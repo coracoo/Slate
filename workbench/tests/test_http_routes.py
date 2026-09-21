@@ -38,6 +38,16 @@ class HttpRouteTests(unittest.TestCase):
         head, payload = raw.split(b'\r\n\r\n', 1)
         return int(head.split()[1]), head, payload
 
+    def test_environment_install_validation_and_busy(self):
+        self.assertEqual(self.request('/api/env/install', 'POST', b'{"groups":["arbitrary"]}')[0], 400)
+        with patch.object(server.H, 'JOBS', {1: {"status": "running"}}):
+            self.assertEqual(self.request('/api/env/install', 'POST', b'{"groups":["base"]}')[0], 409)
+        with patch.object(server.H, 'JOBS', {}), patch.object(server.H, 'spawn_job', return_value=77) as spawn:
+            code, _, body = self.request('/api/env/install', 'POST', b'{"groups":["base"]}')
+            self.assertEqual(code, 202)
+            self.assertEqual(json.loads(body)['id'], 77)
+            self.assertEqual(spawn.call_args.args[0], 'environment_install')
+
     def test_missing_frontend_reports_deployment_error(self):
         with tempfile.TemporaryDirectory() as folder, patch.object(server, 'WEBDIST', folder):
             code, _, body = self.request('/')

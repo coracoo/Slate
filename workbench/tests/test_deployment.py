@@ -13,18 +13,20 @@ ROOT = Path(__file__).resolve().parents[2]
 
 class DeploymentTests(unittest.TestCase):
     def test_old_python_rejected_at_entry(self):
-        for name in ('server.py', 'launch.py', 'watch.py'):
+        for name in ('server.py',):
             with self.subTest(name=name), patch.object(sys, 'version_info', (3, 11, 9)):
                 with self.assertRaisesRegex(SystemExit, 'Python 3.12'):
                     runpy.run_path(str(ROOT / 'workbench' / name), run_name='__main__')
 
-    def test_background_launcher_rejects_occupied_port(self):
-        with socket.socket() as listener:
-            listener.bind(('127.0.0.1', 0))
-            listener.listen()
-            result = subprocess.run([sys.executable, str(ROOT / 'workbench/launch.py'),
-                                     str(listener.getsockname()[1])], capture_output=True, timeout=10)
-            self.assertNotEqual(result.returncode, 0)
+    def test_install_groups_reject_arbitrary_commands(self):
+        from workbench.tools.install_environment import normalize_groups, commands
+        for value in ([], None, ["pip install evil"], ["base", 1]):
+            with self.assertRaises(ValueError):
+                normalize_groups(value)
+        self.assertEqual(normalize_groups(["depth", "base", "base"]), ["base", "depth"])
+        plan = commands(["base"], "python-test")
+        self.assertIn("--require-hashes", plan[0])
+        self.assertEqual(plan[-1], ["python-test", "-m", "pip", "check"])
 
 
 if __name__ == '__main__':

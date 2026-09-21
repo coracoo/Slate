@@ -317,6 +317,10 @@
   ],
   [
     "POST",
+    "/api/env/install"
+  ],
+  [
+    "POST",
     "/api/env/models"
   ],
   [

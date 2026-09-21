@@ -57,17 +57,15 @@ Pop-Location
 
 服务当前监听 `0.0.0.0:8775`。局域网访问需要放行防火墙；管理接口面向可信网络，不要直接把整个工作台映射到公网。GPU 不是工作台本身的要求，本地模型和深度推理的资源需求另算。
 
-### 后台运行、开发与更新
+### 更新与开发
 
-```powershell
-# 与前台启动二选一，不要重复启动同一端口
-.\.venv\Scripts\python.exe workbench/launch.py 8775
+在终端按 `Ctrl+C` 停止服务，执行 `git pull --ff-only`，安装锁文件依赖并重新运行前端 `npm ci`、`npm run build`，再启动服务。前端开发在后端已启动时运行 `npm run dev`，Vite 代理 API 到 8775。
 
-# 可选守护：8 秒巡检服务；启用后停止服务进程会被自动拉起
-.\.venv\Scripts\python.exe workbench/watch.py
-```
+### 批量安装环境
 
-更新时先等待任务结束，停止服务（若启用守护，同时停止守护），再执行 `git pull --ff-only`、重新安装变更的依赖、`npm ci` 和 `npm run build`，之后重新启动并刷新页面。前端开发在后端已启动时运行 `npm run dev`，Vite 代理 API 到 8775。
+进入“环境检查 → 批量安装环境”，选择基础依赖、深度/剪影依赖或 ChatGPT 本机程序，点击“后台安装所选环境”。任务面板显示日志，完成或失败时顶部提醒。安装期间保持前台服务运行；基础依赖安装后重启服务。
+
+安装目标为项目 `.venv`（Python 3.12）。FFmpeg、Blender、ComfyUI 及 Chrome 扩展授权需单独配置。
 
 ### 深度与剪影（可选）
 
@@ -81,7 +79,7 @@ GPU 加速需要与设备匹配的 PyTorch；此组依赖独立于基础安装�
 
 ### 日志
 
-前台运行时日志输出到终端。后台日志位于 `workbench/server.log`，可用 `Get-Content workbench/server.log -Tail 80` 查看。
+服务日志输出到启动终端；安装和生成日志在任务面板查看。
 
 ## 2. ChatGPT 网页生图：安装程序与浏览器扩展
 

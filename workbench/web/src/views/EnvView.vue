@@ -8,6 +8,7 @@ import {
 } from '../api'
 import { toast } from '../stores/app'
 import StyledSelect from '../components/StyledSelect.vue'
+import EnvironmentInstaller from '../components/EnvironmentInstaller.vue'
 import ChromeUseEnvironment from '../components/ChromeUseEnvironment.vue'
 import MediaGatewayEnvironment from '../components/MediaGatewayEnvironment.vue'
 import { icons } from '../components/icons'
@@ -284,6 +285,7 @@ onMounted(() => {
     <ChromeUseEnvironment />
     <MediaGatewayEnvironment />
 
+    <EnvironmentInstaller @installed="detect" />
     <!-- 上半：本机环境 -->
     <section class="glass mb-5 p-5" :style="{ '--glow': GLOW }">
       <div class="mb-4 flex items-center gap-2">

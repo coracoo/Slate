@@ -568,7 +568,10 @@ class H(BaseHTTPRequestHandler):
                 if self.JOBS[jid].get("status")=="running": continue
                 del self.JOBS[jid]; overflow-=1
     def spawn_job(self,step,cmd):
-        with self.JLOCK:
+        with self.ENV_INSTALL_LOCK, self.JLOCK:
+            active = [j for j in self.JOBS.values() if j.get("status") == "running" or j.get("process_alive")]
+            if any(j.get("step") == "environment_install" for j in active) or (step == "environment_install" and active):
+                raise ValueError("环境安装与生成任务不能同时运行，请等待当前任务结束")
             self.JOBSEQ[0]+=1; jid=self.JOBSEQ[0]
             self.JOBS[jid]={"id":jid,"step":step,"status":"running","out":"","err":"","cmd":[os.path.basename(c) for c in cmd],
                             "fullcmd":list(cmd),"attempts":1,"attempt_id":f"{jid}-a1",
@@ -1602,6 +1605,23 @@ class H(BaseHTTPRequestHandler):
         jid=int(q.get("id",["0"])[0])
         j=self.job_record(jid)
         return self._send(200,"application/json; charset=utf-8",json.dumps(j or {"err":"无此任务","lost":True},ensure_ascii=False).encode())
+
+    ENV_INSTALL_LOCK = threading.RLock()
+
+    @route('POST', '/api/env/install')
+    def route_post_api_env_install(self, ctx):
+        try:
+            body = json.loads(self.rfile.read(ctx.content_length).decode("utf-8"))
+            groups = tools_mod("install_environment.py").normalize_groups(body.get("groups") if isinstance(body, dict) else None)
+        except (ValueError, UnicodeError) as exc:
+            return self._send(400, "application/json", json.dumps({"err": str(exc)}, ensure_ascii=False).encode())
+        with self.ENV_INSTALL_LOCK:
+            with self.JLOCK:
+                active = any(j.get("status") == "running" or j.get("process_alive") for j in self.JOBS.values())
+            if active:
+                return self._send(409, "application/json", json.dumps({"err": "请等待运行中的任务结束后安装环境"}, ensure_ascii=False).encode())
+            jid = self.spawn_job("environment_install", [sys.executable, os.path.join(TOOLS, "install_environment.py"), *groups])
+        return self._send(202, "application/json", json.dumps({"ok": True, "id": jid, "job": True}).encode())
 
     @route('POST', '/api/env/config')
     def route_post_api_env_config(self, ctx):
@@ -3771,7 +3791,7 @@ if __name__=="__main__":
     try:
         httpd = ThreadingHTTPServer((host,port),H)
     except OSError as exc:
-        raise SystemExit(f"启动失败，无法监听端口 {port}：{exc}。请检查是否已启动前台服务、launch 或 watch。")
+        raise SystemExit(f"启动失败，无法监听端口 {port}：{exc}。请检查是否已有工作台服务正在运行。")
     print(f"工作台: http://localhost:{port}（监听 0.0.0.0，局域网可达）", flush=True)
     httpd.serve_forever()
 
