@@ -138,7 +138,7 @@ def state(project, name):
     for i, u in enumerate(units):
         u['label'] = f'V{i+1:02}'
         try:
-            u['stale'] = not u.get('prompt_video') or not u.get('prompt_grid') or u.get('source_hash') != source_hash(shot_list(board, u))
+            u['stale'] = not u.get('prompt_video') or u.get('source_hash') != source_hash(shot_list(board, u))
             u['timeline'] = timeline(board, u)
             u['video_stale'] = bool(u.get('video_binding')) and u['video_binding'].get('source_hash') != media_source_hash(shot_list(board, u), 'video', u)
         except ValueError:

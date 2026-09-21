@@ -48,6 +48,9 @@ class ProductionContractTests(unittest.TestCase):
         self.assertNotIn('prompt_video', shot)
         self.assertNotIn('prompt_grid', shot)
         with self.assertRaises(ValueError): require_prompts([shot])
+        # 宫格是按需人工字段：两类齐全即通过，不因缺宫格被拒
+        shot['prompt_video'] = '起身连续动作'
+        require_prompts([shot])
 
     def test_old_shot_editor_keeps_new_fields_and_bindings(self):
         b = self.board()
@@ -173,6 +176,17 @@ class ProductionExecutionTests(unittest.TestCase):
         studio.save_shots(self.root, self.path.name, [{**self.board['shots'][0], 'prompt_image': '修改'}], rev)
         with self.assertRaises(studio.project_store.RevisionConflict):
             studio.save_units(self.root, self.path.name, self.board['video_units'], rev)
+
+    def test_llm_prompts_refresh_keeps_prompt_grid(self):
+        # 宫格文案不被 LLM 刷新覆盖/清空——它是确定性排版的元数据，按需人工配置
+        from production_jobs import llm_task
+        _, rev = studio.read_board(self.root, self.path.name)
+        client = Mock()
+        client.chat.return_value = json.dumps({'shots': [{**s, 'prompt_image': '模型静帧', 'prompt_video': '模型动态'} for s in self.board['shots']]})
+        llm_task(self.root, {'action': 'prompts', 'snapshot': self.board, 'board': self.path.name, 'board_revision': rev}, client)
+        refreshed = studio.read_board(self.root, self.path.name)[0]['shots'][0]
+        self.assertEqual(refreshed['prompt_image'], '模型静帧')
+        self.assertEqual(refreshed['prompt_grid'], '格序1')
 
     def test_authored_s_and_v_survive_llm_refresh(self):
         from production_jobs import llm_task

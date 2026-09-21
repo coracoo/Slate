@@ -5,9 +5,12 @@ import json
 import re
 
 FIELDS = ('prompt_image', 'prompt_video', 'prompt_grid')
+# LLM 生成面只覆盖前两类；宫格是确定性排版（make_grid 按固定行列排已采用关键帧），
+# prompt_grid 只是宫格参考模式用的元数据说明——按需人工配置，不让模型逐镜付费生成。
+LLM_FIELDS = ('prompt_image', 'prompt_video')
 EDIT_FORMAT = '''输出格式：每段以【S镜号（起点—终点s）：开头，以】结束，顺序为序号、时长、景别、镜头（焦距/机位）、运镜、画面呈现（内容、人物、动作、声音、台词）、光影。未知事实不得编造。
 以用户当前框体文字为主要依据，保留用户新增的创意、人物和动作，分镜结构字段只补缺；不要用旧默认提示词覆盖当前内容。
-静帧只描写一个瞬间；运镜/声音/台词仅作为拍摄上下文，不把时间编号、文字或对白画入图像。视频描述连续动作；宫格描述有序画格，三者不可混用。'''
+静帧只描写一个瞬间；运镜/声音/台词仅作为拍摄上下文，不把时间编号、文字或对白画入图像。视频描述连续动作。两者不可混用。'''
 
 
 def format_shot_prompt(shot, text, start=0):
@@ -27,21 +30,19 @@ def retime_prompt(text, ident, start, end):
     return re.sub(r'^【' + re.escape(ident) + r'镜（[^）]*）：',
                   f'【{ident}镜（{start:.1f}—{end:.1f}s）：', str(text or ''))
 CONTRACT = '''
-【制作提示词契约 v2，必须随每个 S 转场镜头一起生成】
-同一次 JSON 输出的每个 shots 元素必须另外包含三个独立字符串：
+【制作提示词契约 v3，必须随每个 S 转场镜头一起生成】
+同一次 JSON 输出的每个 shots 元素必须另外包含两个独立字符串：
 prompt_image：单张参考关键帧，选择可辨认的一个动作瞬间，写姿态、位置、视线、景别、光线。
 只能一幅画面，不写连续阶段、运镜过程或宫格；不要字幕/对白框/文字/水印。
 prompt_video：本镜完整连续动作，写开始状态→动作发展→结束状态，机位与运镜、节奏、声音和原文台词。
 不得写“输出单张/冻结/三视图/拼图”；不要把后期字幕当作画面元素。
-prompt_grid：用于故事板的格子规划，写本镜起始/发展/落点的可视瞬间、格序与统一机位/人物/场景约束。
-它是宫格布局说明，绝不能直接作为单张参考帧或视频提示词。
-三个字段各 60~140 字，内容不同；人物与场景用现有 @character/@scene/@prop ID 引用，不复制资产外观。
-三个字段统一按【S镜号（起点—终点s）：景别；镜头/机位；运镜；画面内容、人物、动作、声音、台词；光影】组织。静帧中的时间、运镜和声音仅作上下文，不作为画面元素。
+两个字段各 60~140 字，内容不同；人物与场景用现有 @character/@scene/@prop ID 引用，不复制资产外观。
+两个字段统一按【S镜号（起点—终点s）：景别；镜头/机位；运镜；画面内容、人物、动作、声音、台词；光影】组织。静帧中的时间、运镜和声音仅作上下文，不作为画面元素。
 旧 prompt 字段可省略，系统将以 prompt_image 提供兼容视图。
 保留 scene_ref、dur、动作和台词事实；narrator 仅存在台词轨。
+不要生成宫格/布局文案（prompt_grid）——宫格由已采用关键帧确定性排版，布局说明只在选择故事板宫格参考模式时人工配置。
 同时返回 video_units 数组：按实际 scene_ref 将相邻 S 组合为 V 分镜视频，不能跨场景或跳过/重复/调换镜头。
-格式 [{"shot_ids":["S1","S2"],"title":"场景段落","prompt_video":"承接动作与空间关系的整段视频描述",
-"prompt_grid":"各 S 关键帧的格序和布局用途","negative":"整段共用负面约束"}]。
+格式 [{"shot_ids":["S1","S2"],"title":"场景段落","prompt_video":"承接动作与空间关系的整段视频描述","negative":"整段共用负面约束"}]。
 分组按原 S 顺序完整覆盖；总时长为成员 dur 之和，不能增删剧情或改写台词。
 '''
 
@@ -56,10 +57,11 @@ def normalize_prompts(shot):
 
 
 def require_prompts(shots):
+    """按用途校验：关键帧与视频两类必须齐且互不相同；宫格为可选人工字段不在此列。"""
     for shot in shots:
-        values = [str(shot.get(k) or '').strip() for k in FIELDS]
-        if not all(values) or len(set(values)) != 3:
-            raise ValueError(f"{shot.get('id')} 的三类提示词缺失或重复，拒绝以一类内容补齐另外两类")
+        values = [str(shot.get(k) or '').strip() for k in LLM_FIELDS]
+        if not all(values) or len(set(values)) != len(LLM_FIELDS):
+            raise ValueError(f"{shot.get('id')} 的提示词缺失或两类内容重复，拒绝以一类内容补齐另一类")
 
 
 def fingerprint(value):

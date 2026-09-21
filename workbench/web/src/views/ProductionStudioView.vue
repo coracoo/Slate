@@ -57,7 +57,8 @@ async function load() {
       for (const field of promptFields) s[field.key] = defaultShotPrompt(s, field.key, start)
     }
     for (const u of result.board.video_units || []) {
-      for (const f of ['prompt_video', 'prompt_grid'] as const) u[f] = defaultUnitPrompt(u, result.board.shots, f)
+      // 宫格文案按需人工配置（仅故事板宫格参考模式使用），默认不回填
+      u.prompt_video = defaultUnitPrompt(u, result.board.shots, 'prompt_video')
     }
     if (!result.board.video_units?.some(u => u.id === selectedUnit.value)) selectedUnit.value = result.board.video_units?.[0]?.id || ''
     if (!result.board.shots.some(s => s.id === selectedShot.value)) selectedShot.value = result.board.shots[0]?.id || ''
@@ -218,7 +219,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
         <section v-if="unit" class="space-y-2 border-b border-white/10 pb-4">
           <div class="flex items-center gap-2"><b class="text-sky-300">{{ unit.label }}</b><input v-model="unit.title" class="control" @input="dirty = true" /></div>
           <label class="block text-xs text-slate-400">完整分镜视频提示词<button class="ml-2 text-sky-300" :disabled="busy || !!optimizing || !textVendor" @click="optimize('V', unit.id, 'prompt_video')">重新生成 / 优化</button><textarea v-model="unit.prompt_video" class="control mt-1" rows="4" @input="dirty = true" /></label>
-          <details open><summary class="text-xs text-violet-300">宫格布局提示词</summary><button class="text-xs text-sky-300" :disabled="busy || !!optimizing || !textVendor" @click="optimize('V', unit.id, 'prompt_grid')">重新生成 / 优化</button><textarea v-model="unit.prompt_grid" class="control mt-2" rows="3" @input="dirty = true" /></details>
+          <details><summary class="text-xs text-violet-300">宫格布局提示词（可选，仅故事板宫格参考模式需要）</summary><button class="text-xs text-sky-300" :disabled="busy || !!optimizing || !textVendor" @click="optimize('V', unit.id, 'prompt_grid')">重新生成 / 优化</button><textarea v-model="unit.prompt_grid" class="control mt-2" rows="3" placeholder="留空即可——宫格由已采用关键帧自动排版；选择故事板宫格参考模式时再按需填写布局说明" @input="dirty = true" /></details>
           <div class="flex flex-wrap gap-2"><span v-for="beat in unit.timeline" :key="beat.shot_id" class="rounded-lg bg-sky-950/40 px-2 py-1 text-xs text-sky-200">{{ beat.shot_id }} · {{ beat.start }}–{{ beat.end }}s</span></div>
           <div class="flex flex-wrap gap-2"><button class="btn btn-sm" :disabled="busy" @click="saveUnits(true)">保存并确认 V 汇总</button><button class="btn btn-sm btn-ghost" :disabled="busy" @click="mergeNext">与下一个 V 合并</button></div>
           <p class="text-xs text-slate-500">改动 S 后，V 汇总会标记过期；请更新叙事承接再确认。宫格由已采用关键帧排版生成。</p>

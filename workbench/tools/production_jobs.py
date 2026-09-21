@@ -12,7 +12,7 @@ import sys
 import uuid
 from pathlib import Path
 from production_studio import project_store, board_path, read_board, save_units, save_shots, validate_units, shot_list, shot_unit, inside
-from production_prompts import CONTRACT, FIELDS, source_hash, media_source_hash, require_prompts
+from production_prompts import CONTRACT, LLM_FIELDS, source_hash, media_source_hash, require_prompts
 from production_media import bound_path, binding, digest, tail_frame, make_grid, concatenate, probe
 
 try: sys.stdout.reconfigure(encoding='utf-8')
@@ -191,9 +191,9 @@ def llm_task(project, packet, client):
                                   snapshot=__import__('versions').snapshot)
         return
     if packet['action'] == 'prompts':
-        instruction = '只补写 shots 的三类提示词，镜号、镜头顺序和所有事实不得改变。返回 shots 数组（id 与三个 prompt 字段）。'
+        instruction = '只补写 shots 的 prompt_image 与 prompt_video 两类提示词，镜号、镜头顺序和所有事实不得改变。返回 shots 数组（id 与这两个 prompt 字段）。宫格文案是人工配置字段，不要生成。'
     else:
-        instruction = '只输出 video_units 分组及 prompt_video/prompt_grid/negative/title，不重写 shots。'
+        instruction = '只输出 video_units 分组及 prompt_video/negative/title，不重写 shots，也不要生成宫格文案。'
     response = client.chat([{'role': 'system', 'content': CONTRACT + '\n' + instruction},
                             {'role': 'user', 'content': json.dumps(snapshot, ensure_ascii=False)}], kind='text', max_tokens=24000, timeout=720,
                            extra={'thinking': {'type': 'disabled'}})
@@ -205,9 +205,10 @@ def llm_task(project, packet, client):
         cleaned = []
         for old, row in zip(snapshot['shots'], rows):
             updated = copy.deepcopy(old)
-            for field in FIELDS:
+            for field in LLM_FIELDS:
                 if old.get(field + '_source') != 'authored':
                     updated[field] = str(row[field]); updated[field + '_source'] = 'llm'
+            # prompt_grid 是按需人工配置字段：LLM 刷新不生成、不覆盖、不清空
             cleaned.append(updated)
         save_shots(project, packet['board'], cleaned, packet['board_revision'], trusted_sources=True)
     else:
@@ -221,7 +222,7 @@ def llm_task(project, packet, client):
             previous = old.get(tuple(u.get('shot_ids') or []), {})
             u['id'] = previous.get('id') or 'v-' + uuid.uuid4().hex[:12]
             members = shot_list(snapshot, u)
-            if not u.get('prompt_video') or not u.get('prompt_grid'): raise ValueError('V 缺少视频或宫格提示词')
+            if not u.get('prompt_video'): raise ValueError('V 缺少视频提示词')
             u['duration'] = previous.get('duration') or sum(float(s['dur']) for s in members)
             u['scene_ref'] = members[0].get('scene_ref', '')
             u['source_hash'] = source_hash(members)

@@ -72,7 +72,7 @@ def compile_request(project, body, cfg):
             if (body.get('image_urls') or {}).get(s['id']): r['public_url'] = public_url(body['image_urls'][s['id']])
             refs.append(r)
         beats = timeline(board, unit)
-        if any(not b['prompt'].strip() for b in beats): raise ValueError('成员 S 尚缺视频提示词，请先补全三类提示词')
+        if any(not b['prompt'].strip() for b in beats): raise ValueError('成员 S 尚缺视频提示词，请先补全提示词')
         prompt += '\n时间轴（秒）：\n' + '\n'.join(f"{b['start']:g}–{b['end']:g}｜{b['shot_id']}：{b['prompt']}" for b in beats)
     negative = str(unit.get('negative') or '')
     # 风格仍由项目/资产 Skill 提供，避免从旧分镜自由文本带入过期画风。
