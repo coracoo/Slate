@@ -1,13 +1,64 @@
 <script setup lang="ts">
 // -*- coding: utf-8 -*-
-import { computed, onMounted, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import ParticleBg from './components/ParticleBg.vue'
 import JobDrawer from './components/JobDrawer.vue'
 import { icons } from './components/icons'
-import { loadBasics, app, toasts, selectProject, currentProject } from './stores/app'
+import { loadBasics, app, toasts, selectProject, currentProject, toast } from './stores/app'
+import { fetchAuthStatus, authLogout, checkUpdate, applyUpdate, rollbackUpdate, restartServer, type UpdateCheck } from './api'
 
 const route = useRoute()
+const router = useRouter()
+/* 登录页不渲染工作台外壳（N85） */
+const showShell = computed(() => route.path !== '/login')
+
+/* GitHub 更新检查（N86）：左下角指示器，1 小时轮询 */
+const update = ref<UpdateCheck | null>(null)
+const updateOpen = ref(false)
+const updateBusy = ref(false)
+let updateTimer = 0
+async function refreshUpdate(force = false) {
+  if (route.path === '/login') return
+  try { update.value = await checkUpdate(force) } catch { /* 未登录/网络失败静默，下轮再试 */ }
+}
+function startUpdatePoll() {
+  void refreshUpdate()
+  updateTimer = window.setInterval(() => void refreshUpdate(), 60 * 60 * 1000)
+}
+async function doUpdate() {
+  updateBusy.value = true
+  try {
+    const r = await applyUpdate()
+    if (!r.updated) { toast(r.note || '已是最新', 'info'); return }
+    toast('更新完成，进程正在重启加载新版本…', 'ok', 6000)
+    setTimeout(() => void restartServer(), 800)
+  } catch (e) { toast(e instanceof Error ? e.message : '更新失败', 'err', 6000) }
+  finally { updateBusy.value = false }
+}
+async function doRollback() {
+  if (!confirm('回滚到上次更新前的版本？（当前工作区需干净）')) return
+  updateBusy.value = true
+  try {
+    const r = await rollbackUpdate()
+    toast('已回滚到 ' + r.rolled_back_to + '，进程正在重启…', 'ok', 6000)
+    setTimeout(() => void restartServer(), 800)
+  } catch (e) { toast(e instanceof Error ? e.message : '回滚失败', 'err', 6000) }
+  finally { updateBusy.value = false }
+}
+async function doLogout() {
+  try { await authLogout() } catch { /* 会话可能已失效 */ }
+  location.href = '/login'
+}
+/* 认证守卫：已配置口令且未登录 → 登录页（服务端已 302，这里兜底直链场景） */
+onMounted(async () => {
+  try {
+    const s = await fetchAuthStatus()
+    if (s.configured && !s.authed && route.path !== '/login') router.replace('/login')
+    else startUpdatePoll()
+  } catch { /* /login 页自身 */ }
+})
+onBeforeUnmount(() => window.clearInterval(updateTimer))
 const theme = computed(() => ({
   c1: (route.meta.c1 as string) || '#22d3ee',
   c2: (route.meta.c2 as string) || '#818cf8'
@@ -53,7 +104,7 @@ onMounted(loadBasics)
 
 <template>
   <ParticleBg />
-  <div class="relative z-10 flex h-full">
+  <div v-if="showShell" class="relative z-10 flex h-full">
     <!-- 侧边栏 -->
     <aside
       class="flex w-56 shrink-0 flex-col border-r border-line-soft bg-black/30 backdrop-blur-xl"
@@ -112,6 +163,24 @@ onMounted(loadBasics)
         <div v-if="currentProject" class="mt-2 truncate text-2xs text-slate-500" :title="currentProject.name">
           projects/{{ currentProject.name }}/
         </div>
+      </div>
+
+      <!-- GitHub 更新检查（左下角，1 小时轮询）+ 退出登录 -->
+      <div class="mt-auto border-t border-white/5 p-3 text-[10px]">
+        <div v-if="update?.supported" class="mb-2">
+          <button class="flex w-full items-center gap-1.5 rounded-lg px-1 py-1 hover:bg-white/5" @click="updateOpen = !updateOpen">
+            <span class="h-1.5 w-1.5 rounded-full" :class="update.behind ? 'bg-amber-400' : 'bg-emerald-400'"></span>
+            <span :class="update.behind ? 'text-amber-300' : 'text-slate-500'">
+              {{ update.behind ? `GitHub 有更新（落后 ${update.behind} 个提交）` : '已是最新版本' }}
+            </span>
+          </button>
+          <div v-if="updateOpen && update.behind" class="mt-1 space-y-1 rounded-lg bg-black/40 p-2">
+            <div v-for="c in update.commits" :key="c" class="truncate font-mono text-slate-400" :title="c">{{ c }}</div>
+            <button class="btn btn-sm w-full" :disabled="updateBusy" @click="doUpdate">拉取更新并重启</button>
+            <button class="btn btn-ghost btn-sm w-full" :disabled="updateBusy" title="回滚到上次更新前的版本（更新时自动留了 backup 分支）" @click="doRollback">回滚上一版本</button>
+          </div>
+        </div>
+        <button class="text-slate-600 hover:text-slate-300" @click="doLogout">退出登录</button>
       </div>
     </aside>
 

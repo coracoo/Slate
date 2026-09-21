@@ -5,7 +5,8 @@ import http.client
 import socket
 import tempfile
 import threading
-import unittest
+import os as _os, unittest
+_os.environ.setdefault('SLATE_NO_AUTH', '1')   # HTTP 边界测试不做口令认证
 from pathlib import Path
 from unittest.mock import patch
 from http.server import ThreadingHTTPServer

@@ -37,6 +37,10 @@
  ],
  [
   "GET",
+  "/api/auth/status"
+ ],
+ [
+  "GET",
   "/api/comfy/workflows"
  ],
  [
@@ -161,6 +165,10 @@
  ],
  [
   "GET",
+  "/api/update/check"
+ ],
+ [
+  "GET",
   "/api/versions"
  ],
  [
@@ -262,6 +270,22 @@
  [
   "POST",
   "/api/assets/relations"
+ ],
+ [
+  "POST",
+  "/api/auth/change"
+ ],
+ [
+  "POST",
+  "/api/auth/login"
+ ],
+ [
+  "POST",
+  "/api/auth/logout"
+ ],
+ [
+  "POST",
+  "/api/auth/setup"
  ],
  [
   "POST",
@@ -526,6 +550,18 @@
  [
   "POST",
   "/api/studio/voice-bind"
+ ],
+ [
+  "POST",
+  "/api/update/apply"
+ ],
+ [
+  "POST",
+  "/api/update/restart"
+ ],
+ [
+  "POST",
+  "/api/update/rollback"
  ],
  [
   "POST",

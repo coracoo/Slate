@@ -698,6 +698,10 @@ class H(BaseHTTPRequestHandler):
                 except ValueError:
                     return self._request_error(400, 'Content-Length 无效')
             ctx = RequestContext(url, query, length)
+            # ---- 认证闸门（N85）：口令未配置时只放行首次设置流程；已配置则校验签名会话 ----
+            gate = self._auth_gate(method, url.path)
+            if gate is not None:
+                return gate
             handler = ROUTES.get((method, url.path))
             if handler is not None:
                 # 二进制上传保持流式；其余 POST 在业务分支前验证对象 JSON。
@@ -1359,6 +1363,130 @@ class H(BaseHTTPRequestHandler):
             return self._send(200,"application/json; charset=utf-8",json.dumps(result,ensure_ascii=False).encode())
         except Exception as exc:
             return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+
+    # ---- 账号体系（N85）：签名会话 cookie；白名单见 _auth_gate ----
+    AUTH_EXACT_ALLOW = ('/api/auth/status', '/api/auth/setup', '/api/auth/login', '/healthz')
+
+    def _cookie(self, name):
+        raw = self.headers.get('Cookie') or ''
+        for part in raw.split(';'):
+            k, _, v = part.strip().partition('=')
+            if k == name: return v
+        return ''
+
+    def _auth_gate(self, method, path):
+        if os.environ.get('SLATE_NO_AUTH') == '1': return None   # 仅测试进程使用，勿在生产设置
+        import auth_service
+        allow = path in self.AUTH_EXACT_ALLOW or path.startswith('/assets/')
+        if allow: return None
+        token = self._cookie(auth_service.COOKIE)
+        if auth_service.verify_not_revoked(token): return None
+        if not auth_service.configured():
+            # 首次使用：页面放行到 /login（口令设置入口），API 一律 401+need_setup
+            if path.startswith(('/api', '/media', '/src')):
+                return self._send(401, 'application/json', json.dumps({'ok': False, 'err': '需要先设置管理员口令', 'need_setup': True}, ensure_ascii=False).encode())
+            if method == 'GET':
+                return None if path == '/login' else self._redirect('/login')
+            return self._send(401, 'application/json', json.dumps({'ok': False, 'err': '需要先设置管理员口令', 'need_setup': True}, ensure_ascii=False).encode())
+        if path.startswith(('/api', '/media', '/src')):
+            return self._send(401, 'application/json', json.dumps({'ok': False, 'err': '未登录'}, ensure_ascii=False).encode())
+        if method == 'GET':
+            return self._redirect('/login')
+        return self._send(401, 'application/json', json.dumps({'ok': False, 'err': '未登录'}, ensure_ascii=False).encode())
+
+    def _redirect(self, location):
+        self.send_response(302); self.send_header('Location', location)
+        self.send_header('Content-Length', '0'); self.end_headers()
+
+    @route('GET', '/api/auth/status')
+    def route_get_auth_status(self, ctx):
+        import auth_service
+        token = self._cookie(auth_service.COOKIE)
+        authed = auth_service.verify_not_revoked(token)
+        return self._send(200, 'application/json', json.dumps(
+            {'ok': True, 'configured': auth_service.configured(), 'authed': authed}, ensure_ascii=False).encode())
+
+    @route('POST', '/api/auth/setup')
+    def route_post_auth_setup(self, ctx):
+        import auth_service
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8', 'replace') or b'{}')
+        try:
+            token = auth_service.setup(str(body.get('password') or ''))
+        except Exception as exc:
+            return self._send(400, 'application/json', json.dumps({'ok': False, 'err': scrub_err(exc)}, ensure_ascii=False).encode())
+        return self._send(200, 'application/json', json.dumps({'ok': True}, ensure_ascii=False).encode(),
+                          {'Set-Cookie': f'{auth_service.COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={auth_service.SESSION_TTL}'})
+
+    @route('POST', '/api/auth/login')
+    def route_post_auth_login(self, ctx):
+        import auth_service
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8', 'replace') or b'{}')
+        client = self.client_address[0] if self.client_address else ''
+        try:
+            token = auth_service.login(str(body.get('password') or ''), client)
+        except Exception as exc:
+            return self._send(401, 'application/json', json.dumps({'ok': False, 'err': scrub_err(exc)}, ensure_ascii=False).encode())
+        return self._send(200, 'application/json', json.dumps({'ok': True}, ensure_ascii=False).encode(),
+                          {'Set-Cookie': f'{auth_service.COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={auth_service.SESSION_TTL}'})
+
+    @route('POST', '/api/auth/logout')
+    def route_post_auth_logout(self, ctx):
+        import auth_service
+        token = self._cookie(auth_service.COOKIE)
+        try: auth_service.logout(token)
+        except Exception: pass
+        return self._send(200, 'application/json', json.dumps({'ok': True}, ensure_ascii=False).encode(),
+                          {'Set-Cookie': f'{auth_service.COOKIE}=; Path=/; HttpOnly; SameSite=Lax; Max-Age=0'})
+
+    @route('POST', '/api/auth/change')
+    def route_post_auth_change(self, ctx):
+        import auth_service
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8', 'replace') or b'{}')
+        try:
+            token = auth_service.change(str(body.get('old') or ''), str(body.get('new') or ''))
+        except Exception as exc:
+            return self._send(400, 'application/json', json.dumps({'ok': False, 'err': scrub_err(exc)}, ensure_ascii=False).encode())
+        return self._send(200, 'application/json', json.dumps({'ok': True}, ensure_ascii=False).encode(),
+                          {'Set-Cookie': f'{auth_service.COOKIE}={token}; Path=/; HttpOnly; SameSite=Lax; Max-Age={auth_service.SESSION_TTL}'})
+
+    # ---- GitHub 更新检查 / 安全拉取 / 回退（N86）----
+    @route('GET', '/api/update/check')
+    def route_get_update_check(self, ctx):
+        from update_service import check
+        try:
+            result = check(force=(ctx.query.get('force', [''])[0] == '1'))
+            return self._send(200, 'application/json', json.dumps({'ok': True, **result}, ensure_ascii=False).encode())
+        except Exception as exc:
+            return self._send(500, 'application/json', json.dumps({'ok': False, 'err': scrub_err(exc)}, ensure_ascii=False).encode())
+
+    @route('POST', '/api/update/apply')
+    def route_post_update_apply(self, ctx):
+        from update_service import apply
+        try:
+            return self._send(200, 'application/json', json.dumps(apply(), ensure_ascii=False).encode())
+        except Exception as exc:
+            return self._send(409, 'application/json', json.dumps({'ok': False, 'err': scrub_err(exc)}, ensure_ascii=False).encode())
+
+    @route('POST', '/api/update/rollback')
+    def route_post_update_rollback(self, ctx):
+        from update_service import rollback
+        try:
+            return self._send(200, 'application/json', json.dumps(rollback(), ensure_ascii=False).encode())
+        except Exception as exc:
+            return self._send(409, 'application/json', json.dumps({'ok': False, 'err': scrub_err(exc)}, ensure_ascii=False).encode())
+
+    @route('POST', '/api/update/restart')
+    def route_post_update_restart(self, ctx):
+        # 进程退出由 keepalive 守护自动拉起新代码；无守护直跑时请手动重启
+        def _exit():
+            time.sleep(0.6)
+            log_line = time.strftime('%Y-%m-%d %H:%M:%S') + ' 更新应用完成，进程退出以加载新版本\n'
+            try:
+                with open(os.path.join(ROOT, 'server.log'), 'a', encoding='utf-8') as fh: fh.write(log_line)
+            except Exception: pass
+            os._exit(0)
+        threading.Thread(target=_exit, daemon=True).start()
+        return self._send(200, 'application/json', json.dumps({'ok': True, 'note': '进程即将重启'}, ensure_ascii=False).encode())
 
     def _static_or_not_found(self, ctx):
         u = ctx.url

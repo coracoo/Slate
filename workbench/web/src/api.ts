@@ -139,11 +139,28 @@ async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = FET
 export async function getJSON<T>(url: string): Promise<T> {
   const r = await fetchWithTimeout(url)
   if (!r.ok) {
-    const data = (await r.json().catch(() => ({}))) as { error?: string; err?: string }
+    const data = (await r.json().catch(() => ({}))) as { error?: string; err?: string; need_setup?: boolean }
+    if (r.status === 401 && !url.startsWith('/api/auth') && location.pathname !== '/login') {
+      location.href = data.need_setup ? '/login?mode=setup' : '/login'
+    }
     throw new ApiError(r.status, data.error || data.err || `${r.status} ${r.statusText}`)
   }
   return (await r.json()) as T
 }
+
+// ---- 账号体系（N85）----
+export const fetchAuthStatus = () => getJSON<{ ok: boolean; configured: boolean; authed: boolean }>('/api/auth/status')
+export const authSetup = (password: string) => postJSON<{ ok: boolean }>('/api/auth/setup', { password })
+export const authLogin = (password: string) => postJSON<{ ok: boolean }>('/api/auth/login', { password })
+export const authLogout = () => postJSON<{ ok: boolean }>('/api/auth/logout', {})
+export const authChange = (old: string, next: string) => postJSON<{ ok: boolean }>('/api/auth/change', { old, new: next })
+
+// ---- GitHub 更新检查 / 拉取 / 回退（N86）----
+export interface UpdateCheck { ok: boolean; supported: boolean; branch?: string; behind?: number; ahead?: number; commits?: string[]; err?: string }
+export const checkUpdate = (force = false) => getJSON<UpdateCheck>(`/api/update/check${force ? '?force=1' : ''}`)
+export const applyUpdate = () => postJSON<{ ok: boolean; updated: boolean; note?: string; backup?: string }>('/api/update/apply', {})
+export const rollbackUpdate = () => postJSON<{ ok: boolean; rolled_back_to: string; note?: string }>('/api/update/rollback', {})
+export const restartServer = () => postJSON<{ ok: boolean; note?: string }>('/api/update/restart', {})
 
 export async function postJSON<T>(url: string, body: unknown): Promise<T> {
   const r = await fetchWithTimeout(url, {
@@ -152,7 +169,10 @@ export async function postJSON<T>(url: string, body: unknown): Promise<T> {
     body: JSON.stringify(body)
   }, 120000)
   const data = (await r.json().catch(() => ({}))) as T & { error?: string; err?: string }
-  if (!r.ok) throw new ApiError(r.status, data.error || data.err || `${r.status} ${r.statusText}`)
+  if (!r.ok) {
+    if (r.status === 401 && !url.startsWith('/api/auth') && location.pathname !== '/login') location.href = '/login'
+    throw new ApiError(r.status, data.error || data.err || `${r.status} ${r.statusText}`)
+  }
   return data
 }
 

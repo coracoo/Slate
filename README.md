@@ -49,6 +49,7 @@ Pop-Location
 
 # 启动服务
 .\.venv\Scripts\python.exe workbench/server.py 8775
+常驻运行（推荐挂机）：`./.venv/Scripts/python.exe workbench/keepalive.py 8775` —— 进程退出自动重启（退避+冷却），崩溃留痕 `workbench/logs/keepalive.log`；优雅停止：创建 `workbench/STOP` 文件
 ```
 
 通过 `.\.venv\Scripts\python.exe --version` 检查解释器版本，必须显示 3.12.x。不要使用默认的 `python -m venv`，也不要用其他 Python 版本安装这份锁文件。
