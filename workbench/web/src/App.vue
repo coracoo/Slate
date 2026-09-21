@@ -31,7 +31,12 @@ async function doUpdate() {
   try {
     const r = await applyUpdate()
     if (!r.updated) { toast(r.note || '已是最新', 'info'); return }
-    toast('更新完成，进程正在重启加载新版本…', 'ok', 6000)
+    // F06：含前端源码改动时先提示手动重建 dist（dist 不入库），由用户决定何时重启
+    if (r.needs_build) {
+      toast('更新完成，但含前端源码改动：请先在仓库根执行 npm ci && npm run build，再重启生效', 'err', 12000)
+      return
+    }
+    toast('更新完成，进程即将退出：keepalive 守护下会自动拉起新版本，否则请手动重启', 'ok', 6000)
     setTimeout(() => void restartServer(), 800)
   } catch (e) { toast(e instanceof Error ? e.message : '更新失败', 'err', 6000) }
   finally { updateBusy.value = false }
@@ -41,7 +46,7 @@ async function doRollback() {
   updateBusy.value = true
   try {
     const r = await rollbackUpdate()
-    toast('已回滚到 ' + r.rolled_back_to + '，进程正在重启…', 'ok', 6000)
+    toast('已回滚到 ' + r.rolled_back_to + '，进程即将退出：keepalive 守护下会自动拉起，否则请手动重启', 'ok', 6000)
     setTimeout(() => void restartServer(), 800)
   } catch (e) { toast(e instanceof Error ? e.message : '回滚失败', 'err', 6000) }
   finally { updateBusy.value = false }
@@ -99,7 +104,9 @@ watch(
 
 const toastColor = { ok: '#34d399', err: '#f87171', info: '#38bdf8' } as const
 
-onMounted(loadBasics)
+/* /login 页不发业务请求（未登录时全是 401 噪音）；进入工作台后再加载 */
+onMounted(() => { if (showShell.value) void loadBasics() })
+watch(showShell, (v) => { if (v) void loadBasics() })
 </script>
 
 <template>
@@ -169,9 +176,9 @@ onMounted(loadBasics)
       <div class="mt-auto border-t border-white/5 p-3 text-[10px]">
         <div v-if="update?.supported" class="mb-2">
           <button class="flex w-full items-center gap-1.5 rounded-lg px-1 py-1 hover:bg-white/5" @click="updateOpen = !updateOpen">
-            <span class="h-1.5 w-1.5 rounded-full" :class="update.behind ? 'bg-amber-400' : 'bg-emerald-400'"></span>
-            <span :class="update.behind ? 'text-amber-300' : 'text-slate-500'">
-              {{ update.behind ? `GitHub 有更新（落后 ${update.behind} 个提交）` : '已是最新版本' }}
+            <span class="h-1.5 w-1.5 rounded-full" :class="update.behind ? 'bg-amber-400' : (update.ahead ? 'bg-sky-400' : 'bg-emerald-400')"></span>
+            <span :class="update.behind ? 'text-amber-300' : (update.ahead ? 'text-sky-300' : 'text-slate-500')">
+              {{ update.behind ? `GitHub 有更新（落后 ${update.behind} 个提交）` : (update.ahead ? `本地领先 ${update.ahead} 个提交（未推送）` : '已是最新版本') }}
             </span>
           </button>
           <div v-if="updateOpen && update.behind" class="mt-1 space-y-1 rounded-lg bg-black/40 p-2">

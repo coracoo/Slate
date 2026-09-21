@@ -52,6 +52,12 @@ Pop-Location
 常驻运行（推荐挂机）：`./.venv/Scripts/python.exe workbench/keepalive.py 8775` —— 进程退出自动重启（退避+冷却），崩溃留痕 `workbench/logs/keepalive.log`；优雅停止：创建 `workbench/STOP` 文件
 ```
 
+开机自启（可选，登录本机后自动拉起守护；把路径换成你的仓库实际位置）：
+
+```powershell
+schtasks /Create /TN "Slate-8775" /SC ONLOGON /TR "\"C:\path\to\Slate\.venv\Scripts\pythonw.exe\" \"C:\path\to\Slate\workbench\keepalive.py\" 8775"
+```
+
 通过 `.\.venv\Scripts\python.exe --version` 检查解释器版本，必须显示 3.12.x。不要使用默认的 `python -m venv`，也不要用其他 Python 版本安装这份锁文件。
 
 `requirements-win-py312.lock` 包含 Windows / Python 3.12 的固定依赖版本与文件哈希。

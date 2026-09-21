@@ -58,10 +58,14 @@ class AuthServiceTests(unittest.TestCase):
 
     def test_change_password(self):
         auth_service.setup("old-pass-1")
+        old_token = auth_service.login("old-pass-1", "")
         auth_service.change("old-pass-1", "new-pass-2")
         with self.assertRaises(ValueError):
             auth_service.login("old-pass-1", "")
         self.assertTrue(auth_service.login("new-pass-2", ""))
+        # F03：改密轮换 secret，旧会话立即失效
+        self.assertFalse(auth_service.verify(old_token))
+        self.assertFalse(auth_service.verify_not_revoked(old_token))
 
     def test_short_password_rejected(self):
         with self.assertRaises(ValueError):

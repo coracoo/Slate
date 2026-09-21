@@ -1365,7 +1365,10 @@ class H(BaseHTTPRequestHandler):
             return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
 
     # ---- 账号体系（N85）：签名会话 cookie；白名单见 _auth_gate ----
-    AUTH_EXACT_ALLOW = ('/api/auth/status', '/api/auth/setup', '/api/auth/login', '/healthz')
+    # public-reference 自带 URL 签名+限时校验（media_gateway.verify，安全自包含），
+    # 消费方是云厂商拉取器，没有会话 cookie，必须放行（F01）。
+    AUTH_EXACT_ALLOW = ('/api/auth/status', '/api/auth/setup', '/api/auth/login', '/healthz',
+                        '/api/public-reference')
 
     def _cookie(self, name):
         raw = self.headers.get('Cookie') or ''
@@ -1409,6 +1412,11 @@ class H(BaseHTTPRequestHandler):
     @route('POST', '/api/auth/setup')
     def route_post_auth_setup(self, ctx):
         import auth_service
+        # F02：首次设置口令只接受本机请求——服务绑 0.0.0.0，防局域网抢设管理员
+        client = self.client_address[0] if self.client_address else ''
+        if client not in ('127.0.0.1', '::1'):
+            return self._send(403, 'application/json', json.dumps(
+                {'ok': False, 'err': '首次设置管理员口令只能在服务器本机浏览器（127.0.0.1）操作'}, ensure_ascii=False).encode())
         body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8', 'replace') or b'{}')
         try:
             token = auth_service.setup(str(body.get('password') or ''))
@@ -1477,7 +1485,7 @@ class H(BaseHTTPRequestHandler):
 
     @route('POST', '/api/update/restart')
     def route_post_update_restart(self, ctx):
-        # 进程退出由 keepalive 守护自动拉起新代码；无守护直跑时请手动重启
+        # 进程退出由 keepalive 守护自动拉起新代码；无守护直跑时请手动重启（F10：文案区分两种情形）
         def _exit():
             time.sleep(0.6)
             log_line = time.strftime('%Y-%m-%d %H:%M:%S') + ' 更新应用完成，进程退出以加载新版本\n'
@@ -1486,7 +1494,8 @@ class H(BaseHTTPRequestHandler):
             except Exception: pass
             os._exit(0)
         threading.Thread(target=_exit, daemon=True).start()
-        return self._send(200, 'application/json', json.dumps({'ok': True, 'note': '进程即将重启'}, ensure_ascii=False).encode())
+        return self._send(200, 'application/json', json.dumps(
+            {'ok': True, 'note': '进程即将退出：以 keepalive 运行时会自动拉起新版本；直接运行的请手动重启'}, ensure_ascii=False).encode())
 
     def _static_or_not_found(self, ctx):
         u = ctx.url

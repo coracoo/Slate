@@ -9,6 +9,7 @@
 - 每次启动/退出写 workbench/logs/keepalive.log（时间、退出码、运行时长），崩溃留痕可查。
 """
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -32,6 +33,14 @@ def log(msg):
 
 def main():
     port = sys.argv[1] if len(sys.argv) > 1 else '8775'
+    # 单实例锁：占用 port+1；第二个守护（或换端口的其它守护冲突时）直接退出，杜绝双守护抢端口
+    guard = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        guard.bind(('127.0.0.1', int(port) + 1))
+        guard.listen(0)
+    except OSError:
+        print(f'[keepalive] 端口 {int(port)+1} 已被占用——已有守护在运行，本次退出', flush=True)
+        return
     python = sys.executable
     server = str(HERE / 'server.py')
     log(f'守护启动：{python} {server} {port}')
@@ -52,6 +61,9 @@ def main():
             return
         uptime = time.time() - started
         log(f'server 退出：returncode={code}，运行 {uptime:.0f}s')
+        # F14：exit 0 且秒退基本是主动拒绝启动（版本守卫/参数错误），与崩溃分开标注
+        if code == 0 and uptime < FAST_FAIL:
+            log('退出码 0 且秒退：疑似主动拒绝启动（检查 Python 须 3.12 / 端口占用 / 配置），非崩溃')
         if uptime >= FAST_FAIL:
             fast_fails = 0
             backoff_i = 0

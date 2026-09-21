@@ -18,6 +18,8 @@ SESSION_TTL = 30 * 24 * 3600
 COOKIE = 'slate_session'
 LOCK_LIMIT, LOCK_WINDOW = 5, 60
 
+# F04：登录限速是内存计数，进程重启即清零——局域网单管理员场景可接受；
+# cookie 未加 Secure：服务走 HTTP 局域网，若日后上 HTTPS 反代需补 Secure 标记。
 _failures = {}
 
 
@@ -96,7 +98,8 @@ def change(old, new):
     if not isinstance(new, str) or len(new) < 6:
         raise ValueError('新密码至少 6 位')
     salt = secrets.token_hex(16)
-    data.update(salt=salt, password_hash=_hash(new, salt))
+    # F03：改密同时轮换会话签名密钥并清空撤销名单——旧会话全部立即失效
+    data.update(salt=salt, password_hash=_hash(new, salt), secret=secrets.token_hex(32), revoked={})
     _save(data)
     return issue()
 
@@ -120,7 +123,11 @@ def verify(token):
 
 
 def logout(token):
-    """签名会话无状态：把该 token 加入撤销名单（带过期时间，随文件清理）。"""
+    """签名会话无状态：把该 token 加入撤销名单（带过期时间，随文件清理）。
+
+    F05：撤销键是 exp 秒级时间戳——同一秒签发的会话会一起被撤销，
+    单管理员场景无碍；改密（F03）会轮换 secret 使全部会话失效。
+    """
     if not token: return
     data = _load()
     revoked = {k: v for k, v in (data.get('revoked') or {}).items() if float(k) > time.time()}

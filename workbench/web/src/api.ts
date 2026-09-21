@@ -158,7 +158,7 @@ export const authChange = (old: string, next: string) => postJSON<{ ok: boolean 
 // ---- GitHub 更新检查 / 拉取 / 回退（N86）----
 export interface UpdateCheck { ok: boolean; supported: boolean; branch?: string; behind?: number; ahead?: number; commits?: string[]; err?: string }
 export const checkUpdate = (force = false) => getJSON<UpdateCheck>(`/api/update/check${force ? '?force=1' : ''}`)
-export const applyUpdate = () => postJSON<{ ok: boolean; updated: boolean; note?: string; backup?: string }>('/api/update/apply', {})
+export const applyUpdate = () => postJSON<{ ok: boolean; updated: boolean; note?: string; backup?: string; needs_build?: boolean }>('/api/update/apply', {})
 export const rollbackUpdate = () => postJSON<{ ok: boolean; rolled_back_to: string; note?: string }>('/api/update/rollback', {})
 export const restartServer = () => postJSON<{ ok: boolean; note?: string }>('/api/update/restart', {})
 
