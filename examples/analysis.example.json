@@ -1,0 +1,63 @@
+{
+  "name": "示例解构",
+  "version": 1,
+  "source": "examples/demo.mp4",
+  "created_at": "2026-09-20T10:00:00",
+  "engine": "示例数据（手工精写）",
+  "shots": [
+    {
+      "id": "S1",
+      "t_in": 0.0,
+      "t_out": 3.6,
+      "duration": 3.6,
+      "shot_size": "全景",
+      "camera_move": "固定",
+      "angle": "平视",
+      "transition": "淡入",
+      "lighting": "烛火微光",
+      "action": "三人围案而坐，军师居中抬手示意，两侧人静坐面向主位",
+      "story": "军帐夜议，斥候军情刚报，军师定调.",
+      "dialogue": [
+        { "t_in": 1.2, "t_out": 3.4, "speaker": "军师", "text": "斥候回报，敌军明日拂晓渡河。" }
+      ],
+      "prompt_cn": "全景固定机位平视，昏暗古代军帐内帷幔垂落，三人围案跪坐，居中军师抬手示意，烛火微光摇曳，氛围沉肃。",
+      "keyframes": []
+    },
+    {
+      "id": "S2",
+      "t_in": 3.6,
+      "t_out": 7.0,
+      "duration": 3.4,
+      "shot_size": "近景",
+      "camera_move": "固定",
+      "angle": "平视",
+      "transition": "硬切",
+      "lighting": "烛光映甲",
+      "action": "将军霍然起身，按剑环视帐内",
+      "story": "武将主战，主张半渡而击.",
+      "dialogue": [
+        { "t_in": 4.2, "t_out": 6.6, "speaker": "将军", "text": "等他半渡，我们烧他的浮桥！" }
+      ],
+      "prompt_cn": "近景固定机位，军帐内将军霍然起身按剑，烛光在甲面上跳动，眼中映着火光，情绪由沉转厉。",
+      "keyframes": []
+    },
+    {
+      "id": "S3",
+      "t_in": 7.0,
+      "t_out": 11.2,
+      "duration": 4.2,
+      "shot_size": "中景",
+      "camera_move": "推",
+      "angle": "过肩",
+      "transition": "硬切",
+      "lighting": "烛光侧脸",
+      "action": "过将军肩拍军师，军师摇羽扇摇头",
+      "story": "军师否决烧桥，要围而不打，留下全歼之局.",
+      "dialogue": [
+        { "t_in": 7.8, "t_out": 10.6, "speaker": "军师", "text": "烧桥只能挡他三日。我要他全军，留在这岸。" }
+      ],
+      "prompt_cn": "过肩镜头越过将军肩头拍军师，军师轻摇羽扇缓缓摇头，烛光勾勒侧脸，语气平静却字字千钧。",
+      "keyframes": []
+    }
+  ]
+}

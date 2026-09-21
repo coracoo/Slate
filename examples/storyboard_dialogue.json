@@ -1,0 +1,59 @@
+{
+  "project": "demo_dialogue",
+  "title": "军帐议事 · 对白契约示例（可直接渲染）",
+  "w": 960,
+  "h": 540,
+  "fps": 24,
+  "set": { "name": "军帐议事", "type": "generic" },
+  "actors": {
+    "c": { "name": "军师", "shirt": [40, 90, 160], "pos": [-1.7, -0.9], "static": true, "style": "stand" },
+    "v": { "name": "将军", "shirt": [170, 60, 60], "pos": [1.8, 0.3], "static": true, "style": "stand" },
+    "h": { "name": "斥候", "shirt": [60, 140, 90], "pos": [1.7, -1.2], "static": true, "style": "stand" }
+  },
+  "shots": [
+    {
+      "id": "S1",
+      "dur": 3.6,
+      "cam": "wide",
+      "pos": [0.0, 2.0, -6.2],
+      "look": [0.0, 1.1, 0.0],
+      "fov": 48,
+      "scene": "room",
+      "pose": { "c": "seated", "v": "seated", "h": "seated" },
+      "move": "全景·固定·平视",
+      "action": "三人围案而坐，军师居中抬手示意，两侧人静坐面向主位",
+      "lines": [
+        { "at": 1.2, "dur": 2.2, "speaker": "c", "line": "斥候回报，敌军明日拂晓渡河。" }
+      ],
+      "prompt": "全景固定机位平视，昏暗古代军帐内帷幔垂落，三人围案跪坐，居中军师抬手示意，烛火微光摇曳，氛围沉肃。"
+    },
+    {
+      "id": "S2",
+      "dur": 3.4,
+      "cam": "cu",
+      "fov": 34,
+      "scene": "room",
+      "pose": { "c": "seated", "v": "seated", "h": "seated" },
+      "move": "近景·固定·平视",
+      "action": "将军霍然起身，按剑环视帐内",
+      "lines": [
+        { "at": 0.6, "dur": 2.4, "speaker": "v", "line": "等他半渡，我们烧他的浮桥！" }
+      ],
+      "prompt": "近景固定机位，军帐内将军霍然起身按剑，烛光在甲面上跳动，眼中映着火光，情绪由沉转厉。"
+    },
+    {
+      "id": "S3",
+      "dur": 4.2,
+      "cam": "ots",
+      "fov": 38,
+      "scene": "room",
+      "pose": { "c": "seated", "v": "seated", "h": "seated" },
+      "move": "过肩·缓推",
+      "action": "过将军肩拍军师，军师摇羽扇摇头",
+      "lines": [
+        { "at": 0.8, "dur": 2.8, "speaker": "c", "line": "烧桥只能挡他三日。我要他全军，留在这岸。" }
+      ],
+      "prompt": "过肩镜头越过将军肩头拍军师，军师轻摇羽扇缓缓摇头，烛光勾勒侧脸，语气平静却字字千钧。"
+    }
+  ]
+}

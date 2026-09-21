@@ -1,0 +1,527 @@
+<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<title>视频拉片工作台</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:"Microsoft YaHei",sans-serif;background:#0e131a;color:#dce6f0;display:flex;height:100vh}
+#side{width:380px;flex:0 0 380px;background:#131a23;border-right:1px solid #243140;display:flex;flex-direction:column}
+#side h1{font-size:15px;padding:14px 16px;margin:0;color:#8fd0ff;border-bottom:1px solid #243140}
+.sidebtns{display:flex;gap:8px;padding:10px 12px}
+.sbtn{flex:1;background:linear-gradient(180deg,#2f6f9f,#245a82);color:#fff;border:1px solid #3b87bd;border-radius:8px;padding:10px 8px;font-size:13px;cursor:pointer;font-family:inherit}
+.sbtn:hover{background:linear-gradient(180deg,#3b87bd,#2f6f9f)}
+#movieBox{padding:0 12px 10px}
+.movieTitle{font-size:12px;color:#9fb3c6;margin:2px 0 8px;font-weight:bold}
+#srclist{display:flex;flex-direction:column;gap:10px}
+#srclist .f{background:#0f161e;border:1px solid #243140;border-radius:8px;padding:8px;font-size:12px}
+#srclist video{width:100%;max-height:230px;display:block;border-radius:6px;background:#000;max-width:100%}
+.plistHead{padding:8px 14px;font-size:12px;color:#8fa5b8;display:flex;justify-content:space-between;align-items:center;border-top:1px solid #243140}
+.mini{background:none;border:1px solid #2c4660;color:#9fc6e8;border-radius:5px;cursor:pointer;padding:1px 7px;font-size:12px}
+#plist{flex:1;overflow-y:auto;padding:6px 10px 12px}
+.pj{padding:10px 12px;border-radius:8px;margin-bottom:6px;cursor:pointer;background:#182230}
+.pj:hover{background:#1d2c3e}.pj.on{background:#22455f;border-left:3px solid #5ab0e8}
+.pj .nm{font-weight:bold;font-size:13px}.pj .mt{font-size:11px;color:#8fa5b8;margin-top:3px}
+#main{flex:1;display:flex;flex-direction:column;overflow:hidden;min-width:0}
+#tabs{display:flex;gap:2px;padding:10px 14px 0;background:#0e131a;border-bottom:1px solid #243140;flex-wrap:wrap}
+.tab{padding:9px 14px;border-radius:8px 8px 0 0;cursor:pointer;font-size:13px;color:#9fb3c6;background:#131a23}
+.tab.on{background:#1a2836;color:#8fd0ff;font-weight:bold}
+#view{flex:1;overflow-y:auto;padding:18px 22px}
+.card{background:#141c26;border:1px solid #243140;border-radius:10px;padding:16px;margin-bottom:14px}
+.card h3{margin:0 0 10px;font-size:14px;color:#8fd0ff}
+.step{display:flex;align-items:center;gap:12px;padding:10px 0;border-bottom:1px dashed #243140}
+.step .ico{width:30px;height:30px;border-radius:50%;background:#243140;display:flex;align-items:center;justify-content:center;font-size:13px;flex:none}
+.step.done .ico{background:#2e6b46}
+.step .tt{flex:1}.step .tt b{font-size:13px}.step .tt p{margin:2px 0 0;font-size:11px;color:#8fa5b8}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
+.pill{display:inline-block;background:#1d2c3e;border:1px solid #2c4660;border-radius:20px;padding:3px 10px;font-size:11px;margin:2px}
+.log{background:#0a0e13;border:1px solid #243140;border-radius:8px;padding:10px;font:11px/1.5 monospace;white-space:pre-wrap;color:#9fd8b0;max-height:240px;overflow:auto}
+.row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
+.notice{color:#ffcf8f;font-size:12px}
+.tag{display:inline-block;background:#243140;border-radius:4px;padding:1px 6px;font-size:10px;margin-right:5px;color:#9fc6e8;flex:none}
+/* 媒体卡片：16:9 原比例 contain，不再 1:1 裁切 */
+.fcard{background:#0f161e;border:1px solid #243140;border-radius:10px;overflow:hidden;display:flex;flex-direction:column;min-width:0}
+.fcard.clickable{cursor:pointer}.fcard.clickable:hover{border-color:#3b87bd}
+.fcard .media{aspect-ratio:16/9;background:#000;flex:none}
+.fcard .media img,.fcard .media video{width:100%;height:100%;object-fit:contain;display:block}
+.fcard .media.textbody{aspect-ratio:auto;background:#0c1118;border-top:1px solid #1c2836}
+.fcard .media.noprev{aspect-ratio:auto;background:#0c1118;border-top:1px solid #1c2836;display:flex;align-items:center;justify-content:center;color:#8fa5b8;font-size:12px;padding:18px 10px;text-align:center}
+.fhead{padding:8px 10px;display:flex;gap:6px;align-items:center;font-size:12px;flex:none}
+.fhead .fn{color:#dce6f0;word-break:break-all}
+.cardtxt{margin:0;padding:12px 14px;white-space:pre-wrap;word-break:break-word;font:12px/1.7 "Microsoft YaHei",sans-serif;
+ color:#c8d6e6;max-height:420px;overflow:auto;text-align:left}
+#modal pre.txtwindow{margin:0;white-space:pre-wrap;word-break:break-word;font:13px/1.7 'Microsoft YaHei',sans-serif;color:#cfe0f0;background:#0a0e13;border:1px solid #243140;border-radius:8px;padding:14px;max-height:72vh;overflow:auto}
+.empty{color:#8fa5b8;font-size:12px;padding:8px 2px}
+.btn{background:linear-gradient(180deg,#2f6f9f,#245a82);color:#fff;border:1px solid #3b87bd;border-radius:7px;padding:7px 14px;font-size:12px;cursor:pointer;font-family:inherit}
+.btn:hover{background:linear-gradient(180deg,#3b87bd,#2f6f9f)}
+.btn.sm{padding:5px 10px;font-size:12px}
+.btn:disabled{opacity:.5;cursor:wait}
+#pjSearch{width:calc(100% - 20px);margin:6px 10px 2px;padding:6px 9px;background:#0a0e13;border:1px solid #2c4660;border-radius:6px;color:#dce6f0;font-size:12px}
+#srclib{margin:0 12px 10px;background:#0f161e;border:1px solid #243140;border-radius:8px;max-height:210px;overflow-y:auto}
+#srclib .libhead{padding:7px 10px;font-size:12px;color:#8fd0ff;cursor:pointer;position:sticky;top:0;background:#0f161e}
+#srclib .libitem{padding:6px 10px;font-size:11px;color:#9fb3c6;border-top:1px solid #1a2430;display:flex;justify-content:space-between;gap:6px;align-items:center}
+#srclib .libitem:hover{background:#182230;cursor:pointer}
+#srclib .libitem button{font-size:10px;padding:2px 7px;background:#24415a;border:1px solid #3b87bd;color:#cfe6f8;border-radius:5px;cursor:pointer;flex:none}
+audio{width:100%}
+</style></head><body>
+<div id="side">
+  <h1>🎬 视频拉片工作台</h1>
+  <div class="sidebtns">
+    <button class="sbtn" id="selBtn">🗂 选择项目</button>
+    <button class="sbtn" id="importBtn">＋ 导入视频</button>
+  </div>
+  <div id="movieBox">
+    <div class="movieTitle">🎞 当前影片 <span id="srccnt" style="color:#8fd0ff"></span></div>
+    <div id="srclist"></div>
+  </div>
+  <input type="file" id="video" accept="video/*" style="display:none">
+  <input type="text" id="pjSearch" placeholder="🔍 筛选项目…">
+  <div class="plistHead">项目 <span><button class="mini" id="cfgBtn" title="AI 模型配置">⚙ AI</button> <button class="mini" id="rescan" title="刷新">↻</button></span></div>
+  <div id="plist"></div>
+  <div id="srclib"><div class="libhead" id="libHead">📚 Downloads 源视频库 <span id="libCnt"></span> ▸</div><div id="libBody" style="display:none"></div></div>
+</div>
+<div id="main">
+  <div id="tabs">
+    <div class="tab on" data-t="overview">总览</div>
+    <div class="tab" data-t="lapian">① 拉片</div>
+    <div class="tab" data-t="lines">② 台词时间戳</div>
+    <div class="tab" data-t="story">③ 生成分镜</div>
+    <div class="tab" data-t="white">④ 白模成片</div>
+    <div class="tab" data-t="explain">⑤ 镜头语言讲解</div>
+    <div class="tab" data-t="white3d">⑥ 3D 白模</div>
+  </div>
+  <div id="view"><div class="card"><h3>加载中…</h3></div></div>
+</div>
+<script>
+let projects=[],cur=null,curTab='overview',llmOK=false;
+const $=s=>document.querySelector(s);
+const esc=s=>String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/"/g,'&quot;');
+function setHash(){ if(cur) location.hash=encodeURIComponent(cur.name)+'/'+curTab; }
+function readHash(){
+  const h=decodeURIComponent(location.hash.replace(/^#/,''));
+  if(!h) return;
+  const [p,t]=h.split('/');
+  curTab=t||'overview';
+  if(p) cur=projects.find(x=>x.name===p)||null;
+}
+function syncTabs(){document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on',x.dataset.t===curTab));}
+
+function load(){
+  Promise.all([
+    fetch('/api/llmstatus').then(r=>r.json()).catch(()=>({configured:false})),
+    fetch('/api/projects').then(r=>r.json())
+  ]).then(([s,ps])=>{
+    llmOK=!!s.configured;
+    projects=ps;
+    readHash();
+    if(!cur&&ps.length)cur=ps[0];
+    if(cur)cur=ps.find(p=>p.name===cur.name)||ps[0];
+    renderList();loadSrc();loadSrcLib();syncTabs();render();setHash();
+  }).catch(e=>console.error(e));
+}
+function selectProject(name){
+  cur=projects.find(p=>p.name===name)||cur;
+  renderList();loadSrc();render();setHash();
+}
+function renderList(){
+ const kw=($('#pjSearch')&&$('#pjSearch').value||'').trim().toLowerCase();
+ const list=kw?projects.filter(p=>p.name.toLowerCase().includes(kw)):projects;
+ $('#plist').innerHTML=list.map(p=>{
+   const all=Object.values(p.dirs).flat();
+   const marks=['拉片','分镜','白模'].map(k=>(p.dirs[k]&&p.dirs[k].length)?'✔':'·').join('');
+   return `<div class="pj ${cur&&cur.name===p.name?'on':''}" data-n="${esc(p.name)}"><div class="nm">${esc(p.name)}</div><div class="mt">${all.length} 个产物 ${marks}</div></div>`;
+ }).join('')||'<div class="empty" style="padding:8px 12px">无匹配项目</div>';
+ document.querySelectorAll('.pj').forEach(e=>e.onclick=()=>selectProject(e.dataset.n));
+}
+/* ---------- 媒体懒加载：进入视口才挂 src ---------- */
+const lazyIO=new IntersectionObserver(es=>{
+  es.forEach(en=>{
+    if(!en.isIntersecting) return;
+    const el=en.target; lazyIO.unobserve(el);
+    if(el.tagName==='VIDEO'&&el.dataset.src){el.src=el.dataset.src;el.preload='metadata';}
+    else if(el.tagName==='IMG'&&el.dataset.src){el.src=el.dataset.src;}
+  });
+},{root:$('#view'),rootMargin:'300px'});
+function watchLazy(root){
+  (root||document).querySelectorAll('video[data-src],img[data-src]').forEach(el=>lazyIO.observe(el));
+}
+/* ---------- 卡片 ---------- */
+const filesOf=(...subs)=>{let a=[];for(const s of subs){(cur.dirs[s]||[]).forEach(f=>a.push({sub:s,f}))}return a;};
+function mediaURL(rel){ rel=rel.replace(/^根目录\//,""); return "/media?p="+encodeURIComponent("projects/"+cur.name+"/"+rel); }
+function fcard(x){
+  const rel=x.sub+"/"+x.f;
+  const ext=(x.f.split('.').pop()||'').toLowerCase();
+  const isVid=/mp4|mov|mkv/.test(ext), isImg=/jpe?g|png/.test(ext), isText=/md|txt|srt|json|py/.test(ext),
+        isAud=/wav|m4a|mp3|aac|ogg/.test(ext), isSeq=x.f.startsWith("[帧序列]");
+  let body='';
+  if(isSeq){
+    body=`<div class="media noprev">🎞 ${esc(x.f.replace('[帧序列] ',''))}<br>帧序列不在卡片展开，请打开目录或直接看合成 MP4</div>`;
+  } else if(isVid){
+    body=`<div class="media"><video controls preload="metadata" data-src="${mediaURL(rel)}%23t=2"></video></div>`;
+  } else if(isAud){
+    body=`<div class="media textbody" style="padding:14px"><audio controls preload="none" data-src="${mediaURL(rel)}"></audio></div>`;
+  } else if(isImg){
+    body=`<div class="media"><img data-src="${mediaURL(rel)}" alt=""></div>`;
+  } else if(isText){
+    const id='tx_'+Math.random().toString(36).slice(2,9);
+    body=`<div class="media textbody"><pre class="cardtxt" id="${id}">加载中…</pre></div>`;
+    fetch('/api/file?'+new URLSearchParams({p:"projects/"+cur.name+"/"+rel.replace(/^根目录\//,"")})).then(r=>r.text()).then(t=>{
+      const el=document.getElementById(id); if(el) el.textContent=(t||'').length>6000?(t.slice(0,6000)+'\n…（已截断，点击卡片查看全部）'):t;
+    }).catch(e=>{ const el=document.getElementById(id); if(el) el.textContent='加载失败 '+e; });
+  } else {
+    body=`<div class="media noprev">.${esc(ext)} 文件（点击查看/下载）</div>`;
+  }
+  return `<div class="fcard clickable ${isText?'textcard':''}" data-rel="${esc(rel)}"><div class="fhead"><span class="tag">${esc(x.sub)}</span><span class="fn">${esc(x.f)}</span></div>${body}</div>`;
+}
+
+function showModal(title,html){
+  let m=document.getElementById('modal');
+  if(!m){m=document.createElement('div');m.id='modal';
+    m.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.78);z-index:99;display:none;align-items:center;justify-content:center;padding:28px;backdrop-filter:blur(2px)';
+    m.onclick=e=>{if(e.target===m)m.style.display='none'};
+    document.body.appendChild(m);}
+  m.innerHTML=`<div style="background:#141c26;border:1px solid #2c4660;border-radius:12px;max-width:1100px;width:100%;max-height:92vh;overflow:auto;padding:18px 20px;box-shadow:0 20px 60px rgba(0,0,0,.5)">
+     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;position:sticky;top:-18px;background:#141c26;padding:6px 0;z-index:2">
+       <b style="color:#8fd0ff;font-size:15px;word-break:break-all">${esc(title)}</b>
+       <span id="mclose" style="cursor:pointer;color:#9fb3c6;font-size:22px;padding:0 6px">✕</span>
+     </div>${html}</div>`;
+  m.style.display='flex';
+  document.getElementById('mclose').onclick=()=>m.style.display='none';
+}
+
+function openRel(rel){
+  const ext=(rel.split('.').pop()||'').toLowerCase();
+  const full="projects/"+cur.name+"/"+rel.replace(/^根目录\//,"");
+  const title=rel.split('/').pop();
+  let body='';
+  if(/mp4|mov|mkv/.test(ext)){
+    body=`<video src="${mediaURL(rel)}" controls autoplay style="max-width:100%;max-height:70vh"></video>`;
+  } else if(/jpe?g|png/.test(ext)){
+    body=`<img src="${mediaURL(rel)}" style="max-width:100%;max-height:78vh">`;
+  } else if(/md|txt|srt|json|py/.test(ext)){
+    body=`<pre class="txtwindow" id="modalTxt">加载中…</pre>`;
+    showModal(title,body);
+    fetch('/api/file?'+new URLSearchParams({p:full})).then(r=>r.text()).then(t=>{
+      const el=document.getElementById('modalTxt'); if(el) el.textContent=t;
+    }).catch(e=>{ const el=document.getElementById('modalTxt'); if(el) el.textContent='加载失败: '+e; });
+    return;
+  } else if(ext==='blend'){
+    body=`<p style="font-size:13px;color:#9fb3c6">Blender 场景文件：<span class="log" style="display:inline-block;padding:2px 8px">${esc(full)}</span></p>
+     <div class="row">
+       <button class="btn" id="ob_open">🟢 在本机 Blender 中打开</button>
+       <button class="btn" id="ob_render">▶ Blender CLI 后台渲染（按时间轴标记出帧）</button>
+     </div><div class="log" id="ob_log" style="display:none;margin-top:10px"></div>`;
+    showModal(title,body);
+    document.getElementById('ob_open').onclick=async()=>{
+      const r=await fetch('/api/openblend',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({p:full})}).then(x=>x.json()).catch(e=>({err:String(e)}));
+      alert(r.ok?('已打开：'+r.opened):('打开失败：'+(r.err||'')));
+    };
+    document.getElementById('ob_render').onclick=()=>{
+      const log=document.getElementById('ob_log'); log.style.display='block';
+      startGenericJob({step:'blender_render',args:[full]}, log, document.getElementById('ob_render'));
+    };
+    return;
+  } else {
+    body=`<p style="font-size:13px;color:#9fb3c6">${esc(ext)} 文件不在网页预览。</p>
+      <div class="row"><a class="btn" href="${mediaURL(rel)}" target="_blank" style="text-decoration:none">⬇ 下载 / 在新窗口打开</a></div>
+      <div class="log" style="margin-top:10px">${esc(full)}</div>`;
+  }
+  showModal(title,body);
+}
+/* ---------- 选择项目 / 导入视频 ---------- */
+$('#selBtn').onclick=()=>{
+  showModal('选择项目',`<div style="display:grid;gap:8px">`+projects.map(p=>
+    `<div class="pj ${cur&&cur.name===p.name?'on':''}" data-pick="${esc(p.name)}" style="margin:0"><div class="nm">${esc(p.name)}</div><div class="mt">${Object.values(p.dirs).flat().length} 个产物</div></div>`).join('')+`</div>`);
+  document.querySelectorAll('[data-pick]').forEach(e=>e.onclick=()=>{
+    selectProject(e.dataset.pick); const m=document.getElementById('modal'); if(m)m.style.display='none';
+  });
+};
+$('#importBtn').onclick=()=>$('#video').click();
+/* ---------- AI 模型配置弹窗 ---------- */
+$('#cfgBtn').onclick=async()=>{
+  const c=await fetch('/api/llmconfig').then(r=>r.json()).catch(()=>({}));
+  showModal('⚙ AI 模型配置（智谱 GLM）',`
+   <div style="display:grid;gap:12px;font-size:13px">
+     <label>API Key（${c.api_key_masked?'当前：'+esc(c.api_key_masked):'未配置'}，留空则保持不变）
+       <input id="cfg_key" type="password" placeholder="${c.api_key_masked?'留空保持已配置的 key':'粘贴智谱 API Key'}"
+         style="width:100%;margin-top:4px;padding:8px;background:#0a0e13;border:1px solid #2c4660;border-radius:6px;color:#dce6f0">
+     </label>
+     <label>文本模型（台词起草/深度讲解）
+       <input id="cfg_text" value="${esc(c.text_model||'glm-5.3-flash')}"
+         style="width:100%;margin-top:4px;padding:8px;background:#0a0e13;border:1px solid #2c4660;border-radius:6px;color:#dce6f0">
+     </label>
+     <label>视觉模型（代填画面描述）
+       <input id="cfg_vision" value="${esc(c.vision_model||'glm-4.5v')}"
+         style="width:100%;margin-top:4px;padding:8px;background:#0a0e13;border:1px solid #2c4660;border-radius:6px;color:#dce6f0">
+     </label>
+     <label>API Base
+       <input id="cfg_base" value="${esc(c.base||'https://open.bigmodel.cn/api/paas/v4')}"
+         style="width:100%;margin-top:4px;padding:8px;background:#0a0e13;border:1px solid #2c4660;border-radius:6px;color:#dce6f0">
+     </label>
+     <div class="notice">Key 明文保存在本机 workbench/llm_config.json（服务只监听 127.0.0.1）。保存后 ✨ 按钮立即生效。</div>
+     <div class="row" style="margin:0">
+       <button class="btn" id="cfg_save">保存</button>
+       <button class="btn sm" id="cfg_clear" style="background:#5a3a2a;border-color:#8a5a3a">清除 Key</button>
+       <span id="cfg_msg" style="align-self:center"></span>
+     </div>
+   </div>`);
+  document.getElementById('cfg_save').onclick=async()=>{
+    const body={
+      api_key:document.getElementById('cfg_key').value,
+      text_model:document.getElementById('cfg_text').value,
+      vision_model:document.getElementById('cfg_vision').value,
+      base:document.getElementById('cfg_base').value};
+    const r=await fetch('/api/llmconfig',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}).then(x=>x.json()).catch(e=>({err:String(e)}));
+    const m=document.getElementById('cfg_msg');
+    if(r.ok){ m.textContent=r.configured?'✓ 已保存，AI 功能已启用':'已保存（key 为空，AI 功能关闭）'; m.style.color='#9fd8b0'; load(); }
+    else { m.textContent='保存失败: '+(r.err||''); m.style.color='#ffcf8f'; }
+  };
+  document.getElementById('cfg_clear').onclick=async()=>{
+    const r=await fetch('/api/llmconfig',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({clear_key:true})}).then(x=>x.json()).catch(e=>({err:String(e)}));
+    const m=document.getElementById('cfg_msg');
+    if(r.ok){ m.textContent='已清除 Key，AI 功能关闭'; m.style.color='#ffcf8f'; load(); }
+    else { m.textContent='清除失败: '+(r.err||''); m.style.color='#ffcf8f'; }
+  };
+};
+$('#video').onchange=async e=>{
+  const f=e.target.files[0]; e.target.value='';
+  if(!f) return;
+  if(!cur){alert('请先选择项目');return;}
+  if(!confirm(`导入「${f.name}」到项目「${cur.name}/素材/」？`)) return;
+  const buf=await f.arrayBuffer();
+  const u='/api/import?'+new URLSearchParams({project:cur.name,name:f.name});
+  const r=await fetch(u,{method:'POST',body:buf}).then(r=>r.json()).catch(e=>({err:String(e)}));
+  if(r.ok){ load(); } else { alert('导入失败：'+(r.err||'未知错误')); }
+};
+/* ---------- 页面渲染 ---------- */
+function stageSection(title,files){
+  if(!files||!files.length) return '';
+  return `<div class="card"><h3>${title} <span style="font-size:11px;color:#8fa5b8;font-weight:normal">${files.length}</span></h3>
+   <div class="grid">${files.map(fcard).join('')}</div></div>`;
+}
+function homePage(){
+  const d=cur.dirs;
+  const matVid=filesOf('素材','成片','白模').filter(x=>/\.(mp4|mov|mkv)$/i.test(x.f));
+  const lineFiles=[...filesOf('分镜'),...filesOf('白模')].filter(x=>/srt|台词/i.test(x.f));
+  const storyFiles=filesOf('分镜').filter(x=>/json|xlsx|md/i.test(x.f));
+  const whiteMp4=filesOf('白模').filter(x=>/\.mp4$/i.test(x.f));
+  const whiteTxt=filesOf('白模').filter(x=>/srt|txt/i.test(x.f));
+  const lapianAll=filesOf('拉片');
+  const explain=lapianAll.filter(x=>/讲解|完整拉片/i.test(x.f));
+  const lapianOther=lapianAll.filter(x=>!/讲解|完整拉片/i.test(x.f));
+  return `
+   <div class="card"><h3>${esc(cur.name)} · 项目首页</h3>
+     <div style="display:flex;gap:12px;flex-wrap:wrap;margin:6px 0 10px">
+       <span class="pill">拉片 ${(d['拉片']||[]).length}</span>
+       <span class="pill">台词 ${lineFiles.length}</span>
+       <span class="pill">分镜 ${storyFiles.length}</span>
+       <span class="pill">白模 ${whiteMp4.length}</span>
+       <span class="pill">帧 ${(d['帧']||[]).length}</span>
+       <span class="pill">3D ${filesOf('白模3D','三维探索','根目录').filter(x=>/\.mp4$/i.test(x.f)).length}</span>
+     </div>${statusSteps()}
+   </div>
+   ${matVid.length?`<div class="card"><h3>源视频 / 素材</h3><div class="grid">${matVid.map(fcard).join('')}</div></div>`:''}
+   ${stageSection('① 拉片（文档 + 帧截图）',[...lapianOther,...filesOf('帧')])}
+   ${stageSection('② 台词时间戳（OCR + ASR）',lineFiles)}
+   ${stageSection('③ 分镜（JSON + Excel）',storyFiles)}
+   ${stageSection('④ 白模成片',[...whiteMp4,...whiteTxt])}
+   ${stageSection('⑤ 镜头语言讲解',explain)}
+   ${stageSection('⑥ 3D 白模（Blender：.blend / 构建脚本 / 成片）',filesOf('白模3D','三维探索','根目录').filter(x=>/\.(mp4|blend|py)$/i.test(x.f)))}`;
+}
+function statusSteps(){
+  const d=cur.dirs;
+  const S=[
+   ['拉片',(d['拉片']||[]).length],
+   ['台词时间戳',(d['分镜']||[]).filter(f=>/srt|台词/i.test(f)).length+(d['白模']||[]).filter(f=>/srt|台词/i.test(f)).length],
+   ['分镜(JSON/Excel)',(d['分镜']||[]).filter(f=>/json|xlsx/i.test(f)).length],
+   ['白模成片',(d['白模']||[]).filter(f=>/\.mp4$/i.test(f)).length],
+   ['镜头讲解/文档',(d['拉片']||[]).filter(f=>/讲解|完整拉片/i.test(f)).length],
+   ['3D 白模(Blender)',filesOf('白模3D','三维探索','根目录').filter(x=>/\.(blend|mp4)$/i.test(x.f)).length],
+  ];
+  return S.map(([k,n])=>`<div class="step ${n?'done':''}"><div class="ico">${n?'✓':'○'}</div><div class="tt"><b>${k}</b><p>${n?n+' 个产物':'未生成'}</p></div></div>`).join('');
+}
+const stageMap={lapian:{subs:["拉片","帧"],title:"① 拉片（切点/接触印片/拉片文档）",re:null},
+  lines:{subs:["分镜","白模"],title:"② 台词时间戳（OCR + ASR）",re:/srt|台词/},
+  story:{subs:["分镜"],title:"③ 生成分镜（JSON + Excel + MD）",re:/json|xlsx|md/i},
+  white:{subs:["白模"],title:"④ 白模成片",re:null},
+  explain:{subs:["拉片"],title:"⑤ 镜头语言讲解",re:/讲解|完整拉片/},
+  white3d:{subs:["白模3D","三维探索","根目录"],title:"⑥ 3D 白模（Blender）",re:/\.(mp4|blend|py)$/i}};
+function stageFiles(key){
+  const m=stageMap[key]; let out=filesOf(...m.subs);
+  if(m.re) out=out.filter(x=>m.re.test(x.f));
+  if(key==="lapian") out=out.concat(filesOf("素材").filter(x=>/frames_[^/]*\/.+\.(jpg|png)$/i.test(x.f)));
+  return out.map(fcard).join('')||'<p class="empty">该阶段暂无产物</p>';
+}
+/* ---------- 阶段运行按钮：调后端脚本，后台任务 + 轮询 ---------- */
+const relPath=x=>"projects/"+cur.name+"/"+(x.sub==="根目录"?"":x.sub+"/")+x.f;
+const firstOf=(subs,re)=>{for(const s of subs){const hit=(cur.dirs[s]||[]).filter(f=>!re||re.test(f));if(hit.length)return{sub:s,f:hit[0]};}return null;};
+function stageActions(key){
+  const src=firstOf(["素材","成片","白模"],/\.(mp4|mov|mkv)$/i);
+  const js=firstOf(["分镜"],/\.json$/i);
+  const srt=firstOf(["分镜","素材","白模"],/\.srt$/i);
+  const A=[];
+  if(key==="lapian"){
+    if(src){
+      A.push({label:"▶ 跑切点检测(0–300s)",step:"shots",args:[relPath(src),"--start","0","--end","300"]});
+      A.push({label:"▶ 生成拉片切点表(md)",step:"lapdoc",args:[relPath(src)]});
+    }
+  }else if(key==="lines"){
+    if(src){
+      A.push({label:"▶ 提取字幕 (OCR)",step:"subtitles",args:[relPath(src)]});
+      A.push({label:"▶ 语音转台词 (ASR)",step:"speech",args:[relPath(src)]});
+    }
+  }else if(key==="story"){
+    if(srt)A.push({label:"▶ 生成建议分镜",step:"plan",args:[relPath(srt)]});
+    if(js){
+      A.push({label:"▶ 导出分镜表 (Excel)",step:"xlsx",args:[relPath(js)]});
+      A.push({label:"▶ 导出台词文件",step:"dialogue",args:[relPath(js)]});
+    }
+    if(src){
+      const base=src.f.replace(/\.(mp4|mov|mkv)$/i,"");
+      const slug=base.replace(/[^\w\u4e00-\u9fff-]+/g,"_").replace(/^_+|_+$/g,"")||"proj";
+      A.push({label:"▶ 从切点生成分镜(骨架→md+xlsx)",step:"lapdoc",args:[relPath(src)],
+        then:()=>({step:"docs",args:["projects/"+cur.name+"/分镜/"+slug+"_骨架.json","projects/"+cur.name+"/分镜"]})});
+    }
+    if(llmOK&&js&&src)A.push({label:"✨ AI 代填画面描述",step:"fill",args:[relPath(js),"--video",relPath(src)]});
+    if(llmOK&&srt)A.push({label:"✨ AI 起草分镜(台词→骨架)",step:"draft",args:[relPath(srt)]});
+  }else if(key==="white"){
+    if(js)A.push({label:"▶ 渲染对白白模",step:"render",args:[relPath(js),"projects/"+cur.name+"/白模/"+js.f.replace(/\.json$/i,"")+"_白模.mp4"],then:src=>({step:"h264",args:[src]})});
+  }else if(key==="explain"){
+    if(js){
+      A.push({label:"▶ 生成镜头语言讲解",step:"explain",args:[relPath(js)]});
+      if(llmOK)A.push({label:"✨ AI 深度讲解",step:"explain_ai",args:[relPath(js),"--ai"]});
+    }
+  }else if(key==="white3d"){
+    const blend3=firstOf(["白模3D","三维探索","根目录"],/\.blend$/i);
+    const buildPy=firstOf(["白模3D","三维探索","根目录"],/build.*\.py$/i);
+    if(blend3){
+      A.push({label:"🟢 在 Blender 中打开 .blend",step:"openblend",args:[relPath(blend3)]});
+      A.push({label:"▶ Blender CLI 后台渲染（按时间轴出帧）",step:"blender_render",args:[relPath(blend3)]});
+    }
+    if(buildPy) A.push({label:"▶ 发送构建脚本到 Blender（MCP 9876）",step:"blender_build",args:[relPath(buildPy)]});
+    const jsStory=firstOf(["分镜"],/\.json$/i);
+    if(jsStory)A.push({label:"✨ 从分镜JSON 一键生成 3D 场景",step:"blender_previs",args:[relPath(jsStory)]});
+    if(!blend3&&!buildPy&&!jsStory) A.push({label:"（暂无 .blend / build 脚本 / 分镜JSON）",step:"__noop",args:[]});
+  }
+  return A;
+}
+function runBar(key){
+  const A=stageActions(key);
+  let bar='<div class="row" style="margin:0 0 12px">';
+  if(A.length) A.forEach((a,i)=>bar+=`<button class="btn sm" data-run="${key}:${i}">${esc(a.label)}</button>`);
+  else bar+='<span class="empty">该阶段暂无自动脚本，产物请手动放入对应目录</span>';
+  const last=lastRun[key];
+  bar+='</div><div class="log" id="runlog_'+key+'"'+(last?'':' style="display:none"')+'>'+esc(last||'')+'</div>';
+  return bar;
+}
+const lastRun={};
+async function startGenericJob(job,logEl,btn,label){
+  const setLog=t=>{ if(logEl) logEl.textContent=t; };
+  const tail=s=>{s=(s||'').trim();return s.split('\n').slice(-12).join('\n');};
+  const r=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(job)}).then(x=>x.json()).catch(e=>({err:String(e)}));
+  if(!r.ok){setLog('启动失败: '+(r.err||''));return;}
+  if(r.opened){setLog('✓ 已在本机 Blender 打开：'+r.opened);return;}
+  if(btn)btn.disabled=true;
+  const t0=Date.now(); let id=r.id, chain=null;
+  for(;;){
+    await new Promise(res=>setTimeout(res,1500));
+    const j=await fetch('/api/job?id='+id).then(x=>x.json());
+    const el=Math.floor((Date.now()-t0)/1000);
+    if(j.status==='running'){setLog(`任务 #${id} [${job.step}] 运行中… ${el}s\n`+tail(j.out));continue;}
+    if(j.ok&&chain===null&&job.__then){
+      const nxt=job.__then(); chain=nxt;
+      setLog(`✓ [${job.step}] 完成（${el}s），继续：${nxt.step}…\n`+tail(j.out));
+      if(btn)btn.textContent='后续处理…';
+      const r2=await fetch('/api/run',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({step:nxt.step,args:nxt.args})}).then(x=>x.json()).catch(e=>({err:String(e)}));
+      if(!r2.ok){setLog('后续任务启动失败: '+(r2.err||''));if(btn)btn.disabled=false;break;}
+      id=r2.id; continue;
+    }
+    setLog((j.ok?'✓ 完成（'+el+'s）\n':'✗ 失败（'+el+'s）\n')+tail(j.out)+(j.err?'\n[stderr]\n'+tail(j.err):''));
+    if(btn){btn.disabled=false;btn.textContent=label||'运行';}
+    load();
+    break;
+  }
+}
+async function runJob(key,idx,btn){
+  const A=stageActions(key)[idx]; if(!A||A.step==="__noop")return;
+  const log=document.getElementById("runlog_"+key);
+  log.style.display='block'; log.textContent='启动中…';
+  const job={step:A.step,args:A.args};
+  if(A.then) job.__then=()=>A.then(job.args[job.args.length-1]);
+  await startGenericJob(job, log, btn, A.label);
+}
+function render(){
+ if(!cur){$('#view').innerHTML='<div class="card"><h3>请选择左侧项目</h3></div>';return;}
+ const v=$('#view');
+ const tabs={
+   overview:()=>homePage(),
+   lapian:()=>`<div class="card"><h3>${stageMap.lapian.title}</h3>${runBar("lapian")}<div class="grid">${stageFiles("lapian")}</div></div>`,
+   lines:()=>`<div class="card"><h3>${stageMap.lines.title}</h3>${runBar("lines")}<div class="grid">${stageFiles("lines")}</div></div>`,
+   story:()=>`<div class="card"><h3>${stageMap.story.title}</h3>${runBar("story")}<div class="grid">${stageFiles("story")}</div></div>`,
+   white:()=>`<div class="card"><h3>${stageMap.white.title}</h3>${runBar("white")}<div class="grid">${stageFiles("white")}</div></div>`,
+   explain:()=>`<div class="card"><h3>${stageMap.explain.title}</h3>${runBar("explain")}<div class="grid">${stageFiles("explain")}</div></div>`,
+   white3d:()=>`<div class="card"><h3>${stageMap.white3d.title}</h3>${runBar("white3d")}<div class="grid">${stageFiles("white3d")}</div></div>`,
+ };
+ v.innerHTML=(tabs[curTab]||tabs.overview)();
+ v.scrollTop=0;
+ watchLazy(v);
+ document.querySelectorAll('#view .clickable').forEach(el=>el.onclick=()=>openRel(el.dataset.rel));
+ document.querySelectorAll('[data-run]').forEach(b=>{
+   const [k,i]=b.dataset.run.split(':');
+   b.onclick=()=>runJob(k,parseInt(i,10),b);
+ });
+}
+document.querySelectorAll('.tab').forEach(t=>t.onclick=()=>{
+  curTab=t.dataset.t;syncTabs();render();setHash();
+});
+document.getElementById('rescan').onclick=load;
+document.getElementById('pjSearch').oninput=()=>renderList();
+document.getElementById('libHead').onclick=()=>{
+  const b=document.getElementById('libBody');
+  b.style.display=b.style.display==='none'?'block':'none';
+  document.getElementById('libHead').lastChild.textContent=b.style.display==='none'?' ▸':' ▾';
+};
+window.addEventListener('hashchange',()=>{readHash();renderList();loadSrc();syncTabs();render();});
+
+let srcVideos=[];
+function loadSrcLib(){
+  fetch('/api/sources').then(r=>r.json()).then(list=>{
+    srcVideos=list||[];
+    const cnt=document.getElementById('libCnt'); if(cnt) cnt.textContent='（'+list.length+'）';
+    const body=document.getElementById('libBody'); if(!body)return;
+    body.innerHTML=list.map(f=>`<div class="libitem" data-n="${esc(f.name)}"><span title="${esc(f.name)}" style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap">🎞 ${esc(f.name)} <span style="color:#6d8196">${f.mb}MB</span></span><button data-imp="${esc(f.name)}">导入项目</button></div>`).join('')||'<div class="libitem">Downloads 无视频</div>';
+    body.querySelectorAll('.libitem').forEach(el=>el.onclick=e=>{ if(e.target.dataset.imp)return; openSrcVideo(el.dataset.n); });
+    body.querySelectorAll('[data-imp]').forEach(b=>b.onclick=async e=>{
+      e.stopPropagation();
+      if(!cur){alert('请先选择项目');return;}
+      if(!confirm(`把「${b.dataset.imp}」复制到「${cur.name}/素材/」？`))return;
+      b.disabled=true;b.textContent='复制中…';
+      const r=await fetch('/api/import_src',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project:cur.name,name:b.dataset.imp})}).then(x=>x.json()).catch(e=>({err:String(e)}));
+      if(r.ok){b.textContent='✓ 已导入';load();}else{alert('导入失败：'+(r.err||''));b.disabled=false;b.textContent='导入项目';}
+    });
+  }).catch(()=>{});
+}
+function openSrcVideo(name){
+  const u='/src?p='+encodeURIComponent(name);
+  showModal(name, `<video src="${u}" controls autoplay style="max-width:100%;max-height:72vh"></video>
+    <div class="row" style="margin-top:10px"><button class="btn" id="srcImp">＋ 导入到当前项目「${cur?esc(cur.name):'?'}」的素材目录</button></div>`);
+  const b=document.getElementById('srcImp');
+  if(b)b.onclick=async()=>{
+    if(!cur){alert('请先选择项目');return;}
+    const r=await fetch('/api/import_src',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project:cur.name,name})}).then(x=>x.json()).catch(e=>({err:String(e)}));
+    if(r.ok){b.textContent='✓ 已导入到 '+r.path;load();}else alert('导入失败：'+(r.err||''));
+  };
+}
+function loadSrc(){
+ var box=document.getElementById('srclist');if(!box)return;
+ var cnt=document.getElementById('srccnt');
+ if(!cur){box.innerHTML='<div style="font-size:12px;color:#8fa5b8">先选择项目</div>';if(cnt)cnt.textContent='';return;}
+ var mat=[];
+ ['素材','成片','白模','白模3D','根目录'].forEach(k=>(cur.dirs[k]||[]).forEach(f=>{ if(/\.(mp4|mov|mkv)$/i.test(f)) mat.push({sub:k,f}); }));
+ if(cnt)cnt.textContent=mat.length?'（'+mat.length+'个）':'';
+ box.innerHTML=mat.slice(0,1).map(x=>{const rel=x.sub+"/"+x.f;
+   return `<div class="f"><span class="tag">${esc(x.sub)}</span> ${esc(x.f)}<video src="${mediaURL(rel)}%23t=2" controls preload="metadata"></video></div>`;}).join('')
+   || '<div style="font-size:12px;color:#8fa5b8">该项目暂无视频</div>';
+}
+load();
+</script></body></html>
+

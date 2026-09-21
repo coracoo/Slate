@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+  body{font:14px system-ui,sans-serif;margin:0;padding:14px;color:#17212d;background:#fff}
+  h2{font-size:16px;margin:0 0 8px} p{line-height:1.5;color:#485568}
+  button{border:1px solid #abb9c9;background:#f4f7fb;border-radius:8px;padding:8px 12px;margin:4px;cursor:pointer}
+  button:disabled{opacity:.5;cursor:default} #status{white-space:pre-wrap} .error{color:#a52222}
+  canvas{width:min(100%,600px);border:1px solid #b6c4d0;border-radius:8px}
+  #answer{font-weight:700}
+</style>
+<h2>参考图桥接 · Canary</h2>
+<p>此图由组件现场随机生成。先上传并让 ChatGPT 看图回答，再揭示答案核对。组件上传成功不代表模型已看见图像。</p>
+<button id="make" disabled>生成并上传 Canary</button>
+<button id="vision" disabled>验证 Vision</button>
+<button id="reveal" disabled>回答后揭示答案</button>
+<p id="status" role="status">等待工具结果…</p>
+<canvas id="picture" width="1200" height="675" hidden></canvas>
+<p id="answer" hidden></p>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const colors = [{name:'红色',hex:'#e53935'},{name:'蓝色',hex:'#1e58d5'},
+    {name:'绿色',hex:'#138c50'},{name:'黄色',hex:'#f4cc19'}];
+  const shapes = ['圆形','方形','三角形'];
+  const letters = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let test = null, expected = null, fileId = null, busy = false;
+  const random = length => {
+    const bytes = new Uint32Array(length);
+    crypto.getRandomValues(bytes);
+    return Array.from(bytes);
+  };
+  const status = (value,error=false) => {
+    $('status').textContent=value;
+    $('status').className=error?'error':'';
+  };
+  function accept(value) {
+    if(value?.status!=='prepared'||!value.test_id) return;
+    if(test?.test_id===value.test_id) return;
+    test=value; $('make').disabled=false;
+    status('验证入口已准备。请点击“生成并上传 Canary”。');
+  }
+  function draw() {
+    const nums=random(8);
+    const code=Array.from({length:6},(_,i)=>letters[nums[i]%letters.length]).join('');
+    const color=colors[nums[6]%colors.length], shape=shapes[nums[7]%shapes.length];
+    const canvas=$('picture'), ctx=canvas.getContext('2d');
+    ctx.fillStyle='#f5f6f7';ctx.fillRect(0,0,1200,675);
+    ctx.fillStyle=color.hex;ctx.fillRect(85,180,265,265);
+    ctx.fillStyle='#171b22';ctx.beginPath();
+    if(shape==='圆形') ctx.arc(985,312,128,0,2*Math.PI);
+    else if(shape==='方形') ctx.rect(860,187,250,250);
+    else {ctx.moveTo(985,170);ctx.lineTo(1115,450);ctx.lineTo(855,450);ctx.closePath();}
+    ctx.fill();
+    ctx.fillStyle='#121b27';ctx.font='bold 108px monospace';ctx.textAlign='center';
+    ctx.fillText(code,600,590);
+    canvas.hidden=false;
+    expected={code,left_color:color.name,right_shape:shape};
+    $('answer').hidden=true;$('answer').textContent='';
+  }
+  const canvasBlob = canvas => new Promise((resolve,reject)=>
+    canvas.toBlob(blob=>blob?resolve(blob):reject(Error('无法生成 PNG')),'image/png'));
+  $('make').onclick=async()=>{
+    if(!test||busy) return;
+    busy=true;$('make').disabled=true;$('vision').disabled=true;$('reveal').disabled=true;
+    try {
+      if(typeof window.openai?.uploadFile!=='function'||
+         typeof window.openai?.getFileDownloadUrl!=='function'||
+         typeof window.openai?.setWidgetState!=='function') throw Error('宿主缺少图片上传或状态接口');
+      draw();status('正在上传随机生成的 PNG…');
+      const blob=await canvasBlob($('picture'));
+      const file=new File([blob],'bridge_test.png',{type:'image/png'});
+      const uploaded=await window.openai.uploadFile(file,{library:true});
+      if(!uploaded?.fileId) throw Error('uploadFile 没有返回 fileId');
+      fileId=uploaded.fileId;
+      const download=await window.openai.getFileDownloadUrl({fileId});
+      if(!download?.downloadUrl) throw Error('getFileDownloadUrl 没有返回 downloadUrl');
+      const publicContext={type:'previs_bridge_canary',test_id:test.test_id,
+        references:[{reference_id:'T1',file_id:fileId}],
+        instruction:'请仅根据 T1 的图片像素回答用户视觉问题；若不可见请明确说 VISION_NOT_AVAILABLE。'};
+      window.openai.setWidgetState({modelContent:JSON.stringify(publicContext),
+        privateContent:{expected,upload_ok:true,download_url_ok:true,file_id:fileId},imageIds:[fileId]});
+      status('上传与取回链接均成功，已绑定 imageIds。下一步点击“验证 Vision”；尚未验证模型是否看见像素。');
+      $('vision').disabled=false;$('reveal').disabled=false;
+    } catch(error) { status('桥接准备失败：'+String(error.message||error),true);$('make').disabled=false; }
+    finally {busy=false;}
+  };
+  $('vision').onclick=async()=>{
+    if(!fileId||busy) return;
+    busy=true;$('vision').disabled=true;
+    try {
+      if(typeof window.openai?.sendFollowUpMessage!=='function') throw Error('宿主缺少 sendFollowUpMessage');
+      await window.openai.sendFollowUpMessage({prompt:
+        'Canary 视觉验证：只查看刚才组件上传的 T1 图片像素，回答画面下方的六位字符、左侧色块颜色、右侧图形形状。不要根据文件名或上下文猜测；若看不到图片像素，只回答 VISION_NOT_AVAILABLE。'});
+      status('已发起视觉提问。请先读 ChatGPT 答案，再点击“回答后揭示答案”核对；三项全部准确才算 Vision PASS。');
+    } catch(error) {status('视觉提问失败：'+String(error.message||error),true);$('vision').disabled=false;}
+    finally {busy=false;}
+  };
+  $('reveal').onclick=()=>{
+    if(!expected) return;
+    $('answer').textContent='本地答案：'+expected.code+'；'+expected.left_color+'；'+expected.right_shape;
+    $('answer').hidden=false;
+  };
+  window.addEventListener('openai:set_globals',event=>accept(event.detail?.globals?.toolOutput));
+  window.addEventListener('message',event=>{
+    if(event.source===window.parent&&event.data?.method==='ui/notifications/tool-result')
+      accept(event.data.params?.structuredContent);
+  });
+  accept(window.openai?.toolOutput);
+})();
+</script>
+</html>

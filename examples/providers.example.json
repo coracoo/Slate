@@ -1,0 +1,31 @@
+{
+  "_readme": "providers.json 结构示例（复制到 workbench/providers.json 后填入自己的 api_key；此文件绝不放真实 key）。一个厂商=一次 base_url+key，能力差异在 models/endpoints 各能力槽位，由后端按 kind 分发。",
+  "vendors": [
+    {
+      "id": "openai-compat",
+      "label": "OpenAI 兼容（示例）",
+      "enabled": false,
+      "base_url": "https://api.openai.com/v1",
+      "note": "文本/视觉/生图共用一个 key；换成任何 OpenAI 兼容服务只需改 base_url 与模型名",
+      "models": {
+        "text": "gpt-4o-mini",
+        "vision": "gpt-4o",
+        "image": "gpt-image-1",
+        "image_edit": "gpt-image-1",
+        "video": "",
+        "music": "",
+        "speech": ""
+      },
+      "endpoints": {
+        "text": "/chat/completions",
+        "vision": "/chat/completions",
+        "image": "/images/generations",
+        "image_edit": "/images/generations",
+        "video": "",
+        "music": "",
+        "speech": ""
+      },
+      "api_key": ""
+    }
+  ]
+}

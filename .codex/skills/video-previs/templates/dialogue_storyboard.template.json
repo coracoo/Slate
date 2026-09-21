@@ -1,0 +1,24 @@
+{
+  "project": "my_dialogue",
+  "title": "对话短剧白模模板",
+  "w": 960, "h": 540, "fps": 24,
+  "set": { "type": "tatami", "table": { "x": 0, "z": 0.6, "w": 3.6, "d": 1.2, "h": 0.5, "dishes": 6 } },
+  "actors": {
+    "A": { "name": "角色A", "pos": [0, 2.0], "shirt": [70, 92, 132], "style": "seated" },
+    "B": { "name": "角色B", "pos": [-2.0, 0.2], "shirt": [172, 92, 122], "style": "seated" },
+    "C": { "name": "角色C", "pos": [2.0, 0.2], "shirt": [66, 120, 152], "style": "seated" }
+  },
+  "shots": [
+    { "id": "S1 全景建立", "dur": 3.0, "cam": "wide", "fov": 50,
+      "move": "固定全景", "action": "三人围坐，建立空间", "line": "",
+      "prompt": "全景固定，三人围矮桌而坐，自然光。" },
+    { "id": "S2 A说话特写", "dur": 2.5, "cam": "cu", "target": "A", "fov": 36, "speaker": "A",
+      "move": "固定近景特写（浅景深）", "action": "A端碗说话",
+      "line": "这是A的台词。",
+      "prompt": "A面部特写，端碗说话，背景柔光虚化。" },
+    { "id": "S3 越A肩看B", "dur": 2.5, "cam": "ots", "host": "A", "target": "B", "fov": 40, "speaker": "B",
+      "move": "越肩反打", "action": "前景A背影，B回应",
+      "line": "这是B的回应。",
+      "prompt": "越肩镜头：前景A虚化肩膀，中景B说话。" }
+  ]
+}

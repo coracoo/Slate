@@ -1,0 +1,36 @@
+{
+  "project": "actor_fixture",
+  "actors": {
+    "a": {"name": "甲", "role": "克制", "profile_id": "a"},
+    "b": {"name": "乙", "role": "外向", "profile_id": "b"}
+  },
+  "props": [{"id": "phone", "name": "手机", "owner": "a"}],
+  "acting_context": {
+    "version": "actor-context-v1",
+    "continuity_id": "main",
+    "continuities": [{
+      "id": "main",
+      "initial_state": {
+        "a": {"known_facts": [], "props": {"holding": "phone"}},
+        "b": {"known_facts": [], "props": {}}
+      }
+    }],
+    "facts": [
+      {"id": "f_public", "text": "乙说出公开消息"},
+      {"id": "f_secret", "text": "甲藏着证据"}
+    ],
+    "events": [
+      {"id": "ev1", "continuity_id": "main", "order": 1, "deltas": [{"actor_id": "b", "known_facts_add": ["f_public"]}]},
+      {"id": "ev2", "continuity_id": "main", "order": 2, "deltas": [{"actor_id": "a", "known_facts_add": ["f_public"]}]},
+      {"id": "ev3", "continuity_id": "main", "order": 3, "deltas": [{"actor_id": "a", "emotion": "紧张"}]}
+    ]
+  },
+  "shots": [
+    {"id": "S1", "dur": 4, "scene": "room", "cam": "wide", "pos": [0, 2, 1], "look": [0, 0, 1], "speaker": "b", "action": "乙开口"},
+    {"id": "S2", "dur": 4, "scene": "room", "cam": "ots", "pos": [1, 2, 1], "look": [0, 0, 1], "speaker": "a", "action": "甲倾听"},
+    {"id": "S3", "dur": 4, "scene": "room", "cam": "cu", "pos": [0, 2, 1], "look": [0, 0, 1], "speaker": "a", "action": "甲回应"},
+    {"id": "S4", "dur": 4, "scene": "room", "cam": "ots", "pos": [1, 2, 1], "look": [0, 0, 1], "speaker": "b", "action": "乙追问"},
+    {"id": "S5", "dur": 4, "scene": "room", "cam": "two", "pos": [0, 2, 1], "look": [0, 0, 1], "action": "两人对峙"},
+    {"id": "S6", "dur": 4, "scene": "room", "cam": "cu", "pos": [0, 2, 1], "look": [0, 0, 1], "speaker": "a", "action": "甲握紧手机"}
+  ]
+}

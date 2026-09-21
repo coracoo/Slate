@@ -1,0 +1,7 @@
+numpy
+Pillow
+opencv-python
+openpyxl
+rapidocr_onnxruntime
+faster-whisper
+websocket-client==1.9.2
