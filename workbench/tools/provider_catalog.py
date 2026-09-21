@@ -21,13 +21,13 @@ def _vendor(vid, label, base, models, endpoints=None, note='', extra=None, enabl
                 note=note, extra=extra or {})
 
 DEFAULT_VENDORS = [
-    _vendor('local-comfyui','ComfyUI','http://192.168.0.134:8188',
+    _vendor('local-comfyui','ComfyUI','',
             {'image':'z_image_turbo_int8_convrot.safetensors','image_edit':'qwen_image_edit_2511_int8_convrot.safetensors','video':'minimax_h3_fl2va_pruned_int8_convrot.safetensors'},
             {'image':'/prompt','image_edit':'/prompt','video':'/prompt'},
             '本地或局域网工作流；生图、改图、视频分别配置。',
-            {'workflow_path':'','image_edit_workflow_path':''},True),
+            {'workflow_path':'','image_edit_workflow_path':''}),
     _vendor('chatgpt-queue','ChatGPT · chrome-use','',{'image':'chatgpt-web'},
-            note='服务由 image-use 提供；浏览器登录 ChatGPT，一次一张、串行导入。',enabled=True),
+            note='服务由 image-use 提供；浏览器登录 ChatGPT，一次一张、串行导入。'),
     _vendor('doubao','火山方舟 · Agent Plan','https://ark.cn-beijing.volces.com/api/plan/v3',
             {'text':'doubao-seed-evolving','vision':'doubao-seed-evolving','image':'doubao-seedream-5.0-pro'},
             {'image':'/images/generations','video':'/contents/generations/tasks'},'Agent Plan 视频模型需按当前套餐填写；Seedance 1.5 Pro 不适用于此接口。'),

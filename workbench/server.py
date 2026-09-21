@@ -4,8 +4,8 @@
 """
 import os,json,copy,subprocess,sys,re,urllib.parse,urllib.request,html,threading,shutil,socket,glob,time,importlib.util,hashlib,base64
 # 必须在加载业务模块之前拒绝旧解释器，避免页面可用而延迟导入失败。
-if sys.version_info < (3, 12):
-    raise SystemExit("Slate 需要 Python 3.12+；请用 py -3.12 -m venv .venv 或 uv venv --python 3.12 .venv 重建环境。")
+if sys.version_info[:2] != (3, 12):
+    raise SystemExit("Slate 需要 Python 3.12.x；请用 uv venv --python 3.12 --seed .venv 重建环境。")
 from email.parser import BytesParser
 from email.policy import default as email_default_policy
 from http.server import ThreadingHTTPServer,BaseHTTPRequestHandler

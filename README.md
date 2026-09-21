@@ -22,7 +22,7 @@
 | 依赖 | 用途 |
 |---|---|
 | Git | 克隆和更新源码 |
-| Python **3.12+** + pip | 推荐 3.12，使用独立虚拟环境 |
+| uv + CPython **3.12** | 用 uv 安装并固定 Python 3.12；不要用系统 Python 3.11 创建环境 |
 | Node.js 22.18+（或更新 LTS）+ npm | 前端构建与 TypeScript 测试 |
 | FFmpeg / FFprobe | 视频处理、抽帧、尾帧提取、拼接；安装后加入 PATH |
 | Chrome | 仅 ChatGPT 网页生图需要 |
@@ -35,7 +35,9 @@
 git clone https://github.com/coracoo/Slate.git
 cd Slate
 
-py -3.12 -m venv .venv
+# 若尚未安装 uv，请先按 https://docs.astral.sh/uv/getting-started/installation/ 安装
+uv python install 3.12
+uv venv --python 3.12 --seed .venv
 .\.venv\Scripts\python.exe -m pip install --upgrade pip
 .\.venv\Scripts\python.exe -m pip install --require-hashes -r requirements-win-py312.lock
 
@@ -49,11 +51,11 @@ Pop-Location
 .\.venv\Scripts\python.exe workbench/server.py 8775
 ```
 
-使用 uv 时，可运行 `uv python install 3.12` 和 `uv venv --python 3.12 --seed .venv` 创建虚拟环境。通过 `.\.venv\Scripts\python.exe --version` 检查解释器版本。
+通过 `.\.venv\Scripts\python.exe --version` 检查解释器版本，必须显示 3.12.x。不要使用默认的 `python -m venv`，也不要用其他 Python 版本安装这份锁文件。
 
 `requirements-win-py312.lock` 包含 Windows / Python 3.12 的固定依赖版本与文件哈希。
 
-打开 **http://127.0.0.1:8775**。首页可新建“制作”项目，无需先上传影片。进入“环境检查”，配置要使用的模型或安装网页生图工具。
+打开 **http://127.0.0.1:8775**。首页可新建“制作”项目，无需先上传影片。进入“环境检查”，填写 API Key、模型和地址后，再手动启用需要的厂商；首次启动不会启用任何 AI 厂商。
 
 服务当前监听 `0.0.0.0:8775`。局域网访问需要放行防火墙；管理接口面向可信网络，不要直接把整个工作台映射到公网。GPU 不是工作台本身的要求，本地模型和深度推理的资源需求另算。
 

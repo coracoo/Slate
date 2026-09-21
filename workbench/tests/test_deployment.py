@@ -18,6 +18,11 @@ class DeploymentTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, 'Python 3.12'):
                     runpy.run_path(str(ROOT / 'workbench' / name), run_name='__main__')
 
+    def test_newer_python_is_rejected_for_the_pinned_lockfile(self):
+        with patch.object(sys, 'version_info', (3, 13, 0)):
+            with self.assertRaisesRegex(SystemExit, 'Python 3.12'):
+                runpy.run_path(str(ROOT / 'workbench' / 'server.py'), run_name='__main__')
+
     def test_install_groups_reject_arbitrary_commands(self):
         from workbench.tools.install_environment import normalize_groups, commands
         for value in ([], None, ["pip install evil"], ["base", 1]):

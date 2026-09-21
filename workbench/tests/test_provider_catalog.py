@@ -29,6 +29,13 @@ class CatalogTests(unittest.TestCase):
         self.assertEqual([v['id'] for v in rows], list(catalog.ORDER))
         self.assertNotIn('local-codex', [v['id'] for v in rows])
 
+    def test_public_defaults_are_disabled_and_have_no_local_address(self):
+        self.assertTrue(catalog.DEFAULT_VENDORS)
+        self.assertTrue(all(not row['enabled'] for row in catalog.DEFAULT_VENDORS))
+        comfy = next(row for row in catalog.DEFAULT_VENDORS if row['id'] == 'local-comfyui')
+        self.assertEqual(comfy['base_url'], '')
+        self.assertTrue(all(not row.get('api_key') for row in catalog.DEFAULT_VENDORS))
+
     def test_preserves_custom_values_and_secrets(self):
         old = {'id':'minimax','api_key':'private-key','enabled':True,
                'base_url':'https://custom.example/v1','models':{'video':'custom-model'},
