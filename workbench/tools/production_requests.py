@@ -12,6 +12,36 @@ from reference_limits import reference_limit
 from video_profiles import capabilities, settings, validate_media, public_url
 
 
+
+PERFORMANCE_NOTE = '表演指导（只补充可见表演，不改变机位/走位/台词）'
+
+
+def _performance_rows(board, shots, media_type):
+    """已采用且未过期的演员表演 → 提交时注入行。
+
+    复用 prompt_compiler 的节拍格式化（image 自动只取末拍）与新鲜度公式
+    （pop 本镜 performance 后 artifact_hash 比对）；过期表演静默不注入，
+    与旧创作线行为一致——表演层永远不擅自改写镜头事实。
+    """
+    perf_shots = [x for x in shots if isinstance(x.get('performance'), dict) and x['performance'].get('status') == 'ready']
+    if not perf_shots: return []
+    from prompt_compiler import _performance_text
+    rows = []
+    for shot in perf_shots:
+        perf = shot['performance']
+        if perf.get('source_hash'):
+            try:
+                from artifact_provenance import artifact_hash
+                probe = copy.deepcopy(board)
+                for item in probe.get('shots') or []:
+                    if str(item.get('id')) == str(shot.get('id')): item.pop('performance', None); break
+                if perf['source_hash'] != artifact_hash(probe, 'prompt', 'actor-v1'): continue
+            except Exception:
+                continue
+        for r in _performance_text(perf, board.get('actors') or {}, media_type):
+            rows.append(f"{shot['id']} {r}" if media_type == 'video' else r)
+    return rows
+
 def compile_request(project, body, cfg):
     board, revision = read_board(project, body['board'])
     if body.get('revision') and body['revision'] != revision: raise ValueError('分镜已被修改，请刷新后重试')
@@ -83,6 +113,8 @@ def compile_request(project, body, cfg):
         prompt += '\n只绘制一张独立关键帧，画幅 16:9。'
     else:
         prompt += f"\n总时长 {float(unit['duration']):g} 秒，画幅 {video_options.get('ratio', '16:9')}。连续视频，保持人物身份与场景空间连续。"
+    perf_rows = _performance_rows(board, shots, kind)
+    if perf_rows: prompt += '\n' + PERFORMANCE_NOTE + '：' + '；'.join(perf_rows)
     negs = []
     for s in shots:
         n = s.get('negative') or []

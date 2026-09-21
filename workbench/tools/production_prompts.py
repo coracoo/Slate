@@ -89,4 +89,7 @@ def media_source_hash(shots, kind, unit=None):
     if kind == 'video':
         payload['keyframes'] = [(s.get('keyframe') or {}).get('sha256') for s in shots]
         payload['unit'] = {k: (unit or {}).get(k) for k in ('id', 'duration', 'prompt_video', 'prompt_grid', 'negative', 'generation_options')}
+        # 采用/更换演员表演后旧视频应提示重生成；仅在存在表演时并入指纹，保证无表演的旧绑定不误报过期
+        perf = [(s.get('id'), (s.get('performance') or {}).get('status') or '', (s.get('performance') or {}).get('source_hash') or '') for s in shots]
+        if any(p[1] for p in perf): payload['performance'] = perf
     return fingerprint(payload)

@@ -209,6 +209,48 @@ class ProductionExecutionTests(unittest.TestCase):
         self.assertEqual(refreshed['prompt_image'], '模型静帧')
         self.assertEqual(refreshed['prompt_grid'], '格序1')
 
+    def test_adopted_performance_changes_submitted_prompt(self):
+        # 验收标准：只改已采用表演 → 实际提交 prompt 必变；镜头事实（时长/时间轴/其余正文）不被演员层改动
+        from production_requests import compile_request
+        from production_prompts import media_source_hash
+        body = {**self.body, 'scope': 'V', 'target': self.board['video_units'][0]['id']}
+        r1 = compile_request(self.root, body, self.cfg)
+        self.assertNotIn('表演指导', r1['prompt'])
+        perf = {'status': 'ready', 'source_hash': '',
+                'packet': {'actors': [{'actor_id': 'c', 'beats': [{'at': 0, 'duration': 2, 'intent': '施压', 'posture': '前倾按案'}]}]}}
+        self.board['shots'][0]['performance'] = copy.deepcopy(perf)
+        self.path.write_text(json.dumps(self.board), encoding='utf-8')
+        r2 = compile_request(self.root, body, self.cfg)
+        self.assertIn('表演指导', r2['prompt']); self.assertIn('施压', r2['prompt'])
+        def strip(p): return p.split('\n表演指导')[0]
+        self.assertEqual(strip(r1['prompt']), strip(r2['prompt']))   # 表演段之外逐字不变
+        perf['packet']['actors'][0]['beats'][0]['intent'] = '隐忍'
+        self.board['shots'][0]['performance'] = copy.deepcopy(perf)
+        self.path.write_text(json.dumps(self.board), encoding='utf-8')
+        r3 = compile_request(self.root, body, self.cfg)
+        self.assertNotEqual(r2['prompt'], r3['prompt']); self.assertIn('隐忍', r3['prompt'])
+        # 过期表演（source_hash 不匹配）静默不注入
+        self.board['shots'][0]['performance'] = {**copy.deepcopy(perf), 'source_hash': 'stale'}
+        self.path.write_text(json.dumps(self.board), encoding='utf-8')
+        r4 = compile_request(self.root, body, self.cfg)
+        self.assertNotIn('表演指导', r4['prompt'])
+        # S 图请求注入末拍冻结瞬间：两个节拍只取最后一个
+        img_perf = {'status': 'ready', 'source_hash': '',
+                    'packet': {'actors': [{'actor_id': 'c', 'beats': [
+                        {'at': 0, 'duration': 1, 'intent': '起势', 'posture': '后仰'},
+                        {'at': 2, 'duration': 1, 'intent': '落定', 'gaze': '直锁对方'}]}]}}
+        self.board['shots'][0]['performance'] = img_perf
+        self.path.write_text(json.dumps(self.board), encoding='utf-8')
+        r5 = compile_request(self.root, {**body, 'scope': 'S', 'target': 'S1', 'type': 'image'}, self.cfg)
+        self.assertIn('落定', r5['prompt']); self.assertNotIn('起势', r5['prompt'])
+        # 采用表演 → video 指纹联动（提示重生成）、image 关键帧指纹不受影响
+        unit = self.board['video_units'][0]
+        with_perf = media_source_hash(self.board['shots'], 'video', unit)
+        no_perf = media_source_hash([{**x, 'performance': None} for x in self.board['shots']], 'video', unit)
+        self.assertNotEqual(with_perf, no_perf)
+        self.assertEqual(media_source_hash(self.board['shots'][:1], 'image', None),
+                         media_source_hash([{**self.board['shots'][0], 'performance': None}], 'image', None))
+
     def test_authored_s_and_v_survive_llm_refresh(self):
         from production_jobs import llm_task
         self.board['shots'][0]['prompt_video_source'] = 'llm'
