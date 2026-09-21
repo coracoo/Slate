@@ -80,7 +80,7 @@ class ProductionExecutionTests(unittest.TestCase):
         self.board['video_units'][0].update(prompt_video='场景连续动作', prompt_grid='两个独立镜头从左到右')
         self.path = self.root / '分镜/剧本_E1.json'
         self.path.write_text(json.dumps(self.board), encoding='utf-8')
-        self.cfg = {'id': 'doubao-api', 'enabled': True, 'models': {'video': 'seedance-2.5'}, 'base_url': 'https://ark.cn-beijing.volces.com/api/v3'}
+        self.cfg = {'id': 'doubao-api', 'enabled': True, 'models': {'video': 'seedance-2.5', 'image': 'seedream-4'}, 'base_url': 'https://ark.cn-beijing.volces.com/api/v3'}
         self.providers = self.root / 'providers-test.json'
         self.providers.write_text(json.dumps({'vendors': [self.cfg]}), encoding='utf-8')
         self.body = {'project': self.root.name, 'action': 'generate', 'scope': 'V', 'target': self.board['video_units'][0]['id'],
@@ -141,6 +141,25 @@ class ProductionExecutionTests(unittest.TestCase):
         self.assertEqual(saved['video_units'][0]['video_binding']['item_id'], first['item_id'])
         with self.assertRaises(ValueError): execute(req, self.providers)
         self.assertEqual(client.generate_video.call_count, 1)
+
+    def test_worker_image_request_passes_structured_ratio(self):
+        # S 图请求必须像旧 create_media 入口一样显式传 size/ratio——
+        # 云端图像模型对提示词里的中文「画幅 16:9」服从度低，缺 extra 就按默认画幅出图。
+        from production_jobs import enqueue, execute
+        from PIL import Image
+        body = {**self.body, 'scope': 'S', 'target': 'S1', 'type': 'image'}
+        first = enqueue(self.root, body, Mock(return_value=100), self.providers)
+        req = json.loads((self.root / '创作' / first['item_id'] / 'request.json').read_text(encoding='utf-8'))
+        client = Mock(id='doubao-api', cfg=self.cfg)
+        client.last_request = None
+        def generate(*a, **kw): Image.new('RGB', (64, 36), 'blue').save(kw['out_path'])
+        client.generate_image.side_effect = generate
+        with patch('llm_openai.VendorClient', return_value=client):
+            execute(req, self.providers)
+        kwargs = client.generate_image.call_args.kwargs
+        self.assertEqual(kwargs['extra'], {'size': '2k', 'ratio': '16:9'})
+        result = json.loads((self.root / '创作/creation.json').read_text(encoding='utf-8'))['items'][0]
+        self.assertEqual(result['status'], 'done')
 
     def test_s_selection_can_generate_video_and_does_not_change_v_duration(self):
         from production_requests import compile_request

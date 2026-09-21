@@ -319,7 +319,12 @@ def execute(packet, providers):
                     from image_use_runtime import generate_image
                     generate_image(prompt, str(out), refs=paths, timeout=1800)
                 else:
-                    client.generate_image(prompt, out_path=str(out), image_refs=paths, mode=packet['image_mode'], model=packet['model'], timeout=1800)
+                    # 与旧 create_media 入口同源：画幅走结构化 size/ratio 字段，
+                    # 不能只靠提示词里的「画幅 16:9」——云端图像模型对中文画幅词服从度低。
+                    from create_media import image_size_for_aspect, image_ratio_for_aspect
+                    ratio = str((packet.get('image_options') or {}).get('ratio') or '16:9')
+                    client.generate_image(prompt, out_path=str(out), image_refs=paths, mode=packet['image_mode'], model=packet['model'], timeout=1800,
+                                          extra={"size": image_size_for_aspect(ratio), "ratio": image_ratio_for_aspect(ratio)})
                 from PIL import Image
                 with Image.open(out) as generated: generated.verify()
                 info = {}
