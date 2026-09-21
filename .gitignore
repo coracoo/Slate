@@ -79,3 +79,4 @@ workbench/mcp_runtime.json.*
 .codex/*.json
 .codex/*.toml
 .codex/*.log
+workbench/studio_settings.json

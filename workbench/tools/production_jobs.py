@@ -11,7 +11,7 @@ import shutil
 import sys
 import uuid
 from pathlib import Path
-from production_studio import project_store, board_path, read_board, save_units, save_shots, validate_units, shot_list, shot_unit, inside
+from production_studio import project_store, board_path, read_board, save_units, save_shots, validate_units, shot_list, shot_unit, inside, duration_cap
 from production_prompts import CONTRACT, LLM_FIELDS, source_hash, media_source_hash, require_prompts
 from production_media import bound_path, binding, digest, tail_frame, make_grid, concatenate, probe
 
@@ -194,7 +194,10 @@ def llm_task(project, packet, client):
     if packet['action'] == 'prompts':
         instruction = '只补写 shots 的 prompt_image 与 prompt_video 两类提示词，镜号、镜头顺序和所有事实不得改变。返回 shots 数组（id 与这两个 prompt 字段）。宫格文案是人工配置字段，不要生成。'
     else:
-        instruction = '只输出 video_units 分组及 prompt_video/negative/title，不重写 shots，也不要生成宫格文案。'
+        cap = duration_cap()
+        instruction = (f'只输出 video_units 分组及 prompt_video/negative/title，不重写 shots，也不要生成宫格文案。'
+                      f'分组目标时长：每个 V 的成员 dur 之和不超过 {cap} 秒——同场景连续优先合并，'
+                      f'同一段剧情尽量放在一起，时长放不下就切到下一个 V；超上限的分组保存时会被自动拆分。')
     response = client.chat([{'role': 'system', 'content': CONTRACT + '\n' + instruction},
                             {'role': 'user', 'content': json.dumps(snapshot, ensure_ascii=False)}], kind='text', max_tokens=24000, timeout=720,
                            extra={'thinking': {'type': 'disabled'}})

@@ -2073,6 +2073,24 @@ class H(BaseHTTPRequestHandler):
         jid=self.spawn_job("create_batch",cmd)
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"id":jid,"job":True},ensure_ascii=False).encode())
 
+    @route('GET', '/api/studio/settings')
+    def route_get_studio_settings(self, ctx):
+        try:
+            mod = tools_mod('production_studio.py')
+            return self._send_run_json(200, {'ok': True, **mod.load_settings()})
+        except Exception as exc:
+            return self._send_run_json(500, {'ok': False, 'err': scrub_err(exc)})
+
+    @route('POST', '/api/studio/settings')
+    def route_post_studio_settings(self, ctx):
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8', 'replace') or b'{}')
+        try:
+            mod = tools_mod('production_studio.py')
+            data = mod.save_settings(body)
+            return self._send_run_json(200, {'ok': True, **data})
+        except Exception as exc:
+            return self._send_run_json(400, {'ok': False, 'err': scrub_err(exc)})
+
     @route('GET', '/api/studio/data', '/api/studio/voices')
     def route_get_production_studio(self, ctx):
         q = ctx.query

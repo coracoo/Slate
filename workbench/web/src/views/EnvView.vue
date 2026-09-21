@@ -7,6 +7,7 @@ import {
   MODEL_SLOTS, type EnvInfo, type Vendor, type ModelSlot, type TestResult
 } from '../api'
 import { toast } from '../stores/app'
+import { fetchStudioSettings, saveStudioSettings } from '../utils/productionStudio'
 import StyledSelect from '../components/StyledSelect.vue'
 import EnvironmentInstaller from '../components/EnvironmentInstaller.vue'
 import ChromeUseEnvironment from '../components/ChromeUseEnvironment.vue'
@@ -28,6 +29,17 @@ const hasSpeechExtra = (v: Vendor) => v.id === 'doubao'
 /* ---------- 本机环境 ---------- */
 const env = ref<EnvInfo | null>(null)
 const detecting = ref(false)
+/* 制作默认：V 分组目标生成时长（8/15/30s），分组合法性与主流模型提交能力对齐 */
+const defaultDuration = ref(15)
+const durationSaving = ref(false)
+async function loadStudioSettings() { try { defaultDuration.value = (await fetchStudioSettings()).default_video_duration } catch { /* 保持默认 */ } }
+async function saveDuration() {
+  durationSaving.value = true
+  try { const r = await saveStudioSettings({ default_video_duration: Number(defaultDuration.value) }); defaultDuration.value = r.default_video_duration; toast('制作默认已保存', 'ok') }
+  catch (e) { toast(e instanceof Error ? e.message : '保存失败', 'err') }
+  finally { durationSaving.value = false }
+}
+
 async function detect() {
   detecting.value = true
   try {
@@ -269,6 +281,7 @@ async function fetchModels(v: Vendor, slot: ModelSlot) {
 }
 
 onMounted(() => {
+  void loadStudioSettings()
   detect()
   loadConfig()
   loadComfyWorkflows()
@@ -286,6 +299,24 @@ onMounted(() => {
     <MediaGatewayEnvironment />
 
     <EnvironmentInstaller @installed="detect" />
+    <!-- 制作默认：V 分组目标生成时长 -->
+    <section class="glass mb-5 p-5" :style="{ '--glow': 'rgba(251,191,36,0.22)' }">
+      <div class="mb-3 flex items-center gap-2">
+        <h3 class="text-xs font-bold tracking-wider text-slate-500">制作默认</h3>
+      </div>
+      <div class="flex flex-wrap items-end gap-3">
+        <label class="text-[10px] text-slate-500">默认生成视频时长（V 分组上限）
+          <select v-model.number="defaultDuration" class="input mt-1 w-36">
+            <option :value="8">8 秒</option>
+            <option :value="15">15 秒（主流）</option>
+            <option :value="30">30 秒（长片段模型）</option>
+          </select>
+        </label>
+        <button class="btn" :disabled="durationSaving" @click="saveDuration">{{ durationSaving ? '保存中…' : '保存' }}</button>
+        <p class="flex-1 text-[10px] leading-relaxed text-slate-500">V 分组与自动拆分按此时长执行；同场景连续镜头超过上限会自动切成多个 V（提示词继承并标记待重写）。个别厂商模型上限更低时以提交阶段的模型校验为准。</p>
+      </div>
+    </section>
+
     <!-- 上半：本机环境 -->
     <section class="glass mb-5 p-5" :style="{ '--glow': GLOW }">
       <div class="mb-4 flex items-center gap-2">

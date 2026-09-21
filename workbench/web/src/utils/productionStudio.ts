@@ -16,6 +16,7 @@ export interface VideoUnit {
   id: string; label?: string; title: string; shot_ids: string[]; scene_ref?: string; duration: number
   prompt_video?: string; prompt_grid?: string; negative?: string; source_hash?: string; stale?: boolean
   video_binding?: MediaBinding; video_stale?: boolean; generation_options?: GenerationOptions; timeline?: {shot_id: string; start: number; end: number}[]
+  judge?: {ok: boolean; warnings: string[]}
 }
 export interface StudioState {
   board: {shots: ProductionShot[]; video_units?: VideoUnit[]}; revision: string
@@ -25,4 +26,6 @@ export interface StudioState {
 export type ProductionItem = CreateItem & {scope?: string; unit_id?: string; actual_duration?: number; archive_error?: string}
 export const studioData = (project: string, board: string) => getJSON<StudioState>(`/api/studio/data?project=${encodeURIComponent(project)}&board=${encodeURIComponent(board)}`)
 export const studioPost = (path: string, body: unknown) => postJSON<{ok: boolean; id?: number; item_id?: string; reused?: boolean}>(`/api/studio/${path}`, body)
+export const fetchStudioSettings = () => getJSON<{ok: boolean; default_video_duration: number}>('/api/studio/settings')
+export const saveStudioSettings = (body: {default_video_duration: number}) => postJSON<{ok: boolean; default_video_duration: number}>('/api/studio/settings', body)
 export const submitStudioJob = (body: RequestBody, recover = false) => navigator.locks.request('slate-production:' + body.project, () => durableRequest(body, b => studioPost('job', b), recover))

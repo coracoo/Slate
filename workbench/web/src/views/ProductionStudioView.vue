@@ -212,7 +212,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
         <button class="btn w-full" :disabled="busy || !board || !textVendor" @click="job('group')">自动合并分镜</button>
         <button v-if="!units.length" class="btn btn-ghost w-full" :disabled="!board" @click="initialize">先按场景建立 V 分组</button>
         <button v-for="u in units" :key="u.id" class="unit-card" :class="{'selected': u.id === selectedUnit}" @click="chooseUnit(u)">
-          <b>{{ u.label }} · {{ u.title }}</b><small>{{ u.shot_ids.join(' · ') }} · {{ u.duration }}s</small>
+          <b>{{ u.label }} · {{ u.title }}<span v-if="u.judge?.warnings?.length" class="ml-1 cursor-help text-amber-300" :title="u.judge.warnings.join('\n')">！</span></b><small>{{ u.shot_ids.join(' · ') }} · {{ u.duration }}s</small>
           <small class="unit-status" :class="u.stale || u.video_stale ? 'is-pending' : 'is-ready'">{{ u.stale ? '汇总待更新' : u.video_stale ? '已采用视频待确认' : u.video_binding ? '已采用视频' : '待生成视频' }}</small>
         </button>
         <button class="btn w-full" :disabled="busy || !units.length" @click="concatQuality = 'master'; job('concat')">拼接已采用 V → 集视频（交付母版）</button>
@@ -220,7 +220,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
       </aside>
       <main class="glass min-w-0 space-y-4 p-4">
         <section v-if="unit" class="space-y-2 border-b border-white/10 pb-4">
-          <div class="flex items-center gap-2"><b class="text-sky-300">{{ unit.label }}</b><input v-model="unit.title" class="control" @input="dirty = true" /></div>
+          <div class="flex items-center gap-2"><b class="text-sky-300">{{ unit.label }}</b><span v-if="unit.judge?.warnings?.length" class="cursor-help text-amber-300" :title="unit.judge.warnings.join('\n')">！提示词可能无法完整生成（悬浮看详情）</span><input v-model="unit.title" class="control" @input="dirty = true" /></div>
           <label class="block text-xs text-slate-400">完整分镜视频提示词<button class="ml-2 text-sky-300" :disabled="busy || !!optimizing || !textVendor" @click="optimize('V', unit.id, 'prompt_video')">重新生成 / 优化</button><textarea v-model="unit.prompt_video" class="control mt-1" rows="4" @input="dirty = true" /></label>
           <details><summary class="text-xs text-violet-300">宫格布局提示词（可选，仅故事板宫格参考模式需要）</summary><button class="text-xs text-sky-300" :disabled="busy || !!optimizing || !textVendor" @click="optimize('V', unit.id, 'prompt_grid')">重新生成 / 优化</button><textarea v-model="unit.prompt_grid" class="control mt-2" rows="3" placeholder="留空即可——宫格由已采用关键帧自动排版；选择故事板宫格参考模式时再按需填写布局说明" @input="dirty = true" /></details>
           <div class="flex flex-wrap gap-2"><span v-for="beat in unit.timeline" :key="beat.shot_id" class="rounded-lg bg-sky-950/40 px-2 py-1 text-xs text-sky-200">{{ beat.shot_id }} · {{ beat.start }}–{{ beat.end }}s</span></div>

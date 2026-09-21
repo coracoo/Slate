@@ -40,6 +40,61 @@ class ProductionContractTests(unittest.TestCase):
         self.assertEqual([(v['start'], v['end']) for v in beats], [(0, 5), (5, 10)])
         self.assertEqual(b['shots'][0]['dur'], 3)
 
+    def test_default_units_caps_by_duration(self):
+        # N84：同场景连续 + 累积时长 ≤ 上限；放不下自动切下一个 V
+        b = {'shots': [dict(id=f'S{i}', dur=4, scene_ref='@scene:a', prompt_image='a', prompt_video='v') for i in range(1, 7)]}
+        units = studio.default_units(b, cap=15)
+        self.assertEqual([u['shot_ids'] for u in units], [['S1', 'S2', 'S3'], ['S4', 'S5', 'S6']])
+        self.assertTrue(all(u['duration'] == 12 for u in units))
+
+    def test_validate_units_rejects_over_cap(self):
+        b = {'shots': [dict(id=f'S{i}', dur=6, scene_ref='@scene:a') for i in range(1, 4)]}
+        units = studio.default_units(b, cap=30)   # 18s 单组（30 上限下合法）
+        with self.assertRaisesRegex(ValueError, '上限'):
+            studio.validate_units(b, units)       # 15s 默认上限下非法
+
+    def test_clean_units_auto_splits_inheriting_prompt(self):
+        # 超上限 V 保存时自动拆：首段保 id，两段继承汇总提示词（成员变→source_hash 自然 stale 待重写）
+        b = {'shots': [dict(id=f'S{i}', dur=4, scene_ref='@scene:a', prompt_image='a', prompt_video='v') for i in range(1, 7)]}
+        big = [{'id': 'v-1', 'title': 'a', 'shot_ids': [f'S{i}' for i in range(1, 7)], 'scene_ref': '@scene:a',
+                'prompt_video': '整段汇总', 'duration': 24}]
+        clean = studio.clean_units(b, big)
+        self.assertEqual([len(u['shot_ids']) for u in clean], [3, 3])
+        self.assertEqual(clean[0]['id'], 'v-1')
+        self.assertTrue(all(u['prompt_video'] == '整段汇总' for u in clean))
+        self.assertTrue(all(u['duration'] == 12 for u in clean))
+
+    def test_timeline_locks_dialogue_at_speech_floor(self):
+        # N84：对白镜头锁定 max(叙事, 语速下限 4字/s)；纯视觉镜头分摊剩余伸缩量
+        b = {'shots': [dict(id='S1', dur=2, scene_ref='@scene:a', lines=[{'speaker': 'c', 'line': 'x' * 20}]),
+                       dict(id='S2', dur=8, scene_ref='@scene:a')]}
+        beats = studio.timeline(b, {'shot_ids': ['S1', 'S2'], 'duration': 10})
+        self.assertEqual(beats[0]['end'] - beats[0]['start'], 5.0)
+        self.assertAlmostEqual(beats[1]['end'] - beats[1]['start'], 5.0)
+
+    def test_judge_flags_dialogue_overflow_and_cap(self):
+        b = {'shots': [dict(id='S1', dur=1, scene_ref='@scene:a', lines=[{'speaker': 'c', 'line': 'x' * 20}])]}
+        verdict = studio.judge_unit(b, {'shot_ids': ['S1'], 'duration': 2}, cap=15)
+        self.assertFalse(verdict['ok'])
+        self.assertTrue(any('自然语速' in w for w in verdict['warnings']))
+        verdict2 = studio.judge_unit(b, {'shot_ids': ['S1'], 'duration': 20}, cap=15)
+        self.assertTrue(any('上限' in w for w in verdict2['warnings']))
+
+    def test_settings_roundtrip_and_choices(self):
+        import tempfile
+        from pathlib import Path as _P
+        old = studio.SETTINGS_PATH
+        with tempfile.TemporaryDirectory() as td:
+            studio.SETTINGS_PATH = _P(td) / 's.json'
+            try:
+                self.assertEqual(studio.load_settings()['default_video_duration'], 15)
+                studio.save_settings({'default_video_duration': 8})
+                self.assertEqual(studio.duration_cap(), 8)
+                with self.assertRaises(ValueError):
+                    studio.save_settings({'default_video_duration': 12})
+            finally:
+                studio.SETTINGS_PATH = old
+
     def test_master_spec_no_downscale_and_orientation(self):
         # 母版规格推导：不降档、取向按多数、帧率取最大、奇数取偶（N82）
         from production_media import resolve_master_spec
