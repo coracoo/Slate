@@ -69,7 +69,8 @@ def enqueue(project, body, spawn, providers):
             ref = u['video_binding']; bound_path(project, ref)
             if ref.get('source_hash') != media_source_hash(shot_list(board, u), 'video', u): raise ValueError('存在已过期的 V 视频，请重新确认采用')
             refs.append(copy.deepcopy(ref))
-        packet = {'board': body['board'], 'refs': refs, 'scope': 'E', 'type': 'video', 'label': 'EPISODE', 'board_revision': revision}
+        packet = {'board': body['board'], 'refs': refs, 'scope': 'E', 'type': 'video', 'label': 'EPISODE', 'board_revision': revision,
+                  'quality': str(body.get('quality') or 'master')}
     elif action in ('voice_catalog', 'voice_sample', 'voice_design', 'speech'):
         from voice_assets import prepare
         packet = prepare(project, body, config)
@@ -263,7 +264,8 @@ def execute(packet, providers):
             update(status='done', **result); return
         if action == 'concat':
             out = folder / f"{Path(packet['board']).stem}_EPISODE_VIDEO.mp4"
-            info = concatenate(project, packet['refs'], out)
+            # 交付出口默认母版（按片段推导规格+响度归一）；quality='proxy' 才走 720p 预览代理
+            info = concatenate(project, packet['refs'], out, spec='proxy' if packet.get('quality') == 'proxy' else 'master')
         else:
             refs = copy.deepcopy(packet['refs'])
             if packet['ref_mode'] == 'grid': refs = [make_grid(project, refs, packet['prompt_grid'])]

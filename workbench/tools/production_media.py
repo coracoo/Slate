@@ -105,15 +105,56 @@ def make_grid(project, refs, description=''):
     return {'path': path.relative_to(Path(project)).as_posix(), 'sha256': digest(path), 'purpose': 'S 关键帧故事板，格序为镜头顺序'}
 
 
-def concatenate(project, refs, out):
-    """统一尺寸、时间基与音轨再拼接，兼容不同模型的视频规格。"""
+def resolve_master_spec(streams):
+    """从已采用片段推导交付母版规格（纯函数，便于回归）。
+
+    画布取向按多数画幅投票，再在该取向内取像素面积最大者定基准——竖屏多数就出竖屏母版，
+    高分辨率片段不被降档；帧率取全体最大值统一时间基。只升不降：小片段 letterbox/pad 黑边，
+    绝不裁切、绝不拉伸。
+    """
+    parsed = []
+    for s in streams:
+        w, h = int(s.get('width') or 0), int(s.get('height') or 0)
+        if w <= 0 or h <= 0: raise ValueError('片段缺少有效分辨率，无法推导母版规格')
+        rate = str(s.get('avg_frame_rate') or s.get('r_frame_rate') or '0/1')
+        try:
+            num, _, den = rate.partition('/')
+            fps = float(num) / float(den or 1)
+        except (TypeError, ZeroDivisionError, ValueError):
+            fps = 0.0
+        parsed.append((w, h, fps))
+    portrait = sum(1 for w, h, _ in parsed if h > w)
+    want_portrait = portrait > len(parsed) / 2
+    same = [(w, h, f) for w, h, f in parsed if (h > w) == want_portrait] or parsed
+    w, h, _ = max(same, key=lambda t: t[0] * t[1])
+    fps = max(f for _, _, f in parsed) or 24.0
+    return {'w': w - w % 2, 'h': h - h % 2, 'fps': round(fps, 3)}
+
+
+def concatenate(project, refs, out, spec='proxy'):
+    """拼接已采用片段。
+
+    spec='proxy'：预览代理，统一 1280×720@24（低成本快速看片）。
+    spec='master' 或 {'w','h','fps'}：交付母版——按片段推导（或显式给定）规格，绝不把高规格
+    素材降档；少数取向片段 pad 黑边，音频在拼接后整段响度归一（EBU R128 / -16 LUFS）。
+    """
     if not refs: raise ValueError('请先采用本集的 V 视频')
     with tempfile.TemporaryDirectory(dir=Path(out).parent) as tmp:
-        clips = []
-        for i, ref in enumerate(refs):
-            src = bound_path(project, ref)
-            info = probe(src)
+        infos = []
+        for ref in refs:
+            info = probe(bound_path(project, ref))
             video_stream = next((s for s in info.get('streams', []) if s.get('codec_type') == 'video'), {})
+            if not video_stream: raise ValueError('片段没有视频轨，停止拼接')
+            infos.append((ref, info, video_stream))
+        if spec == 'master':
+            spec = resolve_master_spec(v for _, _, v in infos)
+        if spec == 'proxy':
+            w, h, fps = 1280, 720, 24
+        else:
+            w, h, fps = int(spec['w']), int(spec['h']), float(spec['fps'])
+        clips = []
+        for i, (ref, info, video_stream) in enumerate(infos):
+            src = bound_path(project, ref)
             seconds = float(video_stream.get('duration') or info.get('format', {}).get('duration') or 0)
             if seconds <= 0: raise ValueError('无法确定视频片段时长，停止拼接')
             audio = any(s.get('codec_type') == 'audio' for s in info.get('streams', []))
@@ -121,11 +162,17 @@ def concatenate(project, refs, out):
             args = [binary('ffmpeg'), '-v', 'error', '-i', str(src)]
             if not audio: args += ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo']
             args += ['-map', '0:v:0', '-map', '0:a:0' if audio else '1:a:0', '-vf',
-                     'scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,setsar=1,fps=24',
+                     f'scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps:g}',
                      '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-t', str(seconds), '-shortest', '-y', str(dst)]
             run(args, 1800); clips.append(dst)
         listing = Path(tmp) / 'concat.txt'
         listing.write_text('\n'.join(f"file '{p.name}'" for p in clips), encoding='utf-8')
-        run([binary('ffmpeg'), '-v', 'error', '-f', 'concat', '-safe', '0', '-i', str(listing),
-             '-c', 'copy', '-movflags', '+faststart', '-y', str(out)], 1800)
+        final_args = [binary('ffmpeg'), '-v', 'error', '-f', 'concat', '-safe', '0', '-i', str(listing),
+                      '-movflags', '+faststart', '-y', str(out)]
+        if spec != 'proxy':
+            # 交付母版：视频流直通（分段已统一规格），音频整段响度归一后重编码
+            final_args[9:9] = ['-c:v', 'copy', '-af', 'loudnorm=I=-16:TP=-1.5:LRA=11', '-c:a', 'aac', '-b:a', '192k']
+        else:
+            final_args[9:9] = ['-c', 'copy']
+        run(final_args, 1800)
     return probe(out)

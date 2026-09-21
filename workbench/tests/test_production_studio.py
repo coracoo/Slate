@@ -40,6 +40,27 @@ class ProductionContractTests(unittest.TestCase):
         self.assertEqual([(v['start'], v['end']) for v in beats], [(0, 5), (5, 10)])
         self.assertEqual(b['shots'][0]['dur'], 3)
 
+    def test_master_spec_no_downscale_and_orientation(self):
+        # 母版规格推导：不降档、取向按多数、帧率取最大、奇数取偶（N82）
+        from production_media import resolve_master_spec
+        spec = resolve_master_spec([
+            {'width': 1920, 'height': 1080, 'avg_frame_rate': '24000/1001'},
+            {'width': 1280, 'height': 720, 'avg_frame_rate': '30/1'},
+            {'width': 1280, 'height': 720, 'avg_frame_rate': '25/1'},
+        ])
+        self.assertEqual((spec['w'], spec['h']), (1920, 1080))
+        self.assertEqual(spec['fps'], 30.0)
+        spec = resolve_master_spec([
+            {'width': 720, 'height': 1280, 'avg_frame_rate': '30/1'},
+            {'width': 1080, 'height': 1920, 'avg_frame_rate': '30/1'},
+            {'width': 1920, 'height': 1080, 'avg_frame_rate': '30/1'},
+        ])
+        self.assertEqual((spec['w'], spec['h']), (1080, 1920))
+        spec = resolve_master_spec([{'width': 1081, 'height': 1921, 'avg_frame_rate': '30/1'}])
+        self.assertEqual((spec['w'], spec['h']), (1080, 1920))
+        with self.assertRaises(ValueError):
+            resolve_master_spec([{'width': 0, 'height': 0}])
+
     def test_prompt_families_not_copied(self):
         from production_prompts import normalize_prompts, require_prompts
         shot = {'id': 'S1', 'prompt': '旧静帧', 'action': '起身'}

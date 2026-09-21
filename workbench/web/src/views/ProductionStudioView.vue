@@ -16,6 +16,7 @@ useBoardSelection(board, boards, 'create')
 const selectedUnit = ref(''), selectedShot = ref(''), scope = ref<'S' | 'V'>('V'), kind = ref<'image' | 'video'>('video')
 const vendor = ref(''), textVendor = ref(''), visionVendor = ref(''), busy = ref(false), dirty = ref(false), duration = ref(5)
 const refMode = ref('keyframes'), tailMode = ref(''), tailItem = ref(''), includeVoices = ref(true), error = ref('')
+const concatQuality = ref<'master' | 'proxy'>('master')
 const videoOptions = ref<VideoSettingsValue>({mode:'reference'}), firstShot = ref(''), lastShot = ref('')
 const imageUrls = ref<Record<string,string>>({}), audioUrls = ref(''), videoUrls = ref('')
 const currentShots = computed(() => scope.value === 'S' ? (shot.value ? [shot.value] : []) : shots.value)
@@ -167,7 +168,8 @@ async function job(action: string, recover = false) {
   const body = {...base(), action, vendor_id: ['group', 'prompts'].includes(action) ? textVendor.value : vendor.value,
     scope: scope.value, target: currentTarget.value, type: kind.value,
     ...(kind.value === 'video' ? {duration: duration.value, ref_mode: videoOptions.value.mode === 'reference' ? refMode.value : 'keyframes', include_voices: includeVoices.value && !!canBindVoices.value, video_options:videoOptions.value, first_shot_id:firstShot.value,last_shot_id:lastShot.value,image_urls:imageUrls.value, audio_urls:videoOptions.value.mode === 'reference' && capability.value?.max_audio ? urlLines(audioUrls.value) : [],video_urls:videoOptions.value.mode === 'reference' && capability.value?.max_video ? urlLines(videoUrls.value) : [],
-      continuity: tailMode.value && (tailMode.value !== 'tail_first_frame' || ['first_frame','first_last'].includes(videoOptions.value.mode || '')) ? {mode: tailMode.value, item_id: tailItem.value, vision_vendor: visionVendor.value} : {}} : {})}
+      continuity: tailMode.value && (tailMode.value !== 'tail_first_frame' || ['first_frame','first_last'].includes(videoOptions.value.mode || '')) ? {mode: tailMode.value, item_id: tailItem.value, vision_vendor: visionVendor.value} : {}} : {}),
+    ...(action === 'concat' ? { quality: concatQuality.value } : {})}
   busy.value = true; error.value = ''
   try {
     const result = await submitStudioJob(body, recover)
@@ -213,7 +215,8 @@ onBeforeUnmount(() => window.clearInterval(timer))
           <b>{{ u.label }} · {{ u.title }}</b><small>{{ u.shot_ids.join(' · ') }} · {{ u.duration }}s</small>
           <small class="unit-status" :class="u.stale || u.video_stale ? 'is-pending' : 'is-ready'">{{ u.stale ? '汇总待更新' : u.video_stale ? '已采用视频待确认' : u.video_binding ? '已采用视频' : '待生成视频' }}</small>
         </button>
-        <button class="btn btn-ghost w-full" :disabled="busy || !units.length" @click="job('concat')">拼接已采用 V → 集视频</button>
+        <button class="btn w-full" :disabled="busy || !units.length" @click="concatQuality = 'master'; job('concat')">拼接已采用 V → 集视频（交付母版）</button>
+        <button class="btn btn-ghost w-full text-[10px]" :disabled="busy || !units.length" title="统一 720p/24fps 快速看片用，不作为交付出口" @click="concatQuality = 'proxy'; job('concat')">快速预览（720p 代理，不交付）</button>
       </aside>
       <main class="glass min-w-0 space-y-4 p-4">
         <section v-if="unit" class="space-y-2 border-b border-white/10 pb-4">
