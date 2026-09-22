@@ -1394,6 +1394,7 @@ class H(BaseHTTPRequestHandler):
         if path.startswith(('/api', '/media', '/src')):
             return self._send(401, 'application/json', json.dumps({'ok': False, 'err': '未登录'}, ensure_ascii=False).encode())
         if method == 'GET':
+            if path == '/login': return None   # SPA 登录页（已登录时前端自动跳回首页）
             return self._redirect('/login')
         return self._send(401, 'application/json', json.dumps({'ok': False, 'err': '未登录'}, ensure_ascii=False).encode())
 

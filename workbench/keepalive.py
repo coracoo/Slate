@@ -28,7 +28,13 @@ def log(msg):
     stamp = time.strftime('%Y-%m-%d %H:%M:%S')
     with open(LOG, 'a', encoding='utf-8') as fh:
         fh.write(f'[{stamp}] {msg}\n')
-    print(f'[keepalive {stamp}] {msg}', flush=True)
+    try:
+        # pythonw 下 sys.stdout 为 None，print 会抛错打死守护（09-22 实锤：pythonw 守护
+        # 写完"拉起"日志即消失，server 沦为孤儿无人看护）——仅前台运行时打印
+        if sys.stdout is not None:
+            print(f'[keepalive {stamp}] {msg}', flush=True)
+    except Exception:
+        pass
 
 
 def main():
