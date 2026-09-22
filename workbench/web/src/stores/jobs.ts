@@ -121,7 +121,13 @@ export function trackJob(id: number, label: string): Promise<TrackedJob> {
       try {
         j = await fetchJob(id)
         pollState.delete(trackId)
-      } catch {
+      } catch (e) {
+        if ((e as { status?: number })?.status === 401) {
+          upsert(trackId, { status: 'error', ok: false, err: '需要登录；重新登录后请刷新页面恢复跟踪' })
+          timers.delete(trackId)
+          finish()
+          return
+        }
         const st = pollState.get(trackId) || { fails: 0, delay: 1500, base: tj.out }
         st.fails += 1
         st.delay = Math.min(st.delay * 2, 30000)

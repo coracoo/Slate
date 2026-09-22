@@ -59,8 +59,11 @@ async function doLogout() {
 onMounted(async () => {
   try {
     const s = await fetchAuthStatus()
-    if (s.configured && !s.authed && route.path !== '/login') router.replace('/login')
-    else startUpdatePoll()
+    if (!s.authed) {
+      if (route.path !== '/login') router.replace('/login')
+      return                       // 未登录：不轮询更新、不拉业务数据
+    }
+    startUpdatePoll()
   } catch { /* /login 页自身 */ }
 })
 onBeforeUnmount(() => window.clearInterval(updateTimer))
