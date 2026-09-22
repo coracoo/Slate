@@ -114,9 +114,10 @@ watch(showShell, (v) => { if (v) void loadBasics() })
 
 <template>
   <ParticleBg />
-  <div v-if="showShell" class="relative z-10 flex h-full">
-    <!-- 侧边栏 -->
+  <div class="relative z-10 flex h-full">
+    <!-- 侧边栏（登录页隐藏；路由出口必须常驻，否则 /login 无处渲染） -->
     <aside
+      v-if="showShell"
       class="flex w-56 shrink-0 flex-col border-r border-line-soft bg-black/30 backdrop-blur-xl"
     >
       <div class="px-5 pb-4 pt-6">
@@ -195,7 +196,7 @@ watch(showShell, (v) => { if (v) void loadBasics() })
     </aside>
 
     <!-- 主区 -->
-    <main class="flex-1 overflow-y-auto">
+    <main :class="showShell ? 'flex-1 overflow-y-auto' : 'flex-1 overflow-y-auto p-4'">
       <RouterView v-slot="{ Component }">
         <!-- 页面可能包含 Teleport/多根节点（创作页的 OverlayViewer），不包 Transition，
              避免 Vue 在多根组件切换时停留在离场状态。 -->
@@ -204,7 +205,7 @@ watch(showShell, (v) => { if (v) void loadBasics() })
     </main>
   </div>
 
-  <JobDrawer />
+  <JobDrawer v-if="showShell" />
 
   <!-- Toast -->
   <Teleport to="body">
