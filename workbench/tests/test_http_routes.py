@@ -108,6 +108,18 @@ class HttpRouteTests(unittest.TestCase):
             with patch.object(server, 'safe_video', return_value=str(secret)):
                 self.assertEqual(self.request('/media?p=providers.json')[0], 403)
 
+    def test_session_credentials_never_leave_http(self):
+        """auth.json 持会话签名 secret 与口令 scrypt 哈希，三个文件出口一律 403。"""
+        with tempfile.TemporaryDirectory() as folder:
+            cred = Path(folder)/'auth.json'
+            cred.write_text(json.dumps({'salt': 'aa', 'password_hash': 'bb', 'secret': 'cc'}))
+            with patch.object(server, 'safe_video', return_value=str(cred)):
+                self.assertEqual(self.request('/media?p=workbench/auth.json')[0], 403)
+                self.assertEqual(self.request('/api/file?p=workbench/auth.json')[0], 403)
+            with patch.object(server, 'ROOT', folder), patch.object(server, 'WEBDIST', tempfile.mkdtemp()):
+                self.assertEqual(self.request('/auth.json')[0], 403)
+            self.assertTrue(server._deny_file(str(cred.parent/'auth.json.bak')))
+
     def test_json_parse_error_returns_400(self):
         self.assertEqual(self.request('/api/project/new', 'POST', b'{', {'Content-Type': 'application/json'})[0], 400)
 

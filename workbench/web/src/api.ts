@@ -908,7 +908,7 @@ export interface PlanSummary {
  *  三种形态：all_scenes 全部场景补初稿 / scene 单场景（extra_desc 补充）/ name+scene_desc 自由生成。 */
 export const generatePlan = (body: {
   project: string; name?: string; scene_desc?: string; keyframe?: string; zone?: string
-  all_scenes?: boolean; scene?: string; extra_desc?: string
+  all_scenes?: boolean; redo?: boolean; scene?: string; extra_desc?: string
 }) =>
   postJSON<RunResult>('/api/plan/generate', body)
 export const fetchPlanList = (project: string) =>

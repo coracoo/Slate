@@ -2,7 +2,7 @@
 
 **面向短片制作与拉片分析的本地 Web 工作台。** 从剧本、分镜、人物与场景资产，到关键帧、视频片段、角色音色和集视频，在一个项目中管理。制作数据以分镜 JSON 为依据，生成结果和请求记录保存在本机。
 
-仓库：[coracoo/Slate](https://github.com/coracoo/Slate) · [详细操作教程](workbench/README.md) · [示例数据](examples/README.md) · [隐私与发布检查](SECURITY.md)
+仓库：[coracoo/Slate](https://github.com/coracoo/Slate) · [详细操作教程](workbench/README.md) · [示例数据](examples/README.md) · [隐私与发布检查](SECURITY.md) · [许可协议](LICENSE)
 
 ## 功能
 
@@ -165,3 +165,7 @@ Pop-Location
 ```
 
 仓库不附带真实 API Key、个人项目、模型权重、用户知识卡、Chrome 登录信息或生成产物。配置和项目数据备份由使用者管理，具体边界见 [SECURITY.md](SECURITY.md)。
+
+## 许可
+
+代码与文档采用 [MIT License](LICENSE)。仓库引用的第三方组件（ComfyUI 自定义节点、image-use / chrome-use、Blender、各厂商 SDK）按各自协议授权，不由本协议覆盖。

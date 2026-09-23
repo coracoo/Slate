@@ -259,10 +259,14 @@ async function loadZoneOptions() {
 watch(() => app.current, () => { void loadPlans(); void loadZoneOptions() }, { immediate: true })
 
 /** 主入口：为全部场景资产生成平面图（已有同场景平面图的跳过——后端 --all-scenes --skip-existing） */
-const doGenerateAllPlans = () => run('批量生成平面图', () => {
-  if (!app.current) throw new Error('请先选择项目')
-  return generatePlan({ project: app.current, all_scenes: true })
-}, loadPlans)
+const doGenerateAllPlans = async () => {
+  if (!app.current) { toast('请先选择项目', 'err'); return }
+  const existing = sceneGroups.value.filter((g) => g.plan).length
+  const redo = existing > 0 && confirm(
+    `${existing}/${sceneGroups.value.length} 个场景已有平面图。
+确定全部重新生成？（旧图有版本快照，可在版本面板恢复；取消则只生成缺图的场景）`)
+  await run('批量生成平面图', () => generatePlan({ project: app.current!, all_scenes: true, redo }), loadPlans)
+}
 
 /** 选中场景生成/重新生成（可选补充描述；同名覆盖旧图，落盘前有版本快照） */
 const doRegenScenePlan = () => run('生成平面图', () => {

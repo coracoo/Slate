@@ -279,10 +279,11 @@ def scan_sources():
                 out.append({"name":f,"mb":sz})
     return out
 MEDIA_EXT=(".mp4",".mov",".mkv",".png",".jpg",".jpeg",".webp",".blend",".py",".md",".srt",".txt",".json",".xlsx",".wav",".m4a",".mp3",".aac",".html",".ogg")
-DENY_BASENAMES=("providers.json","llm_config.json","mcp.json","mcp_runtime.json","media_gateway.json","media_gateway.tmp")
+DENY_BASENAMES=("providers.json","llm_config.json","mcp.json","mcp_runtime.json","media_gateway.json","media_gateway.tmp","auth.json")
 DENY_EXT=(".log",".env")
 def _deny_file(p):
-    """敏感文件拒绝通过 HTTP 外发：厂商/LLM 配置及其 .bak 备份变体、日志、.env。"""
+    """敏感文件拒绝通过 HTTP 外发：会话凭证（auth.json 含签名 secret 与口令哈希）、
+    厂商/LLM 配置及其 .bak 备份变体、日志、.env。"""
     b=os.path.basename(p).lower()
     if b.endswith(DENY_EXT): return True
     return any(b==n or b.startswith(n+".") for n in DENY_BASENAMES)
@@ -3741,7 +3742,8 @@ class H(BaseHTTPRequestHandler):
             return self._send(500, "application/json", json.dumps({"ok": False, "err": "gen_plan.py 缺失"}, ensure_ascii=False).encode())
         cmd = [sys.executable, os.path.join(TOOLS, "gen_plan.py"), d]
         if body.get("all_scenes"):
-            cmd += ["--all-scenes", "--skip-existing"]
+            cmd += ["--all-scenes"]
+            if not body.get("redo"): cmd += ["--skip-existing"]   # redo=true：已有图也全部重生成（旧图有版本快照）
         else:
             scene = str(body.get("scene") or "").strip()
             if scene:

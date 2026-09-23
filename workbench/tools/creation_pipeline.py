@@ -720,7 +720,8 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
     require_prompts(shots)
     for shot in shots:
         normalize_prompts(shot)
-        for field in ('prompt_image', 'prompt_video', 'prompt_grid'):
+        from production_prompts import LLM_FIELDS
+        for field in LLM_FIELDS:
             shot[field + '_source'] = 'llm'
     # 契约化：id 去重/补齐、数值兜底、词表外的值回退
     VALID = {"shot_size": ["大远景", "远景", "全景", "中景", "中近景", "近景", "特写", "大特写"],
@@ -820,14 +821,16 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
     units = data.get('video_units') or []
     if not units: raise ValueError('LLM 未返回 V 分镜视频汇总，已保留原文件；请重新生成')
     for unit in units:
-        if not str(unit.get('prompt_video') or '').strip() or not str(unit.get('prompt_grid') or '').strip():
-            raise ValueError('V 缺少视频或宫格提示词，已拒绝保存不完整分镜')
+        # 契约 v3（N81）：宫格为按需人工字段，LLM 不再生成——校验只查视频提示词
+        if not str(unit.get('prompt_video') or '').strip():
+            raise ValueError('V 缺少视频提示词，已拒绝保存不完整分镜')
         unit['id'] = 'v-' + uuid.uuid4().hex[:12]
         members = shot_list(cfg, unit)
         unit['duration'] = sum(float(s['dur']) for s in members)
         unit['scene_ref'] = members[0].get('scene_ref', '')
         unit['source_hash'] = source_hash(members)
-        for field in ('prompt_video', 'prompt_grid', 'negative', 'title'): unit[field + '_source'] = 'llm'
+        for field in ('prompt_video', 'prompt_grid', 'negative', 'title'):
+            if unit.get(field): unit[field + '_source'] = 'llm'
     validate_units(cfg, units)
     cfg['video_units'] = units
     if os.path.isfile(out):
