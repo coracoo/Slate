@@ -831,6 +831,10 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
         unit['source_hash'] = source_hash(members)
         for field in ('prompt_video', 'prompt_grid', 'negative', 'title'):
             if unit.get(field): unit[field + '_source'] = 'llm'
+    pre = len(units)
+    units = split_units_by_scene(cfg, units)
+    if len(units) != pre:
+        print(f"[自愈] {pre} 个 V 中存在跨场景/缺场景引用，已按场景切分为 {len(units)} 个；请到⑦核对各段汇总提示词")
     validate_units(cfg, units)
     cfg['video_units'] = units
     if os.path.isfile(out):
@@ -838,6 +842,38 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
     _dump(out, cfg)
     print(f"[完成] 分镜 {len(shots)} 镜 -> {out}")
     print(f"[提示] 可直接进白模页渲染 / 3D 页构建 / 平面图生成")
+
+
+def split_units_by_scene(cfg, units):
+    """确定性自愈（N88）：LLM 分组偶发把不同/空 scene_ref 的 S 合进同一 V——validate 必拒。
+
+    按成员 scene_ref 切分：非空同场景连段保留（继承原 V 的提示词等字段）；空 scene_ref 的
+    S 自成单镜段。保序、保完整覆盖；切分后首段继承原 id。真正的漏镜/乱序仍交 validate_units
+    硬报错——本函数只修"场景混组"这一类可确定性修复的问题。
+    """
+    sid_scene = {str(x.get("id")): str(x.get("scene_ref") or "") for x in cfg.get("shots") or []}
+    fixed = []
+    for unit in units:
+        ids = [str(i) for i in (unit.get("shot_ids") or [])]
+        scenes = [sid_scene.get(i, "") for i in ids]
+        if len(ids) <= 1 or (scenes and len(set(scenes)) == 1 and scenes[0]):
+            fixed.append(unit)
+            continue
+        runs = []
+        for sid, sc in zip(ids, scenes):
+            if sc and runs and runs[-1][0] == sc:
+                runs[-1][1].append(sid)
+            else:
+                runs.append((sc, [sid]))     # 空 scene_ref 自成单镜段
+        for k, (_sc, run_ids) in enumerate(runs):
+            frag = {key: val for key, val in unit.items()
+                    if key not in ("id", "shot_ids", "duration", "scene_ref", "source_hash")}
+            import uuid
+            frag["id"] = unit.get("id") if k == 0 else "v-" + uuid.uuid4().hex[:12]
+            frag["shot_ids"] = run_ids
+            frag["scene_ref"] = _sc
+            fixed.append(frag)
+    return fixed
 
 
 def collect_plans(proj):
