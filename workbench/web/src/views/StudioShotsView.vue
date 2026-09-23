@@ -37,11 +37,13 @@ const allReadySelected = computed(() => readyEpisodeIds.value.length > 0
   && readyEpisodeIds.value.every((id) => epsSel.value.includes(id)))
 const epsSel = ref<string[]>([])
 function toggleEp(id: string) {
+  epsTouched.value = true
   const i = epsSel.value.indexOf(id)
   if (i >= 0) epsSel.value.splice(i, 1)
   else epsSel.value.push(id)
 }
 function toggleAllEpisodes() {
+  epsTouched.value = true
   epsSel.value = allReadySelected.value ? [] : [...readyEpisodeIds.value]
 }
 const router = useRouter()
@@ -220,7 +222,9 @@ async function loadPreview() {
 }
 watch(epsSel, loadPreview)
 watch(episodes, loadPreview, { immediate: true })
+const epsTouched = ref(false)   // 用户手动改过选择后不再自动全选
 watch(readyEpisodeIds, (ids) => {
+  if (!epsTouched.value) { epsSel.value = [...ids]; return }   // 默认全选可生成集
   const valid = new Set(ids)
   const next = epsSel.value.filter((id) => valid.has(id))
   if (next.length !== epsSel.value.length) epsSel.value = next
@@ -330,24 +334,34 @@ useBoardSelection(board, boards, 'shots')
     <template v-else>
       <!-- 生成分镜 -->
       <section class="glass mb-5 p-4">
-        <!-- 行 1：集选择（chips 数量不定，独占一行伸缩，不再推挤按钮） -->
-        <div class="flex flex-wrap items-center gap-2">
-          <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-pink-400/15 text-xs font-black text-pink-300">1</span>
-          <h3 class="shrink-0 text-sm font-bold text-slate-200">生成分镜</h3>
-          <span class="shrink-0 text-xs text-slate-400">集（可多选 · 有正文 {{ readyEpisodes.length }}/{{ episodes.length }}）</span>
-          <button v-if="readyEpisodes.length" class="shrink-0 rounded-full px-2 py-0.5 text-2xs font-bold"
-            :class="allReadySelected ? 'bg-pink-400/25 text-pink-200' : 'bg-white/5 text-slate-400'"
-            @click="toggleAllEpisodes">
-            {{ allReadySelected ? '取消全选' : '全选可生成集' }}
-          </button>
-          <div class="flex min-w-0 flex-1 flex-wrap items-center gap-1.5">
+        <!-- 行 0：集选择（独立分块 · 默认全选可生成集） -->
+        <div class="mb-3 rounded-xl border border-pink-400/25 bg-pink-400/5 p-3">
+          <div class="flex flex-wrap items-center gap-2">
+            <h3 class="shrink-0 text-sm font-black text-pink-200">选择集</h3>
+            <span class="shrink-0 text-xs text-slate-400">可多选 · 有正文 {{ readyEpisodes.length }}/{{ episodes.length }} · 默认已全选可生成集</span>
+            <span class="flex-1"></span>
+            <button v-if="readyEpisodes.length" class="shrink-0 rounded-full px-2.5 py-0.5 text-2xs font-bold"
+              :class="allReadySelected ? 'bg-pink-400/25 text-pink-200' : 'bg-white/10 text-slate-300 hover:bg-white/20'"
+              @click="toggleAllEpisodes">
+              {{ allReadySelected ? '取消全选' : '全选可生成集' }}
+            </button>
+          </div>
+          <div class="mt-2 flex flex-wrap gap-1.5">
             <button v-for="e in episodes" :key="e.id" :disabled="!episodeReady(e)"
               class="rounded-full px-2.5 py-1 text-xs-plus font-bold transition disabled:cursor-not-allowed disabled:opacity-40"
               :class="epsSel.includes(e.id) ? 'chip-active' : 'chip'"
               :title="episodeReady(e) ? '已就绪，可生成分镜' : '暂无剧本文本，请先在①剧本生成页扩写'"
               @click="episodeReady(e) && toggleEp(e.id)">{{ e.id }} {{ e.title }}<span v-if="!episodeReady(e)">（待扩写）</span></button>
           </div>
-          <button class="btn shrink-0" :disabled="!!busy || !!sbRunning.length" @click="doSb" title="按选中的分集生成分镜 JSON；会更新镜头动作、机位和提示词">
+          <p v-if="!readyEpisodes.length" class="mt-2 text-xs text-amber-300/80">还没有可生成的集——先到 ① 剧本生成页扩写正文</p>
+        </div>
+        <!-- 行 1：生成分镜动作 -->
+        <div class="flex flex-wrap items-center gap-2">
+          <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-pink-400/15 text-xs font-black text-pink-300">1</span>
+          <h3 class="shrink-0 text-sm font-bold text-slate-200">生成分镜</h3>
+          <span v-if="epsSel.length" class="shrink-0 text-2xs text-slate-500">将生成：{{ epsSel.join('、') }}</span>
+          <span class="flex-1"></span>
+          <button class="btn shrink-0" :disabled="!!busy || !!sbRunning.length || !epsSel.length" @click="doSb" title="按选中的分集生成分镜 JSON；会更新镜头动作、机位和提示词">
             {{ sbRunning.length ? `生成中（${sbRunning.join(' ')}）…` : epsSel.length > 1 ? `LLM 生成分镜（${epsSel.length} 集并行）` : 'LLM 生成分镜' }}
           </button>
         </div>
