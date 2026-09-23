@@ -694,7 +694,7 @@ function parentAsset(row?: AssetRegistryItem | null) {
     <EmptyState v-if="!app.current" title="请先在左侧选择项目" />
     <template v-else>
       <div class="mb-3 rounded-lg bg-sky-400/10 px-3 py-2 text-xs-plus text-sky-200">
-        推荐顺序：① 剧本生成 → ② 分镜生成 → ③ 本页提炼（带上分镜上下文补角色状态/锚点）→ ⑦ 创作生成。
+        推荐顺序：① 剧本生成 → ③ 本页提炼（人物/场景/道具，收尾自动出场景平面图初稿）→ ② 分镜生成（自动关联 scene_ref，无需手动绑定）→ ⑤ 演员表现 → ⑥ 平面推演 → ⑦ 创作生成。
       </div>
       <div class="glass mb-5 flex flex-wrap items-end gap-3 p-4">
         <div class="flex items-end gap-2">

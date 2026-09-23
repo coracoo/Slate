@@ -67,6 +67,7 @@ const scenesMap = computed<Record<string, string>>(() => {
   const rows = (data.value as any)?.scenes?.scenes || []
   return Object.fromEntries(rows.map((r: any) => [r.id || r.name || '', r.name || r.id || '']).filter(([k]: any) => k))
 })
+const scenesAssets = computed(() => (data.value as any)?.scenes?.scenes || [])
 /** 场景列：scene_ref 场景名优先；room/field 是对话契约的预设地形（军帐室内/野外战场），翻译成中文展示 */
 function sceneCell(s: Shot): { label: string; cls: string; title: string } {
   const ref = String(s.scene_ref || '').replace(/^@scene:/, '')
@@ -399,7 +400,15 @@ useBoardSelection(board, boards, 'shots')
           <StyleSelect target="storyboard" label="导演风格" />
           <StyleSelect target="acting" label="演员风格" />
         </div>
-        <p v-if="!chars.length" class="mt-2 text-xs-plus text-amber-300/80">提示：还没有资产（人物/场景/道具）——可先生成分镜再回 ③ 素材生成补齐（推荐顺序）；不提炼也能直接生成。</p>
+        <!-- 资产前置提示（非阻断）：scene_ref 是平面图/空间一致性链路的根基，提炼应在分镜生成之前 -->
+        <div v-if="!chars.length || !scenesAssets.length" class="mb-3 rounded-xl border border-amber-400/25 bg-amber-400/5 p-3 text-xs-plus leading-relaxed text-amber-200/90">
+          <b>资产未提炼。</b>正确顺序：① 剧本生成 → <b>③ 素材提炼（人物/场景/道具）</b> → 回本页生成分镜——分镜会自动关联场景资产（scene_ref）与人物/道具引用，是平面推演与视频空间一致性的根基，无需任何手动绑定。
+          <template v-if="shots.length">
+            当前分镜已生成但未关联场景——<b>提炼后回到本页重新生成分镜即可自动补上</b>（已采用的关键帧/视频会保留）。
+          </template>
+          <template v-else>纯对白/白模用法可以不提炼直接生成，但平面推演与参考帧回流将不可用。</template>
+        </div>
+        <p v-if="!chars.length && false" class="mt-2 text-xs-plus text-amber-300/80"></p>
         <div v-if="kbHits.length" class="mt-2 flex flex-wrap items-center gap-1.5">
           <span class="text-2xs font-bold text-emerald-400/80">将垫入上下文的拉片卡片</span>
           <span v-for="h in kbHits" :key="h.id"
