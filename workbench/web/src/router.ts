@@ -42,7 +42,7 @@ export const routes = [
     path: '/acting',
     name: 'acting',
     component: () => import('./views/ActingView.vue'),
-    meta: { title: '④ 演员表现', c1: '#f59e0b', c2: '#ec4899', icon: 'user' }
+    meta: { title: '⑤ 演员表现', c1: '#f59e0b', c2: '#ec4899', icon: 'user' }
   },
   {
     path: '/white',
@@ -110,7 +110,7 @@ export const routes = [
     path: '/billing',
     name: 'billing',
     component: () => import('./views/BillingView.vue'),
-    meta: { title: '⑥ 用量计费', c1: '#34d399', c2: '#22d3ee', icon: 'chart' }
+    meta: { title: '用量计费', c1: '#34d399', c2: '#22d3ee', icon: 'chart' }
   },
   {
     path: '/package',
@@ -122,7 +122,7 @@ export const routes = [
     path: '/create',
     name: 'create',
     component: () => import('./views/ProductionStudioView.vue'),
-    meta: { title: '⑤ 创作生成', c1: '#ec4899', c2: '#f472b6', icon: 'wand' }
+    meta: { title: '⑦ 创作生成', c1: '#ec4899', c2: '#f472b6', icon: 'wand' }
   }
 ]
 

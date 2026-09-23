@@ -76,7 +76,7 @@ onMounted(load)
   <div class="page">
     <header class="mb-6 flex flex-wrap items-end gap-3">
       <div>
-        <h1 class="grad-text text-2xl font-black">⑥ 用量计费</h1>
+        <h1 class="grad-text text-2xl font-black">用量计费</h1>
         <p class="mt-1 text-xs text-slate-500">模型调用账本（append-only）：成功按单价表计费，无价格配置仍记录调用；失败记 0 元</p>
       </div>
       <div class="ml-auto flex items-center gap-2">

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useBoardSelection } from '../utils/useBoardSelection'
 // -*- coding: utf-8 -*-
-/** ③ 分镜与生成：按集生成分镜（知识注入）→ 逐镜明细；生成拍摄资料包 → 包明细 */
+/** ② 分镜生成：按集生成分镜（知识注入）→ 逐镜明细；生成拍摄资料包 → 包明细 */
 import { ref, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
@@ -314,7 +314,7 @@ async function doRunActing(s: Shot) {
     if (!r.id) throw new Error(r.err || '演员任务未启动')
     const j = await trackJob(r.id, `演员表演 ${s.id}`)
     if (!j.success) throw new Error(j.err || '演员任务失败')
-    toast('演员候选已生成 ' + s.id + '，请到「④ 演员表现」审核并应用', 'ok', 5000)
+    toast('演员候选已生成 ' + s.id + '，请到「⑤ 演员表现」审核并应用', 'ok', 5000)
     await loadBoard()
   } catch (e) { toast(e instanceof Error ? e.message : '演员任务失败', 'err', 6000) }
   finally { busy.value = '' }

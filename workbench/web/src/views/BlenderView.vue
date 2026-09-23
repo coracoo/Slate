@@ -25,7 +25,7 @@ async function detect() {
 onMounted(detect)
 
 const FLOW = [
-  { n: '①', t: '分镜 JSON', d: '在「① 拉片结构 / ⑤ 创作生成」产出 dialogue 契约分镜（显式 pos/look 站位）' },
+  { n: '①', t: '分镜 JSON', d: '在「① 拉片结构 / ⑦ 创作生成」产出 dialogue 契约分镜（显式 pos/look 站位）' },
   { n: '②', t: '生成构建脚本', d: '3D 白模页一键调用 blender_previs.py，生成 gen_<slug>.py' },
   { n: '③', t: 'MCP 构建场景', d: '脚本经 Blender MCP(127.0.0.1:9876) 在 Blender 里执行，自动存盘 .blend' },
   { n: '④', t: '产出与渲染', d: '.blend 可本机打开查看；「CLI 渲染」后台出 .mp4 供校对白模' }
@@ -154,7 +154,7 @@ const FLOW = [
           <h2 class="text-base font-bold text-slate-100">工作台怎么用它</h2>
           <p class="mt-1.5 text-xs leading-relaxed text-slate-400">
             前往
-            <RouterLink to="/white3d" class="mx-1 font-semibold text-orange-300 underline">⑥ 3D 白模</RouterLink>
+            <RouterLink to="/white3d" class="mx-1 font-semibold text-orange-300 underline">② 辅助·Blender</RouterLink>
             页，整条链路一键完成：
           </p>
           <div class="mt-3 grid grid-cols-1 gap-2.5 sm:grid-cols-2 lg:grid-cols-4">

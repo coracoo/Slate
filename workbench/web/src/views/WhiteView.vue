@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useBoardSelection } from '../utils/useBoardSelection'
 // -*- coding: utf-8 -*-
-/** ⑤ 白模：选分镜 JSON + 镜头区间 + 引擎 → 渲染；产物视频卡片。 */
+/** ① 辅助·白模：选分镜 JSON + 镜头区间 + 引擎 → 渲染；产物视频卡片。 */
 import { ref, computed, watch } from 'vue'
 import { runWhiterange, whiteFromAnalysis, exportPreviz, fetchAnalysisList, fetchWhiteBoard, fmtT, mediaUrl, deleteFile, type WhiteBoard } from '../api'
 import { app, projectFiles, materialVideos, toast, loadBasics } from '../stores/app'

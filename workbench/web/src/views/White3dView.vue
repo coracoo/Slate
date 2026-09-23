@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useBoardSelection } from '../utils/useBoardSelection'
 // -*- coding: utf-8 -*-
-/** ⑥ 3D 白模：选分镜 JSON → 生成 Blender 构建脚本 → 发 Blender MCP 构建存盘 .blend；产物卡片（打开/CLI 渲染/代码查看）。 */
+/** ② 辅助·Blender：选分镜 JSON → 生成 Blender 构建脚本 → 发 Blender MCP 构建存盘 .blend；产物卡片（打开/CLI 渲染/代码查看）。 */
 import { ref, computed, watch } from 'vue'
 import { runGeneric, openBlend, fetchText, mediaUrl, ApiError, deleteFile } from '../api'
 import { app, projectFiles, materialVideos, toast, loadBasics } from '../stores/app'

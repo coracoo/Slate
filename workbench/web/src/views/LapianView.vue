@@ -579,7 +579,7 @@ watch(() => app.current, () => {
         </label>
         <div class="mt-0.5 min-h-4">
           <p v-if="useAi && aiVendor" class="text-2xs text-cyan-300/80">将使用 {{ aiVendor.label }} · {{ aiVendor.models?.vision }}</p>
-          <p v-else-if="!aiVendor" class="text-2xs text-slate-500">⑦环境配置 vision 厂商后可自动分析</p>
+          <p v-else-if="!aiVendor" class="text-2xs text-slate-500">④ 环境检查配置 vision 厂商后可自动分析</p>
         </div>
       </div>
       <button class="btn" :disabled="running || !app.current" @click="runRegen">
