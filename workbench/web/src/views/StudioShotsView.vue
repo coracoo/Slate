@@ -338,7 +338,7 @@ useBoardSelection(board, boards, 'shots')
 <template>
   <div class="page">
     <header class="mb-6">
-      <h1 class="grad-text text-2xl font-black">② 分镜生成</h1>
+      <h1 class="grad-text text-2xl font-black">③ 分镜生成</h1>
       <p class="mt-1 text-xs text-slate-500">LLM 同时生成转场镜头的参考帧、视频、宫格提示词及 V 分组。三类提示词可分别编辑，创作台使用同一份分镜。</p>
     </header>
 
@@ -402,7 +402,7 @@ useBoardSelection(board, boards, 'shots')
         </div>
         <!-- 资产前置提示（非阻断）：scene_ref 是平面图/空间一致性链路的根基，提炼应在分镜生成之前 -->
         <div v-if="!chars.length || !scenesAssets.length" class="mb-3 rounded-xl border border-amber-400/25 bg-amber-400/5 p-3 text-xs-plus leading-relaxed text-amber-200/90">
-          <b>资产未提炼。</b>正确顺序：① 剧本生成 → <b>③ 素材提炼（人物/场景/道具）</b> → 回本页生成分镜——分镜会自动关联场景资产（scene_ref）与人物/道具引用，是平面推演与视频空间一致性的根基，无需任何手动绑定。
+          <b>资产未提炼。</b>正确顺序：① 剧本生成 → <b>② 素材提炼（人物/场景/道具）</b> → 回本页生成分镜——分镜会自动关联场景资产（scene_ref）与人物/道具引用，是平面推演与视频空间一致性的根基，无需任何手动绑定。
           <template v-if="shots.length">
             当前分镜已生成但未关联场景——<b>提炼后回到本页重新生成分镜即可自动补上</b>（已采用的关键帧/视频会保留）。
           </template>

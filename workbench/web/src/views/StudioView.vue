@@ -388,7 +388,7 @@ async function doExpandAll() {
                 <pre class="mt-2 whitespace-pre-wrap font-mono text-xs leading-relaxed text-slate-400">{{ epSlice(detail) }}</pre>
               </div>
             </div>
-            <p class="mt-4 text-xs-plus text-slate-500">下一步：② 分镜生成 → ③ 素材生成</p>
+            <p class="mt-4 text-xs-plus text-slate-500">下一步：② 素材生成 → ③ 分镜生成</p>
           </div>
         </div>
       </Teleport>

@@ -685,7 +685,7 @@ function parentAsset(row?: AssetRegistryItem | null) {
     <header class="mb-6">
       <div class="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 class="grad-text text-2xl font-black">③ 素材生成</h1><RouterLink to="/studio/asset/voices" class="mt-2 inline-block text-sm text-sky-300">音色绑定 · 云端音色库 · AI 音色创作 →</RouterLink>
+          <h1 class="grad-text text-2xl font-black">② 素材生成</h1><RouterLink to="/studio/asset/voices" class="mt-2 inline-block text-sm text-sky-300">音色绑定 · 云端音色库 · AI 音色创作 →</RouterLink>
           <p class="mt-1 text-xs text-slate-500">母素材统一身份，子素材保存服饰、配饰和身体组件的差异；子图生成自动继承母图参考。拖动资产卡到另一张卡下方即可移动，拖到资产区空白处可提升为母素材。</p>
         </div>
         <button class="btn btn-ghost" title="新增独立角色、场景或道具母素材" @click="openCreate('mother')">＋新增母素材</button>
@@ -694,7 +694,7 @@ function parentAsset(row?: AssetRegistryItem | null) {
     <EmptyState v-if="!app.current" title="请先在左侧选择项目" />
     <template v-else>
       <div class="mb-3 rounded-lg bg-sky-400/10 px-3 py-2 text-xs-plus text-sky-200">
-        推荐顺序：① 剧本生成 → ③ 本页提炼（人物/场景/道具，收尾自动出场景平面图初稿）→ ② 分镜生成（自动关联 scene_ref，无需手动绑定）→ ⑤ 演员表现 → ⑥ 平面推演 → ⑦ 创作生成。
+        推荐顺序：① 剧本生成 → ② 本页提炼（人物/场景/道具，收尾自动出场景平面图初稿）→ ③ 分镜生成（自动关联 scene_ref，无需手动绑定）→ ④ 音色绑定 → ⑤ 演员表现 → ⑥ 平面推演 → ⑦ 创作生成。
       </div>
       <div class="glass mb-5 flex flex-wrap items-end gap-3 p-4">
         <div class="flex items-end gap-2">

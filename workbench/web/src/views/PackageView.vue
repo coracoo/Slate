@@ -317,7 +317,7 @@ useBoardSelection(board, boards, 'package')
           @click="doGenerateAllPlans">
           {{ busy === '批量生成平面图' ? '批量生成中…' : '为全部场景生成平面图' }}
         </button>
-        <p v-if="!zoneOptions.length" class="mb-2 text-center text-2xs text-slate-500">无场景资产——先到 ③素材生成 页提炼</p>
+        <p v-if="!zoneOptions.length" class="mb-2 text-center text-2xs text-slate-500">无场景资产——先到 ②素材生成 页提炼</p>
         <p v-if="!sceneGroups.length" class="py-10 text-center text-sm text-slate-500">选择分镜</p>
         <p v-if="sceneGroups.length && !hasUnits" class="mb-2 text-center text-2xs text-slate-500">
           本分镜无 V 分组（老分镜）——按场景展示；到 ⑦创作生成 建立 V 后按 V 组织

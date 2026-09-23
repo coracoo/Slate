@@ -66,13 +66,13 @@ export const routes = [
     path: '/studio/shots',
     name: 'studioShots',
     component: () => import('./views/StudioShotsView.vue'),
-    meta: { title: '② 分镜生成', c1: '#f472b6', c2: '#e879f9', icon: 'clapper' }
+    meta: { title: '③ 分镜生成', c1: '#f472b6', c2: '#e879f9', icon: 'clapper' }
   },
   {
     path: '/studio/asset',
     name: 'studioAsset',
     component: () => import('./views/StudioAssetView.vue'),
-    meta: { title: '③ 素材生成', c1: '#a78bfa', c2: '#ec4899', icon: 'box3d' }
+    meta: { title: '② 素材生成', c1: '#a78bfa', c2: '#ec4899', icon: 'box3d' }
   },
   {
     path: '/studio/asset/voices', name: 'voiceAssets', component: () => import('./views/VoiceAssetsView.vue'),

@@ -75,8 +75,8 @@ const theme = computed(() => ({
 const navItems = [
   { key: 'home', to: '/', label: '首页', icon: 'home', group: '' },
   { key: 'studio', to: '/studio', label: '① 剧本生成', icon: 'chat', group: '制作' },
-  { key: 'studioShots', to: '/studio/shots', label: '② 分镜生成', icon: 'clapper', group: '制作' },
-  { key: 'studioAsset', to: '/studio/asset', label: '③ 素材生成', icon: 'box3d', group: '制作' },
+  { key: 'studioAsset', to: '/studio/asset', label: '② 素材生成', icon: 'box3d', group: '制作' },
+  { key: 'studioShots', to: '/studio/shots', label: '③ 分镜生成', icon: 'clapper', group: '制作' },
   { key: 'voices', to: '/studio/asset/voices', label: '④ 音色绑定', icon: 'wave', group: '制作' },
   { key: 'acting', to: '/acting', label: '⑤ 演员表现', icon: 'user', group: '制作' },
   { key: 'package', to: '/package', label: '⑥ 平面推演', icon: 'box3d', group: '制作' },
