@@ -63,6 +63,18 @@ const actingCompiling = ref(false)
 const vendors = ref<{ id: string; label?: string; enabled: boolean; models?: Record<string, string> }[]>([])
 const actingVendor = computed(() => vendors.value.find((v) => v.enabled && v.models?.text) || null)
 const chars = computed(() => data.value?.characters?.characters || [])
+const scenesMap = computed<Record<string, string>>(() => {
+  const rows = (data.value as any)?.scenes?.scenes || []
+  return Object.fromEntries(rows.map((r: any) => [r.id || r.name || '', r.name || r.id || '']).filter(([k]: any) => k))
+})
+/** 场景列：scene_ref 场景名优先；room/field 是对话契约的预设地形（军帐室内/野外战场），翻译成中文展示 */
+function sceneCell(s: Shot): { label: string; cls: string; title: string } {
+  const ref = String(s.scene_ref || '').replace(/^@scene:/, '')
+  if (ref) return { label: scenesMap.value[ref] || ref, cls: 'bg-violet-400/15 text-violet-300', title: `场景资产：@scene:${ref}` }
+  if (s.scene === 'field') return { label: '外景', cls: 'bg-amber-400/15 text-amber-300', title: 'field＝野外/战场预设地形（未关联场景资产）' }
+  if (s.scene === 'room') return { label: '室内', cls: 'bg-white/10 text-slate-400', title: 'room＝室内预设地形（未关联场景资产）' }
+  return { label: '—', cls: 'bg-white/5 text-slate-500', title: '未设置场景' }
+}
 
 async function load() {
   if (!app.current) return
@@ -83,7 +95,7 @@ async function loadBoard() {
   try {
     const b: WhiteBoard = await fetchWhiteBoard(project, name)
     if (seq !== boardLoadSeq) return
-    shots.value = ((b.shots || []) as unknown as Shot[]).map(s => ({...s, prompt_image: s.prompt_image || s.prompt || ''}))
+    shots.value = ((b.shots || []) as unknown as Shot[]).map(s => ({...s, prompt_image: s.prompt_image || s.prompt || '', dur: Number(s.dur) > 0 ? Number(s.dur) : 4}))
     boardRev.value = typeof b.script_rev === 'number' ? b.script_rev : null
   } catch {
     if (seq === boardLoadSeq) shots.value = []
@@ -421,72 +433,49 @@ useBoardSelection(board, boards, 'shots')
           </template>
         </div>
 
-        <!-- 汇总表格（Excel 式）：镜号/场景/景别/时长/内容/动作/声音/机位视角/运镜/光影/器械/镜头/台词/提示词 -->
+        <!-- 汇总表格（Excel 式）：镜号/场景/时长/机位视角/器械/镜头/运镜/内容/动作/声音/光影/台词/三提示词（景别数据保留在 JSON 与逐镜明细） -->
         <div v-if="viewTab === 'grid'">
           <div v-if="!shots.length" class="py-10 text-center text-sm text-slate-500">选择或生成一个剧本分镜</div>
           <div v-else class="modal-h-sm overflow-auto rounded-lg border border-line">
             <table class="tbl-view border-collapse">
               <thead>
                 <tr>
-                  <th>镜号</th>
-                  <th>场景</th>
-                  <th>景别</th>
+                  <th class="sticky-col">镜号</th>
+                  <th class="min-w-24">场景</th>
                   <th class="w-16">时长s</th>
+                  <th>机位(视角)</th>
+                  <th>器械</th>
+                  <th>镜头</th>
+                  <th>运镜</th>
                   <th class="min-w-40">内容</th>
                   <th class="min-w-36">动作</th>
                   <th class="min-w-28">声音</th>
-                  <th>机位(视角)</th>
-                  <th>运镜</th>
                   <th class="min-w-28">光影</th>
-                  <th>器械</th>
-                  <th>镜头</th>
                   <th class="min-w-40">台词</th>
                   <th class="min-w-64">参考帧提示词</th><th class="min-w-64">视频提示词</th><th class="min-w-64">宫格提示词</th>
                 </tr>
               </thead>
               <tbody>
                 <tr v-for="s in shots" :key="s.id">
-                  <td class="whitespace-nowrap font-black text-sky-300">{{ s.id }}</td>
-                  <td>
-                    <span class="rounded px-1 text-2xs" :class="s.scene === 'field' ? 'bg-amber-400/15 text-amber-300' : 'bg-white/10 text-slate-400'">{{ s.scene }}</span>
+                  <td class="sticky-col whitespace-nowrap font-black text-sky-300">{{ s.id }}</td>
+                  <td class="whitespace-nowrap">
+                    <span class="rounded px-1.5 py-0.5 text-2xs font-bold" :class="sceneCell(s).cls" :title="sceneCell(s).title">{{ sceneCell(s).label }}</span>
                   </td>
-                  <td class="whitespace-nowrap text-slate-300">{{ s.shot_size }}</td>
                   <td>
                     <input v-model.number="s.dur" type="number" step="0.5" min="1" max="15"
                       class="cell-input w-14 text-center tabular-nums text-slate-200"
                       @input="markDirty" />
                   </td>
-                  <td>
-                    <textarea v-model="s.content" rows="2" class="cell-input text-slate-300"
-                      @input="markDirty"></textarea>
-                  </td>
-                  <td>
-                    <textarea v-model="s.action" rows="2" class="cell-input text-slate-200"
-                      @input="markDirty"></textarea>
-                  </td>
-                  <td>
-                    <textarea v-model="s.sound" rows="2" class="cell-input text-slate-400"
-                      @input="markDirty"></textarea>
-                  </td>
                   <td class="whitespace-nowrap text-slate-400" :title="`${JSON.stringify(s.pos)} → ${JSON.stringify(s.look)}`">{{ viewOf(s) }}</td>
+                  <td><input v-model="s.rig" class="cell-input w-20 text-slate-300" @input="markDirty" /></td>
+                  <td><input v-model="s.lens" class="cell-input w-16 text-slate-300" @input="markDirty" /></td>
                   <td class="whitespace-nowrap text-slate-400">{{ s.camera_move }}</td>
-                  <td>
-                    <textarea v-model="s.lighting" rows="2" class="cell-input text-slate-400"
-                      @input="markDirty"></textarea>
-                  </td>
-                  <td>
-                    <input v-model="s.rig" class="cell-input w-20 text-slate-300"
-                      @input="markDirty" />
-                  </td>
-                  <td>
-                    <input v-model="s.lens" class="cell-input w-16 text-slate-300"
-                      @input="markDirty" />
-                  </td>
+                  <td><textarea v-model="s.content" rows="2" class="cell-input text-slate-300" @input="markDirty"></textarea></td>
+                  <td><textarea v-model="s.action" rows="2" class="cell-input text-slate-200" @input="markDirty"></textarea></td>
+                  <td><textarea v-model="s.sound" rows="2" class="cell-input text-slate-400" @input="markDirty"></textarea></td>
+                  <td><textarea v-model="s.lighting" rows="2" class="cell-input text-slate-400" @input="markDirty"></textarea></td>
                   <td class="max-w-56 text-slate-400">{{ linesOf(s) || '—' }}</td>
-                  <td>
-                    <textarea v-model="s.prompt_image" rows="3" class="cell-input text-slate-300"
-                      @input="markDirty"></textarea>
-                  </td>
+                  <td><textarea v-model="s.prompt_image" rows="3" class="cell-input text-slate-300" @input="markDirty"></textarea></td>
                   <td><textarea v-model="s.prompt_video" rows="3" class="cell-input text-slate-300" @input="markDirty"></textarea></td>
                   <td><textarea v-model="s.prompt_grid" rows="3" class="cell-input text-slate-300" @input="markDirty"></textarea></td>
                 </tr>

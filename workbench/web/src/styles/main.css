@@ -258,6 +258,22 @@ main {
   padding: 0.4rem 0.5rem;
   vertical-align: top;
 }
+.tbl-view tbody tr:nth-child(even) {
+  background: rgba(148, 163, 184, 0.035);
+}
+.tbl-view tbody td + td {
+  border-left: 1px solid rgba(148, 163, 184, 0.07);
+}
+/* 镜号列横向冻结（宽表滚动时保持可见） */
+.tbl-view .sticky-col {
+  position: sticky;
+  left: 0;
+  z-index: 1;
+  background: #10141b;
+}
+.tbl-view thead th.sticky-col {
+  z-index: 2;
+}
 
 /* ---------- 日志绿字 ---------- */
 .log-tail {
