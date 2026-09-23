@@ -18,7 +18,7 @@ except Exception:
     pass
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-PROMPT_VERSION = "1.5"
+PROMPT_VERSION = "1.6"
 
 # 分镜与演员调用资产时只传稳定引用；外观、设定图和概念图留在资产档案/参考图层。
 ASSET_REFERENCE_RULES = """资产引用规则（shot-prompt-v1）：
@@ -38,7 +38,12 @@ def _knowledge(mood_text, k=3):
             return ""
         lines = []
         for h in hits:
-            lines.append(f"- 【{h['skill']}】{h['prescription']}（片例：{h['example']}；置信 {h['count']} 次拉片归纳）")
+            if h.get("source") == "user":
+                # 用户经验卡不是拉片归纳产物，count 恒为 1，如实标注来源即可
+                lines.append(f"- 【{h['skill']}】{h['prescription']}（片例：{h['example']}；用户经验卡）")
+            else:
+                # count = 去重后来源（项目 × 影片）数，如实表述为"部片/场景"，不称"置信度"
+                lines.append(f"- 【{h['skill']}】{h['prescription']}（片例：{h['example']}；来自 {h['count']} 部片/场景的拉片归纳）")
         return "\n".join(lines)
     except Exception:
         return ""
@@ -48,32 +53,136 @@ def _selfcheck(items):
     return "输出前自检（违反任一条则修正后再输出）：\n" + "\n".join(f"- {x}" for x in items)
 
 
-def evidence_rows(text, max_items=96, max_chars=180):
-    """把剧本文本切成可回溯证据行，供资产提炼引用。"""
+# ---------- 项目制作规格（E05）：制片决策读 剧本/brief.json，不硬编码进提示词 ----------
+
+def _brief_block(proj):
+    """读取项目制作规格（projects/<项目>/剧本/brief.json），统一组装给大纲/扩写提示词。
+    返回合并默认值后的 dict；proj 为空、文件不存在或读取失败返回 None（调用处维持旧文案）。"""
+    if not proj:
+        return None
+    try:
+        from brief import has_brief, load_brief
+        return load_brief(proj) if has_brief(proj) else None
+    except Exception:
+        return None
+
+
+def _brief_tone_block(brief):
+    """题材基调注入段：genre_tone 非空才出现，空字符串不约束。"""
+    tone = str((brief or {}).get("genre_tone") or "").strip()
+    if not tone:
+        return ""
+    return f"[题材与基调（项目制作规格）]\n{tone}——人物反应、冲突设计与台词风格都服从这一基调。\n"
+
+
+# 对白密度 → 扩写语速档位（字/分钟）：低密度少台词多动作，高密度台词驱动
+DIALOGUE_RATE = {"低": (120, 160), "中": (180, 220), "高": (240, 300)}
+
+
+# 证据索引参数（E12 修复）：单条 180 字不变；全文按约 1500 字一块均匀分块，
+# 每块至少收 1 条——长剧本后段不再被"只取前 96 条"截断，任何文本区间都有证据覆盖。
+EVIDENCE_ROW_CHARS = 180
+EVIDENCE_CHUNK_CHARS = 1500
+EVIDENCE_MIN_ITEMS = 96
+
+
+def _evidence_sentences(raw):
+    """按行→句切分全文，返回 [(句首字符偏移, 句子)]，保留原文顺序（供分块与覆盖率统计）。"""
+    out = []
+    base = 0
+    for line in raw.split("\n"):
+        lead = len(line) - len(line.lstrip())
+        stripped = line.strip()
+        if stripped:
+            # 保留场景标题、动作和台词的完整短句；超长段落拆开，避免模型只能凭印象抽取。
+            parts = [p.strip() for p in re.split(r"(?<=[。！？；!?;])", stripped) if p.strip()]
+            cursor = 0
+            for part in parts or [stripped]:
+                idx = stripped.find(part, cursor)
+                if idx < 0:
+                    idx = cursor
+                cursor = idx + len(part)
+                out.append((base + lead + idx, part))
+        base += len(line) + 1
+    return out
+
+
+def evidence_rows(text, max_items=None, max_chars=EVIDENCE_ROW_CHARS, chunk_chars=EVIDENCE_CHUNK_CHARS):
+    """把剧本文本切成可回溯证据行，供资产提炼引用。
+
+    全覆盖策略（E12）：句数不超过上限时全量收录（与旧行为一致）；超过时按字符位置
+    均匀分块（每块约 chunk_chars 字）逐块采样，每块至少 1 条，保证全文任何区间都有
+    证据条目覆盖。条目上限随文本长度自适应：max(96, 块数)，即每 1500 字至少 1 条。
+    ID 按文档顺序顺编（EV001…），同一文本多次调用结果完全一致（确定性分块+顺编）。
+    每行附 chunk（块号，1 起）与 offset（句首字符偏移）供覆盖率统计与溯源。
+    """
     raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
     if not raw:
         return []
-    rows = []
-    for line in raw.split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        # 保留场景标题、动作和台词的完整短句；超长段落拆开，避免模型只能凭印象抽取。
-        parts = [part.strip() for part in re.split(r"(?<=[。！？；!?;])", line) if part.strip()]
-        for part in parts or [line]:
-            rows.append(part[:max_chars])
-            if len(rows) >= max_items:
-                break
-        if len(rows) >= max_items:
-            break
-    return [{"id": f"EV{i:03d}", "text": value} for i, value in enumerate(rows, 1)]
+    sents = _evidence_sentences(raw)
+    if not sents:
+        return []
+    total_chars = len(raw)
+    n_chunks = max(1, -(-total_chars // chunk_chars))  # 向上取整
+    cap = max(max_items or EVIDENCE_MIN_ITEMS, n_chunks)
+    if len(sents) <= cap:
+        # 短文本全量收录：与旧版逐句顺序完全一致
+        chosen = [(off, sent, min(off * n_chunks // total_chars, n_chunks - 1) + 1)
+                  for off, sent in sents]
+    else:
+        # 长文本分块采样：按句首偏移归入字符区间块，每块取前 per_chunk 条
+        per_chunk = max(1, cap // n_chunks)
+        buckets = [[] for _ in range(n_chunks)]
+        for off, sent in sents:
+            buckets[min(off * n_chunks // total_chars, n_chunks - 1)].append((off, sent))
+        chosen = []
+        for ci, bucket in enumerate(buckets):
+            for off, sent in bucket[:per_chunk]:
+                chosen.append((off, sent, ci + 1))
+    return [{"id": f"EV{i:03d}", "text": sent[:max_chars], "chunk": ci, "offset": off}
+            for i, (off, sent, ci) in enumerate(chosen, 1)]
+
+
+def evidence_report(text, max_items=None, max_chars=EVIDENCE_ROW_CHARS, chunk_chars=EVIDENCE_CHUNK_CHARS):
+    """证据行 + 覆盖率报告：rows 同 evidence_rows；coverage 如实描述采样覆盖范围，
+    供提取提示词告知模型证据边界（覆盖文本比例/条数/是否采样裁剪）。"""
+    raw = str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    rows = evidence_rows(raw, max_items=max_items, max_chars=max_chars, chunk_chars=chunk_chars)
+    if not raw or not rows:
+        return {"rows": [], "coverage": {"total_chars": len(raw), "covered_chars": 0,
+                                         "coverage_ratio": 0.0, "chunks": 0, "covered_chunks": 0,
+                                         "row_count": 0, "sentence_count": 0, "sampled": False}}
+    sents = _evidence_sentences(raw)
+    total_chars = len(raw)
+    covered = sum(len(r["text"]) for r in rows)
+    return {"rows": rows,
+            "coverage": {
+                "total_chars": total_chars,
+                "covered_chars": covered,                 # 证据条目直接收录的字符数
+                "coverage_ratio": round(covered / total_chars, 4),
+                "chunks": max(1, -(-total_chars // chunk_chars)),
+                "covered_chunks": len({r["chunk"] for r in rows}),
+                "row_count": len(rows),
+                "sentence_count": len(sents),
+                "sampled": len(rows) < len(sents),        # 是否发生采样裁剪（长剧本为 True）
+            }}
 
 
 def _evidence_block(text):
-    rows = evidence_rows(text)
+    report = evidence_report(text)
+    rows = report["rows"]
     if not rows:
         return "[本集证据索引]\n（无可用原文）"
-    return "[本集证据索引：每个资产必须引用至少一条，ID 必须逐字照抄]\n" + "\n".join(
+    cov = report["coverage"]
+    # 如实告知覆盖范围：采样模式下未逐字收录的区间，引导引用位置最近的 EV 编号
+    if cov["sampled"]:
+        note = (f"[证据覆盖：全文 {cov['total_chars']} 字按约 {EVIDENCE_CHUNK_CHARS} 字均匀分 "
+                f"{cov['chunks']} 块逐块采样，以下 {cov['row_count']} 条覆盖全文各区间"
+                f"（逐字收录约 {cov['coverage_ratio'] * 100:.0f}% 原文）；"
+                f"资产依据若未逐字出现，引用原文位置最接近的 EV 编号]")
+    else:
+        note = f"[证据覆盖：全文 {cov['total_chars']} 字、{cov['row_count']} 句已全量收录]"
+    return "[本集证据索引：每个资产必须引用至少一条，ID 必须逐字照抄]\n" + note + "\n" + "\n".join(
         f"{row['id']}：{row['text']}" for row in rows
     )
 
@@ -150,17 +259,28 @@ def episode_overview_prompt(episode_text, entry=None, style_text=None):
 
 # ---------- 1b. 创作构想 → 剧集大纲（从 0 生成，扩写链第一环） ----------
 
-def outline_prompt(idea, eps_n=6, style="短剧", mood=None, style_text=None):
-    """一段话构想 → 全季大纲。产出与 episodes_prompt 同 schema（直接写 分集.json）。"""
+def outline_prompt(idea, eps_n=6, style="短剧", mood=None, style_text=None, proj=None):
+    """一段话构想 → 全季大纲。产出与 episodes_prompt 同 schema（直接写 分集.json）。
+    proj 传入且 brief.json 存在时按制作规格生成（单集时长/冲突节奏/题材基调）；否则维持缺省文案。"""
+    brief = _brief_block(proj)
+    if brief:
+        minutes = float(brief.get("episode_minutes") or 3)
+        # 爽点密度保持约 30~60 秒一个，总量随单集目标时长缩放
+        beats = max(2, round(minutes * 60 / 45))
+        minutes_rule = f"恰好 {eps_n} 集；每集约 {minutes:g} 分钟（{style}节奏，项目制作规格）。"
+        pace_rule = f"每 30~60 秒一个小冲突或反转（单集约 {minutes:g} 分钟 ≈ {beats} 个爽点）。"
+    else:
+        minutes_rule = f"恰好 {eps_n} 集；每集 3~8 分钟（{style}节奏）。"
+        pace_rule = "每 30~60 秒一个小冲突或反转（短剧爽点节奏）。"
     sys_p = f"""你是剧集主理人（v{PROMPT_VERSION}）。把一段创作构想扩写成完整剧集大纲。
 这是"从 0 生成"：构想可能只有一两句话，你要补全世界观、人物关系与叙事弧，但**不得偏离构想的核心设定与基调**。
 
 硬约束：
-1. 恰好 {eps_n} 集；每集 3~8 分钟（{style}节奏）。
+1. {minutes_rule}
 2. 每集必须独立成弧：钩子（前 30 秒建立张力）+ 落点（结尾悬念/情绪爆点）；全季有一条贯穿主线，最后一集收束。
-3. 每 30~60 秒一个小冲突或反转（短剧爽点节奏）。
+3. {pace_rule}
 4. genre/mood 只能从：悬疑/情感/爽感/喜剧/热血/惊悚/温情 中选（可组合）。
-{f'''拆剧本 skill（本项目节奏契约）：
+{_brief_tone_block(brief)}{f'''拆剧本 skill（本项目节奏契约）：
 {style_text}''' if style_text else ''}
 
 输出 JSON：{{"episodes":[{{"id":"E1","title":"≤8字","hook":"开场钩子一句话","cliff":"落点一句话",
@@ -173,8 +293,16 @@ def outline_prompt(idea, eps_n=6, style="短剧", mood=None, style_text=None):
 
 # ---------- 1c. 大纲 → 指定集扩写（分场剧本） ----------
 
-def expand_episode_prompt(idea, entry, prev_summary=None, style_text=None):
-    """大纲条目 → 该集分场剧本文本（场景标题+动作描述+台词，即 剧本.txt 格式）。"""
+def expand_episode_prompt(idea, entry, prev_summary=None, style_text=None, proj=None):
+    """大纲条目 → 该集分场剧本文本（场景标题+动作描述+台词，即 剧本.txt 格式）。
+    proj 传入且 brief.json 存在时按制作规格生成（对白密度字数档位/题材基调）；否则维持缺省文案。"""
+    brief = _brief_block(proj)
+    if brief:
+        density = str(brief.get("dialogue_density") or "中")
+        lo, hi = DIALOGUE_RATE.get(density, DIALOGUE_RATE["中"])
+        rate_rule = f"时长对齐 duration_min（对白密度「{density}」：约 {lo}~{hi} 字/分钟，项目制作规格）。"
+    else:
+        rate_rule = "时长对齐 duration_min（约 180~220 字/分钟）。"
     sys_p = f"""你是对话剧编剧（v{PROMPT_VERSION}）。把大纲里的一集扩写成"分场剧本"原文。
 扩写不是概括：要写出可拍摄的全部台词与动作。
 
@@ -182,9 +310,9 @@ def expand_episode_prompt(idea, entry, prev_summary=None, style_text=None):
 1. 格式：每场以【场景：地点／日或夜】开头；动作描述用第三人称现在时；台词直接写"角色名：台词内容"。
 2. 只写这一集的内容，开场 3 句内建立本集钩子，结尾落在 cliff 上。
 3. 台词口语化、符合人物身份；禁止旁白吐槽、禁止"旁白："。
-4. 时长对齐 duration_min（约 180~220 字/分钟）。
+4. {rate_rule}
 5. 关键道具必须出现在动作描述里（资产提炼会消费）。
-{f'''拆剧本 skill（本项目节奏契约）：
+{_brief_tone_block(brief)}{f'''拆剧本 skill（本项目节奏契约）：
 {style_text}''' if style_text else ''}
 
 输出：纯剧本文本，不要 JSON、不要解释、不要标题。"""

@@ -46,6 +46,48 @@ class ResponseAlreadyStarted(RuntimeError):
 
 try: sys.stdout.reconfigure(encoding="utf-8")
 except Exception: pass
+
+def _safe_print(*args, file=None):
+    """安全打印（P03）：pythonw/守护链下 sys.stdout/sys.stderr 可能为 None，
+    裸 print 会 AttributeError 秒退——所有控制台输出统一走这里，None 时静默跳过。"""
+    try:
+        stream = file if file is not None else sys.stdout
+        if stream is None:
+            return
+        print(*args, file=stream, flush=True)
+    except Exception:
+        pass
+
+def acquire_instance_lock():
+    """server 单实例锁（P01）：msvcrt.locking 非阻塞锁 runtime/server.lock 首字节。
+    Windows 上进程死亡 OS 自动释放，无 stale 问题；非 Windows 兜底 fcntl.flock；
+    两者都不可用的平台不阻断启动。抢锁成功返回句柄（调用方须持有到进程结束），
+    已有实例持锁则打印中文错误并以非零码退出。"""
+    path = os.path.join(ROOT, "runtime", "server.lock")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fh = open(path, "a+b")
+    try:
+        # 锁第 64 字节（远离文件头）：文件头的 PID 文本在持锁期间仍可读，便于排查
+        fh.seek(64)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            try:
+                import fcntl
+            except ImportError:
+                return fh   # 无锁定原语的平台：放弃互斥但不阻断启动
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        _safe_print("已有 server 实例在运行（锁文件 runtime/server.lock），本次退出")
+        raise SystemExit(3)
+    # 锁内写入 PID 便于排查（截断到锁位之前，避免误清锁字节）
+    fh.seek(0)
+    fh.write(str(os.getpid()).encode("ascii"))
+    fh.truncate(32)
+    fh.flush()
+    return fh
 ROOT=os.path.dirname(os.path.abspath(__file__))
 TOOLS=os.path.join(ROOT,"tools")
 if TOOLS not in sys.path: sys.path.insert(0, TOOLS)
@@ -248,6 +290,8 @@ def scan_projects():
     pj=os.path.join(VIDEO,"projects"); out=[]
     if not os.path.isdir(pj): return out
     for name in sorted(os.listdir(pj)):
+        # 隐藏目录（如 .回收站=已删项目暂存区）不参与项目扫描
+        if name.startswith("."): continue
         d=os.path.join(pj,name)
         if not os.path.isdir(d): continue
         try:
@@ -538,7 +582,7 @@ class H(BaseHTTPRequestHandler):
         # 仅记录服务端错误；不写请求正文、查询参数或鉴权头。
         if str(code).isdigit() and int(code) >= 500:
             path = urllib.parse.urlsplit(self.path).path
-            print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] HTTP {code} {self.command} {path}", flush=True)
+            _safe_print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] HTTP {code} {self.command} {path}")
     JOBS={}; JOBSEQ=[0]; JLOCK=threading.RLock(); PROCS={}
     def _persist_job(self,jid):
         """任务状态落盘 workbench/jobs/job_<id>.json（服务重启后可查）。"""
@@ -679,7 +723,7 @@ class H(BaseHTTPRequestHandler):
     def _request_error(self, code, message):
         if getattr(self, '_response_started', False):
             self.close_connection = True
-            print(f'HTTP 响应开始后中止：{self.command} {scrub_err(message)}', file=sys.stderr)
+            _safe_print(f'HTTP 响应开始后中止：{self.command} {scrub_err(message)}', file=sys.stderr)
             return
         try:
             self._send_run_json(code, {'ok': False, 'err': message})
@@ -1077,6 +1121,19 @@ class H(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
 
+    @route('GET', '/api/script/brief')
+    def route_get_api_script_brief(self, ctx):
+        u, q = ctx.url, ctx.query
+        # 项目制作规格（E05）：缺文件返回完整默认值，exists 标记用户是否配置过
+        d=proj_dir(q.get("project",[""])[0])
+        if not d:
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目不存在"},ensure_ascii=False).encode())
+        mod=tools_mod("brief.py")
+        if mod is None:
+            return self._send(500,"application/json",json.dumps({"ok":False,"err":"brief.py 缺失"},ensure_ascii=False).encode())
+        return self._send(200,"application/json; charset=utf-8",json.dumps(
+            {"ok":True,"brief":mod.load_brief(d),"exists":mod.has_brief(d)},ensure_ascii=False).encode())
+
     @route('GET', '/api/script/data')
     def route_get_api_script_data(self, ctx):
         u, q = ctx.url, ctx.query
@@ -1124,10 +1181,16 @@ class H(BaseHTTPRequestHandler):
         if not script:
             sp=os.path.join(d,"剧本","剧本.txt")
             script=open(sp,encoding="utf-8").read() if os.path.isfile(sp) else ""
+        # E10 显性选择：返回 style.json 的显式值（缺失 target 由 ensure_explicit_defaults
+        # 幂等默认填入并落盘），前端下拉直接回显，不再各自隐式推导。
+        try:
+            style_data = skill_lib_call("ensure_explicit_defaults", d)
+        except Exception:
+            style_data = _rd("style.json") or {}
         return self._send(200,"application/json; charset=utf-8",json.dumps({
             "script": script, "script_mode": mode, "script_rev": script_rev,
             "episodes": eps, "characters": chars_data, "scenes": scenes_data,
-            "props": props_data, "style": _rd("style.json") or {}},ensure_ascii=False).encode())
+            "props": props_data, "style": style_data},ensure_ascii=False).encode())
 
     @route('GET', '/api/skills')
     def route_get_api_skills(self, ctx):
@@ -1227,6 +1290,29 @@ class H(BaseHTTPRequestHandler):
     def route_get_api_env_config(self, ctx):
         u, q = ctx.url, ctx.query
         return self._send(200,"application/json; charset=utf-8",json.dumps({"vendors":vendors_masked()},ensure_ascii=False).encode())
+
+    @route('GET', '/api/billing/summary')
+    def route_get_api_billing_summary(self, ctx):
+        """计费汇总：?month=YYYY-MM 可选；按 vendor×kind 分组 + 总合计 + 按天。"""
+        u, q = ctx.url, ctx.query
+        m=tools_mod("billing.py")
+        if m is None:
+            return self._send(500,"application/json",json.dumps({"err":"billing 模块缺失"},ensure_ascii=False).encode())
+        month=(q.get("month",[""])[0] or "").strip() or None
+        return self._send(200,"application/json; charset=utf-8",json.dumps(m.summary(month),ensure_ascii=False).encode())
+
+    @route('GET', '/api/billing/records')
+    def route_get_api_billing_records(self, ctx):
+        """最近账单记录：?limit=100&month=YYYY-MM（limit 夹取 1..500，新在前）。"""
+        u, q = ctx.url, ctx.query
+        m=tools_mod("billing.py")
+        if m is None:
+            return self._send(500,"application/json",json.dumps({"err":"billing 模块缺失"},ensure_ascii=False).encode())
+        try: limit=max(1,min(500,int(q.get("limit",["100"])[0])))
+        except (TypeError,ValueError): limit=100
+        month=(q.get("month",[""])[0] or "").strip() or None
+        return self._send(200,"application/json; charset=utf-8",json.dumps(
+            {"records":m.recent(limit,month)},ensure_ascii=False).encode())
 
     @route('GET', '/api/env/chrome-use')
     def route_get_api_env_chrome_use(self, ctx):
@@ -1570,6 +1656,37 @@ class H(BaseHTTPRequestHandler):
                   open(os.path.join(d,"项目.json"),"w",encoding="utf-8"),ensure_ascii=False,indent=1)
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"type":ptype},ensure_ascii=False).encode())
 
+    @route('POST', '/api/project/delete')
+    def route_post_api_project_delete(self, ctx):
+        u, q = ctx.url, ctx.query
+        ln = ctx.content_length
+        # 删除项目：整目录移入 projects/.回收站/<项目>_<时间戳>/（不物理删除，可手动找回/清空）
+        body=json.loads(self.rfile.read(ln).decode("utf-8","replace") or b"{}")
+        name=str(body.get("project") or "").strip()
+        # 项目名合法性：必须是 projects/ 根下单层目录名，禁分隔符/上跳/隐藏名，从源头挡住路径穿越
+        if not name or name.startswith(".") or "/" in name or "\\" in name:
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目名不合法"},ensure_ascii=False).encode())
+        root=os.path.normpath(os.path.join(VIDEO,"projects"))
+        src=os.path.normpath(os.path.join(root,name))
+        if os.path.dirname(src)!=root or not under(root,src):
+            return self._send(403,"application/json",json.dumps({"ok":False,"err":"路径越界"},ensure_ascii=False).encode())
+        if not os.path.isdir(src):
+            return self._send(404,"application/json",json.dumps({"ok":False,"err":"项目不存在:"+name},ensure_ascii=False).encode())
+        bin_dir=os.path.join(root,".回收站")
+        os.makedirs(bin_dir,exist_ok=True)
+        base="%s_%s"%(name,time.strftime("%Y%m%d_%H%M%S")); dst=os.path.join(bin_dir,base)
+        n=2
+        while os.path.exists(dst):   # 同秒同名撞车追加序号
+            dst=os.path.join(bin_dir,"%s_%d"%(base,n)); n+=1
+        try:
+            os.rename(src,dst)
+        except OSError:
+            try: shutil.move(src,dst)   # rename 失败（占用/跨卷等）兜底，仍是移动不复制删除
+            except Exception as e:
+                return self._send(500,"application/json",json.dumps({"ok":False,"err":"移入回收站失败:"+str(e)},ensure_ascii=False).encode())
+        rel=os.path.relpath(dst,VIDEO).replace(os.sep,"/")
+        return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"recycled":rel,"msg":"项目「%s」已移入回收站（%s），可手动找回或清空"%(name,rel)},ensure_ascii=False).encode())
+
     @route('GET', '/api/media-gateway')
     def route_get_media_gateway(self, ctx):
         from media_gateway import load
@@ -1786,7 +1903,9 @@ class H(BaseHTTPRequestHandler):
                   "note":str(v.get("note") if v.get("note") is not None else o.get("note","") or ""),
                   "models":{k:str(nm.get(k) if nm.get(k) is not None else om.get(k,"") or "") for k in KINDS},
                   "endpoints":{k:str(ne.get(k) if ne.get(k) is not None else oe.get(k,"") or "") for k in KINDS},
-                  "reference_limit": (v.get("reference_limit") if v.get("reference_limit") is not None else o.get("reference_limit"))
+                  "reference_limit": (v.get("reference_limit") if v.get("reference_limit") is not None else o.get("reference_limit")),
+                  # 计费单价表：前端未提交（非 dict）时保留旧值；提交空 dict 表示清空
+                  "pricing": (v.get("pricing") if isinstance(v.get("pricing"),dict) else o.get("pricing")) or {}
                 }
             k=str(v.get("api_key") or "").strip()
             item["api_key"]="" if looks_masked(k) else k   # 掩码值视为未改动
@@ -2843,6 +2962,8 @@ class H(BaseHTTPRequestHandler):
         cmd=[sys.executable,gen,d,"--style",body.get("style") if body.get("style") in ("stand","seated") else "stand"]
         nm=safe_proj(body.get("analysis") or "")
         if nm: cmd+=["--analysis",nm]
+        md=body.get("mode")   # E09 双模式透传：schematic(示意预演,缺省)/faithful(忠实重建)；非法值不带参
+        if md in ("schematic","faithful"): cmd+=["--mode",md]
         _env=dict(os.environ); _env["PYTHONIOENCODING"]="utf-8"
         jid=self.spawn_job("analysis",cmd)
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"id":jid,"job":True},ensure_ascii=False).encode())
@@ -3142,6 +3263,28 @@ class H(BaseHTTPRequestHandler):
             except Exception as exc:
                 return self._send(500,"application/json",json.dumps({"ok":False,"err":f"风格已保存，但待生成资产队列刷新失败：{exc}"},ensure_ascii=False).encode())
         return self._send(200,"application/json",json.dumps({"ok":True,"refreshed_asset_jobs":refreshed},ensure_ascii=False).encode())
+
+    @route('POST', '/api/script/brief')
+    def route_post_api_script_brief(self, ctx):
+        u, q = ctx.url, ctx.query
+        ln = ctx.content_length
+        # 保存项目制作规格（E05）：patch 合并写 剧本/brief.json（版本快照惯例），值 None=恢复默认
+        body=json.loads(self.rfile.read(ln).decode("utf-8","replace") or b"{}")
+        d=proj_dir(body.get("project"))
+        if not d:
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目不存在"},ensure_ascii=False).encode())
+        patch=body.get("patch")
+        if not isinstance(patch,dict):
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"patch 必须是对象"},ensure_ascii=False).encode())
+        mod=tools_mod("brief.py")
+        if mod is None:
+            return self._send(500,"application/json",json.dumps({"ok":False,"err":"brief.py 缺失"},ensure_ascii=False).encode())
+        try:
+            brief_doc=mod.save_brief(d,patch)
+        except ValueError as exc:
+            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+        return self._send(200,"application/json; charset=utf-8",json.dumps(
+            {"ok":True,"brief":brief_doc,"exists":True},ensure_ascii=False).encode())
 
     @route('POST', '/api/script/episode/delete')
     def route_post_api_script_episode_delete(self, ctx):
@@ -3555,12 +3698,163 @@ class H(BaseHTTPRequestHandler):
         ln = ctx.content_length
         body=json.loads(self.rfile.read(ln).decode("utf-8","replace") or b"{}")
         d=proj_dir(body.get("project"))
+        if not d:
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目不存在"},ensure_ascii=False).encode())
+        # plan v1：body.plan 给平面图名 → strategy_map --plan 底图模式；同时带 storyboard 时作底图叠加
+        pl=safe_proj(body.get("plan") or "")
+        plan_path=None
+        if pl:
+            plan_path=os.path.normpath(os.path.join(d,"推演",f"平面图_{pl}.plan.json"))
+            if not under(d,plan_path) or not os.path.isfile(plan_path):
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":"平面图不存在"},ensure_ascii=False).encode())
         sb=str(body.get("storyboard") or "")
-        if not d or not safe_proj(sb) or not sb.lower().endswith(".json") or not under(os.path.join(d,"分镜"),os.path.join(d,"分镜",sb)) or not os.path.isfile(os.path.join(d,"分镜",sb)):
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目/分镜不合法"},ensure_ascii=False).encode())
-        jid=self.spawn_job("creation",[sys.executable,os.path.join(TOOLS,"strategy_map.py"),
-                                       os.path.join(d,"分镜",sb)])
+        cmd=[sys.executable,os.path.join(TOOLS,"strategy_map.py")]
+        if sb:
+            if not safe_proj(sb) or not sb.lower().endswith(".json") or not under(os.path.join(d,"分镜"),os.path.join(d,"分镜",sb)) or not os.path.isfile(os.path.join(d,"分镜",sb)):
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目/分镜不合法"},ensure_ascii=False).encode())
+            cmd.append(os.path.join(d,"分镜",sb))
+        elif not pl:
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"需要 storyboard 或 plan 之一"},ensure_ascii=False).encode())
+        if plan_path:
+            cmd+=["--plan",plan_path]
+        jid=self.spawn_job("creation",cmd)
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"id":jid,"job":True},ensure_ascii=False).encode())
+
+    def _plan_path(self, d, name):
+        """plan v1 落盘约定：projects/<项目>/推演/平面图_<名>.plan.json（名经单层目录清洗）。"""
+        nm = safe_proj(name)
+        if not nm:
+            return None
+        p = os.path.normpath(os.path.join(d, "推演", f"平面图_{nm}.plan.json"))
+        return p if under(d, p) else None
+
+    @route('POST', '/api/plan/generate')
+    def route_post_api_plan_generate(self, ctx):
+        # plan v1：LLM 生成 → validate → 判官打回循环 → 落盘（版本快照）。长任务走 job 体系。
+        # 三种形态：all_scenes=true 全部场景批量；scene=<场景id> 单场景（extra_desc 补充）；
+        # name+scene_desc/keyframe 原始自由生成。
+        body = json.loads(self.rfile.read(ctx.content_length).decode("utf-8", "replace") or b"{}")
+        d = proj_dir(body.get("project"))
+        if not d:
+            return self._send(400, "application/json", json.dumps({"ok": False, "err": "项目不存在"}, ensure_ascii=False).encode())
+        if not tools_mod("gen_plan.py"):
+            return self._send(500, "application/json", json.dumps({"ok": False, "err": "gen_plan.py 缺失"}, ensure_ascii=False).encode())
+        cmd = [sys.executable, os.path.join(TOOLS, "gen_plan.py"), d]
+        if body.get("all_scenes"):
+            cmd += ["--all-scenes", "--skip-existing"]
+        else:
+            scene = str(body.get("scene") or "").strip()
+            if scene:
+                cmd += ["--scene", safe_proj(scene)]
+                extra = str(body.get("extra_desc") or "").strip()
+                if extra:
+                    cmd += ["--extra-desc", extra]
+            else:
+                nm = safe_proj(body.get("name") or "")
+                if not nm:
+                    return self._send(400, "application/json", json.dumps({"ok": False, "err": "name 必填（平面图名），或改用 scene/all_scenes"}, ensure_ascii=False).encode())
+                desc = str(body.get("scene_desc") or "").strip()
+                keyframe = str(body.get("keyframe") or "").strip()
+                if not desc and not keyframe:
+                    return self._send(400, "application/json", json.dumps({"ok": False, "err": "需要 scene_desc 或 keyframe 之一"}, ensure_ascii=False).encode())
+                cmd.append(nm)
+                if desc:
+                    cmd += ["--scene-desc", desc]
+                if keyframe:
+                    kf = os.path.normpath(os.path.join(d, keyframe)) if not os.path.isabs(keyframe) else os.path.normpath(keyframe)
+                    if not under(d, kf) or not os.path.isfile(kf):
+                        return self._send(400, "application/json", json.dumps({"ok": False, "err": "关键帧不存在或越出项目目录"}, ensure_ascii=False).encode())
+                    cmd += ["--keyframe", kf]
+                if body.get("zone"):
+                    cmd += ["--zone", str(body["zone"])]
+        jid = self.spawn_job("creation", cmd)
+        return self._send(200, "application/json; charset=utf-8", json.dumps({"ok": True, "id": jid, "job": True}, ensure_ascii=False).encode())
+
+    @route('GET', '/api/plan')
+    def route_get_api_plan(self, ctx):
+        u, q = ctx.url, ctx.query
+        d = proj_dir(q.get("project", [""])[0])
+        p = self._plan_path(d, q.get("name", [""])[0]) if d else None
+        if not d or not p:
+            return self._send(400, "application/json", json.dumps({"ok": False, "err": "项目/name 不合法"}, ensure_ascii=False).encode())
+        if not os.path.isfile(p):
+            return self._send(404, "application/json", json.dumps({"ok": False, "err": "平面图不存在"}, ensure_ascii=False).encode())
+        try:
+            plan = json.load(open(p, encoding="utf-8"))
+        except ValueError as exc:
+            return self._send(400, "application/json", json.dumps({"ok": False, "err": f"JSON 解析失败: {exc}"}, ensure_ascii=False).encode())
+        return self._send(200, "application/json; charset=utf-8", json.dumps(
+            {"ok": True, "name": safe_proj(q.get("name", [""])[0]), "plan": plan}, ensure_ascii=False).encode())
+
+    @route('POST', '/api/plan/save')
+    def route_post_api_plan_save(self, ctx):
+        # 手动编辑回写：validate 错误 400 带中文明细，警告随响应返回；落盘前版本快照。
+        body = json.loads(self.rfile.read(ctx.content_length).decode("utf-8", "replace") or b"{}")
+        d = proj_dir(body.get("project"))
+        p = self._plan_path(d, body.get("name") or "") if d else None
+        if not d or not p:
+            return self._send(400, "application/json", json.dumps({"ok": False, "err": "项目/name 不合法"}, ensure_ascii=False).encode())
+        plan = body.get("plan")
+        if not isinstance(plan, dict):
+            return self._send(400, "application/json", json.dumps({"ok": False, "err": "plan 必须是对象"}, ensure_ascii=False).encode())
+        vm = tools_mod("validate_plan.py")
+        if not vm:
+            return self._send(500, "application/json", json.dumps({"ok": False, "err": "validate_plan.py 缺失"}, ensure_ascii=False).encode())
+        sc = os.path.join(d, "素材", "场景.json")
+        scene_ids = vm.load_scene_ids(sc) if os.path.isfile(sc) else None
+        vr = vm.validate_document(plan, scene_ids=scene_ids)
+        if vr["errors"]:
+            return self._send(400, "application/json; charset=utf-8", json.dumps(
+                {"ok": False, "err": f"校验未通过：{len(vr['errors'])} 错误",
+                 "errors": vr["errors"], "warnings": vr["warnings"]}, ensure_ascii=False).encode())
+        pm = tools_mod("plan_adapt.py")
+        if not pm:
+            return self._send(500, "application/json", json.dumps({"ok": False, "err": "plan_adapt.py 缺失"}, ensure_ascii=False).encode())
+        pm.save_plan(d, body.get("name") or "", plan)   # 单一写入口：自带版本快照
+        return self._send(200, "application/json; charset=utf-8", json.dumps(
+            {"ok": True, "warnings": vr["warnings"]}, ensure_ascii=False).encode())
+
+    @route('GET', '/api/plan/list')
+    def route_get_api_plan_list(self, ctx):
+        u, q = ctx.url, ctx.query
+        d = proj_dir(q.get("project", [""])[0])
+        if not d:
+            return self._send(400, "application/json", json.dumps({"ok": False, "err": "项目不存在"}, ensure_ascii=False).encode())
+        out = []
+        pdir = os.path.join(d, "推演")
+        vm = tools_mod("validate_plan.py")
+        if os.path.isdir(pdir):
+            for fn in sorted(os.listdir(pdir)):
+                if not (fn.startswith("平面图_") and fn.endswith(".plan.json")):
+                    continue
+                fp = os.path.join(pdir, fn)
+                try:
+                    st = os.stat(fp)
+                    row = {"name": fn[len("平面图_"):-len(".plan.json")], "file": fn,
+                           "size": st.st_size, "mtime": st.st_mtime}
+                    # 页面列表直出：计数 + validate 状态（小文件现算，免逐张二次请求）
+                    try:
+                        plan = json.load(open(fp, encoding="utf-8"))
+                        row["scene_ref"] = plan.get("scene_ref") or None
+                        row["counts"] = {k: len(plan.get(k) or [])
+                                         for k in ("props", "actors", "paths", "cameras", "zones")}
+                        if vm:
+                            vr = vm.validate_document(plan)
+                            row["validate"] = {"ok": not vr["errors"],
+                                               "errors": len(vr["errors"]),
+                                               "warnings": len(vr["warnings"]),
+                                               "details": [e["message"] for e in (vr["errors"] + vr["warnings"])[:3]]}
+                        if isinstance(plan.get("_judge"), dict):
+                            row["judge"] = {"ok": bool(plan["_judge"].get("ok")),
+                                            "reasons": plan["_judge"].get("reasons") or []}
+                    except ValueError:
+                        row["validate"] = {"ok": False, "errors": 1, "warnings": 0,
+                                           "details": ["JSON 解析失败"]}
+                    out.append(row)
+                except OSError:
+                    pass
+        return self._send(200, "application/json; charset=utf-8", json.dumps(
+            {"ok": True, "plans": out}, ensure_ascii=False).encode())
 
     @route('POST', '/api/production/prompts', '/api/production/episode', '/api/production/affected')
     def route_post_api_production_prompts(self, ctx):
@@ -3595,6 +3889,21 @@ class H(BaseHTTPRequestHandler):
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,**report},ensure_ascii=False).encode())
         except Exception as exc:
             return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+
+    @route('POST', '/api/production/redo_segment')
+    def route_post_api_production_redo_segment(self, ctx):
+        # 视频局部修补（重做片段）：抽已采用 V 视频的 t0/t1 锚点帧 → 首尾帧模式生成中段
+        # → 自动拼回原片 → 登记为该 V 的新候选（不自动采用，人工审核流程不变）。长任务走 job 体系。
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8', 'replace') or b'{}')
+        d = proj_dir(body.get("project"))
+        try:
+            if not d: raise ValueError("项目不存在")
+            result = tools_mod('production_jobs.py').enqueue(
+                d, {**body, 'action': 'redo_segment', 'scope': 'V', 'type': 'video'}, self.spawn_job, PROV)
+            return self._send_run_json(200, result)
+        except Exception as exc:
+            return self._send_run_json(409 if exc.__class__.__name__ == 'RevisionConflict' else 400 if isinstance(exc, ValueError) else 500,
+                                       {'ok': False, 'err': scrub_err(exc)})
 
     @route('POST', '/api/knowledge/card', '/api/knowledge/card/delete')
     def route_post_api_knowledge_card(self, ctx):
@@ -3929,14 +4238,18 @@ def heartbeat429(handler_cls):
                 handler_cls.HEARTBEAT_LOG[:] = handler_cls.HEARTBEAT_LOG[-50:]
     t=threading.Thread(target=_loop,daemon=True); t.start(); return t
 if __name__=="__main__":
-    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动 Slate；Python {sys.version.split()[0]}；解释器 {sys.executable}", flush=True)
+    _safe_print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] 启动 Slate；Python {sys.version.split()[0]}；解释器 {sys.executable}")
     if not os.path.isfile(os.path.join(WEBDIST, "index.html")):
-        print("[部署未完成] 缺少新版前端：在 workbench/web 执行 npm ci 和 npm run build；首页将返回 503。", flush=True)
+        _safe_print("[部署未完成] 缺少新版前端：在 workbench/web 执行 npm ci 和 npm run build；首页将返回 503。")
+    # P01：bind 之前抢单实例锁（http.server 默认 SO_REUSEADDR，双绑同端口不报错的平台
+    # 上这是防双实例的最后一道）；句柄挂到本作用域全程，进程死亡 OS 自动释放。
+    # keepalive 父进程不持锁，只有 server 持锁，守护拉起链路不受影响。
+    instance_lock = acquire_instance_lock()
     load_llm_cfg()
     ensure_providers()
     restore_jobs(H)
     removed=cleanup_job_logs()
-    if removed: print(f"已清理 {removed} 个 {JOB_LOG_KEEP_DAYS} 天前的任务日志")
+    if removed: _safe_print(f"已清理 {removed} 个 {JOB_LOG_KEEP_DAYS} 天前的任务日志")
     args=[a for a in sys.argv[1:] if a!="--lan"]
     port=int(args[0]) if args and args[0].isdigit() else 8775
     # 本机与局域网使用同一服务实例；
@@ -3947,8 +4260,10 @@ if __name__=="__main__":
     try:
         httpd = ThreadingHTTPServer((host,port),H)
     except OSError as exc:
-        raise SystemExit(f"启动失败，无法监听端口 {port}：{exc}。请检查是否已有工作台服务正在运行。")
-    print(f"工作台: http://localhost:{port}（监听 0.0.0.0，局域网可达）", flush=True)
+        # P04：同工作区双实例已在 acquire_instance_lock 层退出，到这里的 OSError
+        # 只剩"端口被外部程序占用"场景（SO_REUSEADDR 下双绑不报 EADDRINUSE，本分支不覆盖该情形）
+        raise SystemExit(f"启动失败，端口 {port} 被其他程序占用：{exc}。请更换端口或结束占用进程。")
+    _safe_print(f"工作台: http://localhost:{port}（监听 0.0.0.0，局域网可达）")
     httpd.serve_forever()
 
 

@@ -959,6 +959,11 @@ watch(() => app.current, () => {
                         :key="d._uid || di"
                         class="flex items-center gap-2 rounded-lg border border-line-soft bg-black/25 p-2"
                       >
+                        <span
+                          v-if="d.span === 'overlap'"
+                          class="shrink-0 rounded border border-amber-500/40 bg-amber-500/10 px-1 py-0.5 text-2xs text-amber-300"
+                          :title="`跨镜台词（事件 ${d.event || '?'}）：本句跨多个镜头，此镜为非主属引用`"
+                        >↔跨镜</span>
                         <input v-model="d.speaker" class="input w-20 shrink-0" title="说话人" placeholder="角色" @input="markDirty" />
                         <input v-model="d.text" class="input flex-1" placeholder="台词文本" @input="markDirty" />
                         <input

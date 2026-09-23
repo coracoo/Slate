@@ -264,7 +264,8 @@ class AssetRegistry:
         if not isinstance(data, dict):
             return
         ident = str(data.get("image") or "").strip()
-        if ident:
+        # E10：显式 "auto"（仅知识库、不注 skill）不是真实画风资产，禁止注册成 @style 记录
+        if ident and ident != "auto":
             self._records[f"@style:{ident}"] = {
                 "ref": f"@style:{ident}", "kind": "style", "id": ident,
                 "name": ident, "path": "", "usage": "画风 Skill", "aliases": [],

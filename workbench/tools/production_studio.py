@@ -241,7 +241,20 @@ def state(project, name):
             u['stale'] = True
             u['timeline'] = []
             u['judge'] = {'ok': True, 'warnings': []}
-    return {'board': board, 'revision': revision}
+    result = {'board': board, 'revision': revision}
+    # 制作规格（E05）：V 总时长超过单集目标时长时给出提示；只提示，不改分组算法（E06 另案）
+    try:
+        from brief import has_brief, load_brief
+        if has_brief(project):
+            ep_minutes = float(load_brief(project).get('episode_minutes') or 0)
+            ep_sec = ep_minutes * 60
+            total = sum(float(u.get('duration') or 0) for u in units)
+            if ep_sec > 0 and total > ep_sec + 0.5:
+                result['brief_notice'] = (f'V 总时长 {total:g}s 已超过制作规格的单集时长 '
+                                          f'{ep_minutes:g} 分钟（{ep_sec:g}s），请检查集数拆分或调整剧本页「制作规格」')
+    except Exception:
+        pass
+    return result
 
 
 def clean_units(board, units, *, trusted_sources=False):

@@ -63,6 +63,10 @@ export interface DialogueLine {
   t_in: number
   t_out: number
   source?: string
+  /** E08 独立音轨：回指 dialogue_track 本体事件 id（跨镜去重凭据） */
+  event?: string
+  /** E08：primary=本体中点所在镜（主属）；overlap=跨镜句在本镜的交集引用 */
+  span?: 'primary' | 'overlap'
   /** 前端辅助字段：可增删列表的稳定 key；保存前剔除，不落盘。 */
   _uid?: string
 }
@@ -114,7 +118,31 @@ export class ApiError extends Error {
 
 const FETCH_TIMEOUT = 30000
 
+// ---- 认证静默闸（N85 补充）----
+// 一次 401 后全局静默：后续非 auth 请求在本地直接短路，不打网络、不重复跳转；
+// 登录是 SPA 内跳转（不整页刷新），登录成功后由 LoginView 调 markAuthed() 复位。
+let guest = false
+let redirected = false
+export const isGuest = () => guest
+export function markAuthed() { guest = false; redirected = false; resolveAuth(true) }
+function noteUnauthorized(needSetup?: boolean) {
+  guest = true
+  resolveAuth(false)
+  if (!redirected && location.pathname !== '/login') {
+    redirected = true
+    location.href = needSetup ? '/login?mode=setup' : '/login'
+  }
+}
+function assertApiOpen(url: string) {
+  if (guest && !url.startsWith('/api/auth')) throw new ApiError(401, '未登录')
+}
+/** 首次认证结论（jobs 轮询等模块级订阅者据此决定是否启动）：true=已登录，false=访客。 */
+let settleAuth: ((authed: boolean) => void) | undefined
+export const authReady = new Promise<boolean>((r) => { settleAuth = r })
+function resolveAuth(authed: boolean) { if (settleAuth) { const f = settleAuth; settleAuth = undefined; f(authed) } }
+
 async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = FETCH_TIMEOUT): Promise<Response> {
+  assertApiOpen(url)
   const ctl = new AbortController()
   // 外部 signal（如模态强制关闭）联动中断
   const outer = init?.signal
@@ -124,7 +152,10 @@ async function fetchWithTimeout(url: string, init?: RequestInit, timeoutMs = FET
   }
   const timer = setTimeout(() => ctl.abort(), timeoutMs)
   try {
-    return await fetch(url, { ...init, signal: ctl.signal })
+    const r = await fetch(url, { ...init, signal: ctl.signal })
+    // 只标记 guest（原始返回调用方拿不到 need_setup 细节），跳转交给 getJSON/postJSON
+    if (r.status === 401 && !url.startsWith('/api/auth')) guest = true
+    return r
   } catch (e) {
     if (e instanceof DOMException && e.name === 'AbortError') {
       if (outer?.aborted) throw new ApiError(0, '已取消')
@@ -140,16 +171,16 @@ export async function getJSON<T>(url: string): Promise<T> {
   const r = await fetchWithTimeout(url)
   if (!r.ok) {
     const data = (await r.json().catch(() => ({}))) as { error?: string; err?: string; need_setup?: boolean }
-    if (r.status === 401 && !url.startsWith('/api/auth') && location.pathname !== '/login') {
-      location.href = data.need_setup ? '/login?mode=setup' : '/login'
-    }
+    if (r.status === 401 && !url.startsWith('/api/auth')) noteUnauthorized(data.need_setup)
     throw new ApiError(r.status, data.error || data.err || `${r.status} ${r.statusText}`)
   }
   return (await r.json()) as T
 }
 
 // ---- 账号体系（N85）----
-export const fetchAuthStatus = () => getJSON<{ ok: boolean; configured: boolean; authed: boolean }>('/api/auth/status')
+export const fetchAuthStatus = () =>
+  getJSON<{ ok: boolean; configured: boolean; authed: boolean }>('/api/auth/status')
+    .then((s) => { if (s.authed) markAuthed(); else { guest = true; resolveAuth(false) } return s })
 export const authSetup = (password: string) => postJSON<{ ok: boolean }>('/api/auth/setup', { password })
 export const authLogin = (password: string) => postJSON<{ ok: boolean }>('/api/auth/login', { password })
 export const authLogout = () => postJSON<{ ok: boolean }>('/api/auth/logout', {})
@@ -168,9 +199,9 @@ export async function postJSON<T>(url: string, body: unknown): Promise<T> {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body)
   }, 120000)
-  const data = (await r.json().catch(() => ({}))) as T & { error?: string; err?: string }
+  const data = (await r.json().catch(() => ({}))) as T & { error?: string; err?: string; need_setup?: boolean }
   if (!r.ok) {
-    if (r.status === 401 && !url.startsWith('/api/auth') && location.pathname !== '/login') location.href = '/login'
+    if (r.status === 401 && !url.startsWith('/api/auth')) noteUnauthorized(data.need_setup)
     throw new ApiError(r.status, data.error || data.err || `${r.status} ${r.statusText}`)
   }
   return data
@@ -381,6 +412,23 @@ export interface Vendor {
   extra?: Record<string, string>
   /** 单次请求允许传入的参考图数量；缺省由适配器按模型推断。 */
   reference_limit?: number | null
+  /** 计费单价表（用量计费页/环境页编辑；模型键找不到时后端回落 "*" 通配键）。 */
+  pricing?: VendorPricing
+}
+
+/** 厂商单价配置：text/vision 按每百万 token 的 input/output；image per_image；
+ *  video per_second；speech per_char 或 per_call；music/asr/voice per_call。 */
+export interface VendorPricing {
+  currency?: string
+  text?: Record<string, { input?: number; output?: number }>
+  vision?: Record<string, { input?: number; output?: number }>
+  image?: Record<string, { per_image?: number }>
+  image_edit?: Record<string, { per_image?: number }>
+  video?: Record<string, { per_second?: number; per_call?: number }>
+  speech?: Record<string, { per_char?: number; per_call?: number }>
+  music?: Record<string, { per_call?: number }>
+  asr?: Record<string, { per_call?: number; per_second?: number }>
+  voice?: Record<string, { per_call?: number }>
 }
 
 export interface EnvConfig {
@@ -416,6 +464,49 @@ export const fetchComfyWorkflows = () =>
 
 export const saveEnvConfig = (vendors: Vendor[]) =>
   postJSON<{ ok: boolean }>('/api/env/config', { vendors })
+
+/* ---------- 用量计费 ---------- */
+
+/** 一条账本记录（workbench/billing/ledger.jsonl 每行）。 */
+export interface BillingRecord {
+  ts: string
+  vendor: string
+  kind: string
+  model: string
+  op: string
+  ok: boolean
+  cost: number | null
+  currency: string | null
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }
+  units?: Record<string, number | string>
+  project?: string
+  source?: string
+  error?: string
+}
+
+/** 按 vendor×kind 的分组聚合；cost 按币种分桶。 */
+export interface BillingGroup {
+  vendor: string
+  kind: string
+  calls: number
+  ok: number
+  fail: number
+  cost: Record<string, number>
+}
+
+export interface BillingSummary {
+  month: string | null
+  total: { calls: number; ok: number; fail: number; cost: Record<string, number> }
+  groups: BillingGroup[]
+  days: { date: string; calls: number; ok: number; fail: number; cost: Record<string, number> }[]
+}
+
+export const fetchBillingSummary = (month?: string) =>
+  getJSON<BillingSummary>('/api/billing/summary' + (month ? `?month=${encodeURIComponent(month)}` : ''))
+
+export const fetchBillingRecords = (limit = 100, month?: string) =>
+  getJSON<{ records: BillingRecord[] }>(
+    `/api/billing/records?limit=${limit}` + (month ? `&month=${encodeURIComponent(month)}` : ''))
 
 /** 厂商草稿：测试/拉取模型时用卡片当前未落盘的值；api_key 空串 = 后端回落已落盘 key。 */
 export interface VendorDraft {
@@ -776,12 +867,57 @@ export const scriptExpand = (body: { project: string; idea?: string; eps?: numbe
 /** 删除分集清单中的一集；全局资产与已生成产物由后端保留。 */
 export const deleteScriptEpisode = (project: string, episode: string) =>
   postJSON<{ ok: boolean; episode?: string; remaining_episodes?: string[]; assets_unlinked?: number }>('/api/script/episode/delete', { project, episode })
+/* ---------- 制作规格（ProductionBrief，E05）：projects/<项目>/剧本/brief.json ---------- */
+export interface ProductionBrief {
+  episode_minutes: number
+  total_episodes: number | null
+  aspect_ratio: string
+  genre_tone: string
+  dialogue_density: string
+  max_characters: number | null
+  max_scenes: number | null
+}
+export const fetchBrief = (project: string) =>
+  getJSON<{ ok: boolean; brief: ProductionBrief; exists: boolean }>(`/api/script/brief?project=${encodeURIComponent(project)}`)
+export const saveBrief = (project: string, patch: Partial<ProductionBrief>) =>
+  postJSON<{ ok: boolean; brief: ProductionBrief }>('/api/script/brief', { project, patch })
 /** 资产设定图生图：人物三视图/场景/道具（kind: character|scene|prop|all）。 */
 export const genAssetImage = (body: { project: string; kind: string; id?: string; vendor_id?: string; force?: boolean; states?: 'include' | 'only' | 'skip'; state_id?: string }) =>
   postJSON<RunResult>('/api/asset/image', body)
 /** 剧情战略图（2D 俯视走位/相机/运镜交互 HTML）。 */
 export const buildStrategy = (project: string, storyboard: string) =>
   postJSON<RunResult>('/api/strategy/build', { project, storyboard })
+
+/* ---------- 平面图 plan v1：AI 生成 + 列表 + 画布渲染 ---------- */
+export interface PlanZone { id?: string; label?: string; scene_ref?: string }
+export interface PlanJudge { ok?: boolean; backend?: string; reasons?: string[]; attempts?: number }
+export interface PlanDoc {
+  name?: string
+  canvas?: { w: number; h: number }
+  props?: unknown[]; actors?: unknown[]; paths?: unknown[]; cameras?: unknown[]; zones?: PlanZone[]
+  _judge?: PlanJudge
+}
+export interface PlanSummary {
+  name: string; file: string; size: number; mtime: number
+  scene_ref?: string | null
+  counts?: { props: number; actors: number; paths: number; cameras: number; zones: number }
+  validate?: { ok: boolean; errors: number; warnings: number; details: string[] }
+  judge?: { ok: boolean; reasons: string[] }
+}
+/** LLM 生成平面图（validate → 判官打回循环；长任务走 job）。
+ *  三种形态：all_scenes 全部场景补初稿 / scene 单场景（extra_desc 补充）/ name+scene_desc 自由生成。 */
+export const generatePlan = (body: {
+  project: string; name?: string; scene_desc?: string; keyframe?: string; zone?: string
+  all_scenes?: boolean; scene?: string; extra_desc?: string
+}) =>
+  postJSON<RunResult>('/api/plan/generate', body)
+export const fetchPlanList = (project: string) =>
+  getJSON<{ ok: boolean; plans: PlanSummary[] }>(`/api/plan/list?project=${encodeURIComponent(project)}`)
+export const fetchPlan = (project: string, name: string) =>
+  getJSON<{ ok: boolean; name: string; plan: PlanDoc }>(`/api/plan?project=${encodeURIComponent(project)}&name=${encodeURIComponent(name)}`)
+/** plan → strategy_map --plan 渲染俯视画布 HTML（产物 推演/战略图_平面图_<名>.html）。 */
+export const buildPlanCanvas = (project: string, plan: string) =>
+  postJSON<RunResult>('/api/strategy/build', { project, plan })
 
 export const scriptStoryboard = (project: string, episode?: string) =>
   postJSON<RunResult>('/api/script/storyboard', { project, episode })
@@ -936,10 +1072,12 @@ export async function importVideo(
   name: string,
   data: Blob
 ): Promise<{ ok: boolean; path: string }> {
+  assertApiOpen('/api/import')
   const r = await fetch(
     `/api/import?project=${encodeURIComponent(project)}&name=${encodeURIComponent(name)}`,
     { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: data }
   )
+  if (r.status === 401) noteUnauthorized()
   const j = (await r.json().catch(() => ({}))) as { ok?: boolean; path?: string; err?: string }
   if (!r.ok || j.ok === false) throw new ApiError(r.status, j.err || `${r.status} ${r.statusText}`)
   return { ok: true, path: j.path || '' }
@@ -949,6 +1087,10 @@ export async function importVideo(
 /** 新建项目：type=拆片(配视频) | 制作(纯剧本创作)。 */
 export const newProject = (project: string, type: '拆片' | '制作') =>
   postJSON<{ ok: boolean; type: string }>('/api/project/new', { project, type })
+
+/** 删除项目：整目录移入 projects/.回收站/（不物理删除，可手动找回/清空）。 */
+export const deleteProject = (project: string) =>
+  postJSON<{ ok: boolean; recycled: string; msg: string }>('/api/project/delete', { project })
 
 export const importSrc = (project: string, src: string) =>
   postJSON<{ ok: boolean; path: string }>('/api/import_src', { project, src })

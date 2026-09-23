@@ -26,6 +26,43 @@ const SPEECH_EXTRA_KEYS = [
 const extraDrafts = ref<Record<string, Record<string, string>>>({})
 const hasSpeechExtra = (v: Vendor) => v.id === 'doubao'
 
+/* ---------- 单价配置（用量计费；随「保存全部」走 saveEnvConfig 落盘） ---------- */
+const pricingOpen = ref<Record<string, boolean>>({})
+/** 可配价的能力槽与字段：text/vision=每百万 token 输入/输出；image/image_edit=每张；video=每秒；speech/music=每次 */
+const PRICING_SLOTS: { key: ModelSlot; label: string; fields: { f: string; label: string }[] }[] = [
+  { key: 'text', label: '文本', fields: [{ f: 'input', label: '输入/百万token' }, { f: 'output', label: '输出/百万token' }] },
+  { key: 'vision', label: '视觉', fields: [{ f: 'input', label: '输入/百万token' }, { f: 'output', label: '输出/百万token' }] },
+  { key: 'image', label: '生图', fields: [{ f: 'per_image', label: '每张' }] },
+  { key: 'image_edit', label: '改图', fields: [{ f: 'per_image', label: '每张' }] },
+  { key: 'video', label: '视频', fields: [{ f: 'per_second', label: '每秒' }] },
+  { key: 'speech', label: '语音', fields: [{ f: 'per_call', label: '每次' }] },
+  { key: 'music', label: '音乐', fields: [{ f: 'per_call', label: '每次' }] }
+]
+/** 只给已填模型的能力槽渲染价格输入。 */
+const pricingSlotsOf = (v: Vendor) => PRICING_SLOTS.filter((s) => (v.models?.[s.key] || '').trim() !== '')
+/** 读价：优先当前模型名键，回落 "*" 通配键。 */
+function pricingVal(v: Vendor, kind: ModelSlot, field: string): string {
+  const table = (v.pricing as Record<string, Record<string, Record<string, number>>> | undefined)?.[kind]
+  if (!table) return ''
+  const model = (v.models?.[kind] || '').trim()
+  const val = (model && table[model]?.[field]) ?? table['*']?.[field]
+  return val === undefined || val === null ? '' : String(val)
+}
+/** 写价：以当前槽位模型名为键；清空即删除该字段（服务端空 pricing 不清旧值）。 */
+function setPricingVal(v: Vendor, kind: ModelSlot, field: string, raw: string) {
+  const model = (v.models?.[kind] || '').trim() || '*'
+  const pricing = (v.pricing ??= {}) as unknown as Record<string, Record<string, Record<string, number>>>
+  const table = (pricing[kind] ??= {})
+  const rate = (table[model] ??= {})
+  const n = parseFloat(raw)
+  if (raw.trim() === '' || Number.isNaN(n)) {
+    delete rate[field]
+    if (!Object.keys(rate).length) delete table[model]
+  } else {
+    rate[field] = n
+  }
+}
+
 /* ---------- 本机环境 ---------- */
 const env = ref<EnvInfo | null>(null)
 const detecting = ref(false)
@@ -611,6 +648,33 @@ onMounted(() => {
               </div>
               <p class="mt-1 text-2xs text-slate-500">下拉选择或手动填写模型后，需点卡片「保存」或顶部「保存全部」才会落盘</p>
               <p v-if="v.id==='doubao'" class="mt-2 rounded-md bg-amber-500/10 p-2 text-xs text-amber-200">视频模型必须属于当前 Agent Plan 套餐。旧 Seedance 1.5 Pro 配置已被接口拒绝，请按控制台填写可用模型 ID；套餐模型列表接口不可用时可直接手填，不会自动切到按量计费接口。</p>
+            </div>
+
+            <!-- 单价配置（用量计费）：按已配置模型的能力槽渲染价格输入 -->
+            <div class="rounded-xl border border-line-soft bg-black/20 p-2.5">
+              <button class="flex w-full items-center gap-1.5 text-2xs font-bold text-slate-400" @click="pricingOpen[v.id] = !pricingOpen[v.id]">
+                <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+                  class="transition-transform duration-200" :class="{ 'rotate-90': pricingOpen[v.id] }">
+                  <path :d="icons.chevronR" stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                单价配置（用量计费）
+                <span class="ml-auto font-normal text-slate-600">{{ pricingSlotsOf(v).length ? '留空 = 不计费仍记调用' : '先填模型再配价' }}</span>
+              </button>
+              <div v-if="pricingOpen[v.id]" class="mt-2 space-y-1.5">
+                <label class="block text-2xs text-slate-500">币种
+                  <input :value="v.pricing?.currency || 'CNY'" class="input mt-0.5 w-24"
+                    @input="(v.pricing ??= {}).currency = ($event.target as HTMLInputElement).value || 'CNY'" />
+                </label>
+                <div v-for="s in pricingSlotsOf(v)" :key="s.key" class="flex items-start gap-1.5">
+                  <span class="mt-1.5 w-14 shrink-0 rounded-md bg-white/5 px-1.5 py-1 text-center text-2xs font-bold text-slate-300">{{ s.label }}</span>
+                  <label v-for="f in s.fields" :key="f.f" class="flex-1 text-2xs text-slate-500">
+                    {{ f.label }}
+                    <input :value="pricingVal(v, s.key, f.f)" type="number" step="any" min="0" class="input mt-0.5" placeholder="不填不计费"
+                      @input="setPricingVal(v, s.key, f.f, ($event.target as HTMLInputElement).value)" />
+                  </label>
+                </div>
+                <p class="text-2xs leading-relaxed text-slate-600">价格键 = 当前槽位模型名（模型改名后需重填；记账时找不到模型键会回落 "*" 通配键）。文本/视觉填每百万 token 单价。</p>
+              </div>
             </div>
 
             <div class="flex items-center gap-2 pt-1">

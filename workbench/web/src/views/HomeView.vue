@@ -4,7 +4,7 @@
 import { ref, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { app, selectProject, toast, loadBasics } from '../stores/app'
-import { importVideo, importSrc, normalizeProject, newProject } from '../api'
+import { importVideo, importSrc, normalizeProject, newProject, deleteProject } from '../api'
 import { icons } from '../components/icons'
 import StyledSelect from '../components/StyledSelect.vue'
 import ProgressRing from '../components/ProgressRing.vue'
@@ -47,9 +47,68 @@ function stats(p: Project): CardStats {
   return { videos, analyses, rings, total }
 }
 
+/* ---------- 隐藏项目（纯前端：名单存 localStorage，按工作区持久） ---------- */
+const HIDDEN_KEY = 'slate.hiddenProjects'
+const hiddenNames = ref<string[]>(loadHidden())
+const showHidden = ref(false)
+
+function loadHidden(): string[] {
+  try {
+    const raw = JSON.parse(localStorage.getItem(HIDDEN_KEY) || '[]')
+    return Array.isArray(raw) ? raw.filter((n) => typeof n === 'string') : []
+  } catch {
+    return []
+  }
+}
+
+function saveHidden() {
+  localStorage.setItem(HIDDEN_KEY, JSON.stringify(hiddenNames.value))
+}
+
+function isHidden(name: string) {
+  return hiddenNames.value.includes(name)
+}
+
+function hideProject(name: string) {
+  if (isHidden(name)) return
+  hiddenNames.value.push(name)
+  saveHidden()
+  toast(`已隐藏「${name}」，可点列表上方「显示已隐藏」恢复`, 'info', 3200)
+}
+
+function unhideProject(name: string) {
+  hiddenNames.value = hiddenNames.value.filter((n) => n !== name)
+  saveHidden()
+}
+
+/** 已隐藏且仍存在的项目数（开关徽标用；已删除项目的残留名单不计） */
+const hiddenCount = computed(() => app.projects.filter((p) => isHidden(p.name)).length)
+
 const cards = computed(() =>
-  app.projects.map((p, i) => ({ p, i, s: stats(p) }))
+  app.projects
+    .filter((p) => showHidden.value || !isHidden(p.name))
+    .map((p, i) => ({ p, i, s: stats(p) }))
 )
+
+/* ---------- 删除项目（整目录移入 projects/.回收站/，不物理删除） ---------- */
+const deleting = ref('')
+
+async function removeProject(name: string) {
+  if (deleting.value) return
+  if (!window.confirm(`确定删除项目「${name}」？\n\n整个 projects/${name}/ 目录将移入 projects/.回收站/（不物理删除），可在文件夹中手动找回或清空回收站。`)) return
+  deleting.value = name
+  try {
+    const r = await deleteProject(name)
+    toast(r.msg || `项目「${name}」已移入回收站`, 'ok', 4200)
+    hiddenNames.value = hiddenNames.value.filter((n) => n !== name)
+    saveHidden()
+    await loadBasics()
+  } catch (e) {
+    toast(e instanceof Error ? e.message : '删除失败', 'err')
+  } finally {
+    deleting.value = ''
+  }
+}
 
 function openProject(name: string) {
   selectProject(name)
@@ -235,7 +294,7 @@ async function runNormApply() {
           </div>
         </div>
         <p class="text-xs leading-relaxed text-slate-400">
-          本地剧本 → LLM 分集 → 人物/场景/道具 → 分镜（知识库注入）→ Blender 白模 + 平面运镜图 + 创作包。
+          本地剧本 → LLM 分集 → 人物/场景/道具 → 分镜（知识库注入）→ Blender 白模 + 平面运镜图 + 拍摄资料包。
           无片可拆、从零创作从这里进。
         </p>
       </button>
@@ -279,6 +338,14 @@ async function runNormApply() {
       <span class="text-xs-plus text-slate-500">新建 = 项目目录 + 首个素材视频；导入 = 把 Downloads 源视频复制进已有项目 拉片素材/</span>
     </div>
 
+    <!-- 已隐藏开关：有隐藏项目时出现，临时查看/取消隐藏 -->
+    <div v-if="!app.loading && hiddenCount" class="mb-4 flex justify-end">
+      <button class="btn btn-ghost text-xs" @click="showHidden = !showHidden">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path :d="showHidden ? icons.eyeOff : icons.eye" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        {{ showHidden ? '收起已隐藏项目' : `显示已隐藏（${hiddenCount}）` }}
+      </button>
+    </div>
+
     <div v-if="app.loading" class="py-20 text-center text-sm text-slate-500">正在扫描项目目录…</div>
 
     <div v-else-if="!app.projects.length" class="glass mx-auto max-w-md p-10 text-center" style="--glow: rgba(34,211,238,0.4)">
@@ -296,24 +363,61 @@ async function runNormApply() {
       </button>
     </div>
 
-    <!-- 海报网格 -->
-    <div v-else class="grid grid-cols-1 gap-6 sm:grid-cols-2 xl:grid-cols-3">
+    <!-- 全部项目已隐藏的兜底提示 -->
+    <div v-else-if="!cards.length" class="glass mx-auto max-w-md p-10 text-center" style="--glow: rgba(34,211,238,0.4)">
+      <svg class="mx-auto mb-4 opacity-50" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="1.5"><path :d="icons.eyeOff" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      <p class="font-bold text-slate-200">全部 {{ hiddenCount }} 个项目均已隐藏</p>
+      <p class="mt-2 text-xs leading-relaxed text-slate-500">隐藏只是不在首页显示，项目文件都在 projects/ 里原样保留</p>
+      <button class="btn mx-auto mt-5 px-6 py-2.5 text-sm" @click="showHidden = true">显示已隐藏</button>
+    </div>
+
+    <!-- 海报网格：卡片收敛尺寸、间距拉开（避免满屏拥挤） -->
+    <div v-else class="grid grid-cols-1 gap-8 sm:grid-cols-2 lg:grid-cols-3 2xl:grid-cols-4">
       <article
         v-for="{ p, i, s } in cards"
         :key="p.name"
         class="glass glass-hover group relative cursor-pointer overflow-hidden"
-        :class="{ 'ring-2 ring-cyan-400/40': app.current === p.name }"
+        :class="{ 'ring-2 ring-cyan-400/40': app.current === p.name, 'opacity-60': isHidden(p.name) }"
         :style="{ '--glow': 'rgba(129,140,248,0.4)' }"
         @click="openProject(p.name)"
       >
         <!-- 海报头 -->
-        <div class="relative h-28 overflow-hidden" :style="{ background: posterHue(i) }">
+        <div class="relative h-24 overflow-hidden" :style="{ background: posterHue(i) }">
           <div class="absolute inset-0 opacity-25" style="background: radial-gradient(circle at 70% 30%, rgba(255,255,255,0.5), transparent 55%)"></div>
-          <span class="absolute -right-2 -top-6 text-[96px] font-black leading-none text-white/10 transition-transform duration-300 group-hover:scale-110">
+          <span class="absolute -right-2 -top-5 text-[80px] font-black leading-none text-white/10 transition-transform duration-300 group-hover:scale-110">
             {{ String(i + 1).padStart(2, '0') }}
           </span>
-          <div class="absolute bottom-3 left-4 right-4">
-            <h2 class="truncate text-lg font-extrabold text-white drop-shadow">{{ p.name }}
+          <!-- 卡片操作：左上角悬停浮现；已隐藏卡常显「取消隐藏」 -->
+          <div class="absolute left-1.5 top-1.5 z-10 flex gap-1">
+            <button
+              v-if="isHidden(p.name)"
+              class="rounded-full bg-black/70 p-1.5 text-slate-300 backdrop-blur transition hover:bg-cyan-500/25 hover:text-cyan-300"
+              title="取消隐藏"
+              @click.stop="unhideProject(p.name)"
+            >
+              <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path :d="icons.eye" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            </button>
+            <template v-else>
+              <button
+                class="rounded-full bg-black/70 p-1.5 text-slate-400 opacity-0 backdrop-blur transition hover:bg-cyan-500/25 hover:text-cyan-300 focus-visible:opacity-100 group-hover:opacity-100"
+                title="隐藏该项目（不在首页显示，可随时恢复）"
+                @click.stop="hideProject(p.name)"
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path :d="icons.eyeOff" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+              <button
+                class="rounded-full bg-black/70 p-1.5 text-slate-400 opacity-0 backdrop-blur transition hover:bg-rose-500/25 hover:text-rose-300 focus-visible:opacity-100 group-hover:opacity-100"
+                :class="{ 'opacity-100 animate-pulse text-rose-300': deleting === p.name }"
+                :disabled="deleting === p.name"
+                title="删除项目（移入回收站，可找回）"
+                @click.stop="removeProject(p.name)"
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path :d="icons.trash" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              </button>
+            </template>
+          </div>
+          <div class="absolute bottom-2.5 left-4 right-4">
+            <h2 class="truncate text-base font-extrabold text-white drop-shadow">{{ p.name }}
               <span v-if="p.type === '制作'" class="ml-1 align-middle rounded bg-pink-400/25 px-1.5 py-0.5 text-2xs font-black text-pink-200">制作</span>
             </h2>
             <p class="text-xs-plus text-white/60">projects/{{ p.name }}/</p>
@@ -325,7 +429,7 @@ async function runNormApply() {
         </div>
 
         <!-- 统计 -->
-        <div class="flex items-center justify-between gap-3 p-4">
+        <div class="flex items-center justify-between gap-3 p-3.5">
           <div class="space-y-1.5 text-xs text-slate-400">
             <div class="flex items-center gap-1.5">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><path :d="icons.film" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -335,20 +439,20 @@ async function runNormApply() {
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#e879f9" stroke-width="2"><path :d="icons.clapper" stroke-linecap="round" stroke-linejoin="round"/></svg>
               分析版本 <b class="text-slate-200">{{ s.analyses }}</b> 个
             </div>
-            <div class="mt-2 h-1.5 w-32 overflow-hidden rounded-full bg-white/10">
+            <div class="mt-2 h-1.5 w-24 overflow-hidden rounded-full bg-white/10">
               <div
                 class="h-full rounded-full transition-all duration-700"
                 :style="{ width: s.total * 100 + '%', background: 'linear-gradient(90deg,#22d3ee,#e879f9)' }"
               />
             </div>
           </div>
-          <ProgressRing :value="s.total" :size="62" color="#22d3ee" />
+          <ProgressRing :value="s.total" :size="56" color="#22d3ee" />
         </div>
 
         <!-- 模块环 -->
-        <div class="flex justify-between border-t border-line-soft px-4 pb-5 pt-3">
+        <div class="flex justify-between border-t border-line-soft px-3.5 pb-4 pt-2.5">
           <div v-for="r in s.rings" :key="r.label" class="flex flex-col items-center gap-1">
-            <ProgressRing :value="r.value" :size="40" :color="r.color" />
+            <ProgressRing :value="r.value" :size="36" :color="r.color" />
             <span class="text-2xs text-slate-500">{{ r.label }}</span>
           </div>
         </div>

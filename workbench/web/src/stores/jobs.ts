@@ -1,7 +1,7 @@
 // -*- coding: utf-8 -*-
 /** 全局后台任务跟踪：所有 job 集中登记，JobDrawer 统一展示；轮询 1.5s。 */
 import { reactive } from 'vue'
-import { fetchJob, fetchJobs, jobDone, jobOk, type JobInfo } from '../api'
+import { authReady, fetchJob, fetchJobs, isGuest, jobDone, jobOk, type JobInfo } from '../api'
 import { toast } from './app'
 
 export interface TrackedJob extends JobInfo {
@@ -123,7 +123,7 @@ export function trackJob(id: number, label: string): Promise<TrackedJob> {
         pollState.delete(trackId)
       } catch (e) {
         if ((e as { status?: number })?.status === 401) {
-          upsert(trackId, { status: 'error', ok: false, err: '需要登录；重新登录后请刷新页面恢复跟踪' })
+          upsert(trackId, { status: 'error', ok: false, err: '需要登录；登录后任务需重新发起' })
           timers.delete(trackId)
           finish()
           return
@@ -173,13 +173,11 @@ export function trackJob(id: number, label: string): Promise<TrackedJob> {
   return promise
 }
 
-// 模块加载即恢复刷新前未完成的任务跟踪。
-restoreInflight()
-
 // 页面未显式 trackJob 的入口、其他页面启动的任务也统一接管。
 // 首次载入不重放历史结果；本次打开后的快速结束任务同样通知。
 const openedAt = Date.now() / 1000
 async function discoverJobs() {
+  if (isGuest()) return   // 未登录：静默停止，不再打网络；登录成功由 LoginView 调 startJobDiscovery() 恢复
   try {
     for (const job of (await fetchJobs()).jobs) {
       if (!tracked.has(job.id) && (job.status === 'running' || job.status === 'queued' || (job.finished_at || 0) >= openedAt)) {
@@ -189,7 +187,16 @@ async function discoverJobs() {
   } catch { /* 短暂离线不判任务失败，恢复后继续接管。 */ }
   window.setTimeout(discoverJobs, 3000)
 }
-void discoverJobs()
+
+/** 启动任务接管（恢复刷新前未完成任务 + 3s 发现轮询）。登录是 SPA 内跳转不刷新模块，故登录后需显式调用。 */
+export function startJobDiscovery() {
+  if (isGuest()) return
+  restoreInflight()
+  void discoverJobs()
+}
+
+// 等首次认证结论再启动：未登录时一个请求都不打（/auth/status 由 App 根组件发出）。
+void authReady.then((authed) => { if (authed) startJobDiscovery() })
 
 /** 日志尾部若干行。 */
 export function logTail(j: TrackedJob, n = 10): string {

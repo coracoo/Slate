@@ -67,6 +67,19 @@ def _lines(shot, actors):
     return rows
 
 
+def _image_beats(beats):
+    """图片模式只取一拍作为最终姿态（update.md E07 按角色取图）：
+
+    优先取 ``time_role == "end"`` 的节拍；旧数据未标时间角色时维持取最后一拍的行为。
+    只保留有效 dict 节拍，调用方不必再逐个判型。
+    """
+    beats = [beat for beat in beats if isinstance(beat, dict)]
+    if not beats:
+        return []
+    marked = [beat for beat in beats if str(beat.get("time_role") or "").strip() == "end"]
+    return [marked[-1] if marked else beats[-1]]
+
+
 def _performance_text(performance, actors, media_type="video"):
     if not isinstance(performance, dict) or performance.get("status") not in (None, "ready"):
         return []
@@ -78,8 +91,8 @@ def _performance_text(performance, actors, media_type="video"):
         name = _actor_name(actors, actor.get("actor_id", ""))
         beats = list(actor.get("beats") or [])
         if media_type == "image" and beats:
-            # 单张关键帧只取该角色最后一个有效节拍，避免把连续动作堆进静态图。
-            beats = [beats[-1]]
+            # 单张关键帧只取该角色"结束状态"拍（time_role=end；未标角色时取末拍），避免把连续动作堆进静态图。
+            beats = _image_beats(beats)
         for beat in beats:
             if not isinstance(beat, dict):
                 continue
@@ -226,7 +239,7 @@ def compile_shot(board, shot_id, mode="baseline", media_type="video", supports_a
                 continue
             beats = list(actor.get("beats") or [])
             if media_type == "image" and beats:
-                beats = [beats[-1]]
+                beats = _image_beats(beats)
             actions = []
             for beat in beats:
                 if not isinstance(beat, dict):
@@ -301,7 +314,7 @@ def compile_shot(board, shot_id, mode="baseline", media_type="video", supports_a
     for actor in packet.get("actors") or []:
         beats = list(actor.get("beats") or [])
         if media_type == "image" and beats:
-            beats = [beats[-1]]
+            beats = _image_beats(beats)
         for beat in beats:
             if isinstance(beat, dict) and beat.get("voice"):
                 voice_notes.append(str(beat.get("voice")).strip())

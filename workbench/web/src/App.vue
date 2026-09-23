@@ -6,7 +6,7 @@ import ParticleBg from './components/ParticleBg.vue'
 import JobDrawer from './components/JobDrawer.vue'
 import { icons } from './components/icons'
 import { loadBasics, app, toasts, selectProject, currentProject, toast } from './stores/app'
-import { fetchAuthStatus, authLogout, checkUpdate, applyUpdate, rollbackUpdate, restartServer, type UpdateCheck } from './api'
+import { fetchAuthStatus, authLogout, checkUpdate, applyUpdate, rollbackUpdate, restartServer, authReady, isGuest, type UpdateCheck } from './api'
 
 const route = useRoute()
 const router = useRouter()
@@ -91,7 +91,8 @@ const navItems = [
   { key: 'white3d', to: '/white3d', label: '② 辅助·Blender', icon: 'box3d', group: '系统' },
   { key: 'skills', to: '/skills', label: '③ Skill 配置', icon: 'book', group: '系统' },
   { key: 'env', to: '/env', label: '④ 环境检查', icon: 'server', group: '系统' },
-  { key: 'blender', to: '/blender', label: '⑤ Blender 配置', icon: 'wrench', group: '系统' }
+  { key: 'blender', to: '/blender', label: '⑤ Blender 配置', icon: 'wrench', group: '系统' },
+  { key: 'billing', to: '/billing', label: '⑥ 用量计费', icon: 'chart', group: '系统' }
 ]
 
 watch(
@@ -108,8 +109,9 @@ watch(
 const toastColor = { ok: '#34d399', err: '#f87171', info: '#38bdf8' } as const
 
 /* /login 页不发业务请求（未登录时全是 401 噪音）；进入工作台后再加载 */
-onMounted(() => { if (showShell.value) void loadBasics() })
-watch(showShell, (v) => { if (v) void loadBasics() })
+// 挂载竞态：等首次认证结论再拉基础数据，未登录直链时一个 401 都不打
+onMounted(() => { void authReady.then((a) => { if (a && showShell.value) void loadBasics() }) })
+watch(showShell, (v) => { if (v && !isGuest()) void loadBasics() })
 </script>
 
 <template>

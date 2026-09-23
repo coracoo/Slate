@@ -27,6 +27,71 @@ def config_fingerprint(cfg):
     return hashlib.sha256(json.dumps(cfg, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def compile_redo_request(project, body, cfg):
+    """局部修补请求：抽已采用 V 视频的 t0/t1 锚点帧，走首尾帧模式生成中间段，成功后自动拼回原片。
+
+    不经过 compile_request——修补的参考帧来自已采用视频本身（锚点），不是 S 的已采用关键帧；
+    产出只登记为该 V 的新候选，绝不自动采用（人工审核流程不变）。
+    """
+    from redo_segment import extract_anchor_frames, validate_window, video_duration
+    from video_profiles import capabilities, settings, validate_media
+    board, revision = read_board(project, body['board'])
+    if body.get('revision') and body['revision'] != revision: raise ValueError('分镜已被修改，请刷新后重试')
+    units = board.get('video_units', [])
+    target = str(body.get('target') or '')
+    unit = next((u for u in units if u['id'] == target), None)
+    if not unit: raise ValueError('分镜视频不存在')
+    if not unit.get('video_binding'): raise ValueError('该 V 尚未采用视频，无法局部修补')
+    members = shot_list(board, unit)
+    source = dict(unit['video_binding'])
+    src_path = bound_path(project, source)   # 已采用素材版本变化在此阻断
+    try:
+        t0_raw, t1_raw = float(body.get('t0')), float(body.get('t1'))
+    except (TypeError, ValueError):
+        raise ValueError('请提供数值形式的修补起止时间 t0/t1（秒）')
+    t0, t1 = validate_window(video_duration(src_path), t0_raw, t1_raw)
+    # 片段时长=t1-t0：过短/非整数秒等模型能力限制由 settings 原样抛出，交给用户调整窗口。
+    video_options = settings(cfg, {**(body.get('video_options') or {}), 'mode': 'first_last', 'duration': t1 - t0})
+    cap = capabilities(cfg)
+    if cap['transport'] == 'public_url': raise ValueError('当前视频适配器需要成品帧公网 URL，局部修补暂不支持该厂商')
+    # 锚点帧按 源视频摘要+窗口 缓存复用；入队快照仍会复制进请求目录，缓存丢失不影响已排队请求。
+    folder = Path(project) / '素材/修补锚点' / f"{source['sha256'][:16]}_{t0:g}_{t1:g}"
+    frames = extract_anchor_frames(src_path, t0, t1, folder)
+    refs = []
+    for role, key, label in (('first_frame', 'head', '首'), ('last_frame', 'tail', '尾')):
+        path = frames[key]
+        ts = t0 if role == 'first_frame' else t1
+        refs.append({'path': path.relative_to(Path(project)).as_posix(), 'sha256': digest(path),
+                     'frame_role': role, 'purpose': f'修补{label}锚点（原片 {ts:g}s 帧）', 'name': f'修补锚点·{label}',
+                     'asset_ref': '', 'shot_id': ''})
+    validate_media(cap, 'first_last', ['0', '1'], '0', '1', [], [])
+    prompt = str(body.get('prompt') or unit.get('prompt_video') or '').strip()
+    if not prompt: raise ValueError('修补提示词为空，请填写或先补全该 V 的视频提示词')
+    from skill_lib import image_skill_text
+    style = image_skill_text(str(project))
+    if style: prompt += '\n画风：' + style
+    prompt += (f'\n总时长 {t1 - t0:g} 秒。首尾帧已锁定为原片 {t0:g}s 与 {t1:g}s 的画面，'
+               f'只生成两帧之间自然衔接的动作，保持人物身份与场景空间连续。')
+    negs = []
+    for s in members:
+        n = s.get('negative') or []
+        negs.extend(n if isinstance(n, list) else [n])
+    negative = '；'.join(dict.fromkeys([str(unit.get('negative') or ''), '文字、水印、字幕、边框'] + [str(n) for n in negs if n])).strip('；')
+    label = f'V{units.index(unit)+1:02}_REDO'
+    return {'scope': 'V', 'target': target, 'label': label, 'board': body['board'], 'board_revision': revision,
+            'shots': copy.deepcopy(members), 'unit': copy.deepcopy(unit),
+            'source_hash': media_source_hash(members, 'video', unit), 'type': 'video',
+            'prompt': prompt, 'negative': negative, 'refs': refs, 'ref_mode': 'keyframes', 'prompt_grid': '',
+            'video_options': video_options, 'audio_urls': [], 'video_urls': [],
+            'duration': t1 - t0, 'continuity': {}, 'vendor_id': cfg['id'],
+            'model': (cfg.get('models') or {}).get('video'), 'include_voices': False, 'voices': [],
+            'redo': {'t0': t0, 't1': t1,
+                     'anchors': {'head': refs[0]['path'], 'tail': refs[1]['path']},
+                     'source': source,
+                     'source_output': {'item_id': source.get('item_id', ''), 'output_index': source.get('output_index', 0),
+                                       'path': source.get('path', '')}}}
+
+
 def enqueue(project, body, spawn, providers):
     from production_requests import compile_request
     from llm_openai import load_vendors
@@ -47,6 +112,9 @@ def enqueue(project, body, spawn, providers):
     if action == 'generate':
         if not config: raise ValueError('请选择已启用的厂商')
         packet = compile_request(project, body, config)
+    elif action == 'redo_segment':
+        if not config: raise ValueError('请选择已启用的厂商')
+        packet = compile_redo_request(project, body, config)
     elif action in ('prompts', 'group', 'optimize'):
         if not config or not (config.get('models') or {}).get('text'): raise ValueError('请选择已启用的文字模型')
         board, revision = read_board(project, body['board'])
@@ -112,6 +180,12 @@ def enqueue(project, body, spawn, providers):
         dest = folder / ('previous_video' + src.suffix); shutil.copyfile(src, dest)
         if digest(dest) != source['sha256']: raise ValueError('复制前序视频期间源文件发生变化，请重新提交')
         source['original_path'] = source['path']; source['path'] = dest.relative_to(Path(project)).as_posix()
+    if (packet.get('redo') or {}).get('source'):
+        # 修补源视频同样快照进请求目录：排队期间重新采用/覆盖不影响本次拼回基准。
+        source = packet['redo']['source']; src = bound_path(project, source)
+        dest = folder / ('redo_source' + src.suffix); shutil.copyfile(src, dest)
+        if digest(dest) != source['sha256']: raise ValueError('复制修补源视频期间源文件发生变化，请重新提交')
+        source['original_path'] = source['path']; source['path'] = dest.relative_to(Path(project)).as_posix()
     request_file = folder / 'request.json'
     request_file.write_text(json.dumps(packet, ensure_ascii=False, indent=2), encoding='utf-8')
     item = {'id': item_id, 'nonce': nonce, 'request_hash': request_hash, 'type': packet['type'],
@@ -120,6 +194,9 @@ def enqueue(project, body, spawn, providers):
             'shot_id': packet.get('target') if packet.get('scope') == 'S' else '', 'vendor_id': body.get('vendor_id', ''),
             'prompt': packet.get('prompt', action), 'source_hash': packet.get('source_hash', ''),
             'request': request_file.relative_to(Path(project)).as_posix(), 'duration': packet.get('duration')}
+    if action == 'redo_segment':
+        # 候选卡片标记「修补 t0–t1s」+ 锚点/来源溯源信息，随 creation.json 透出给前端。
+        item['redo'] = {k: packet['redo'][k] for k in ('t0', 't1', 'anchors', 'source_output')}
     reused = []
     def append(data):
         for existing in data.setdefault('items', []):
@@ -327,8 +404,10 @@ def execute(packet, providers):
                 else:
                     # 与旧 create_media 入口同源：画幅走结构化 size/ratio 字段，
                     # 不能只靠提示词里的「画幅 16:9」——云端图像模型对中文画幅词服从度低。
+                    # 缺省读制作规格（E05 brief.aspect_ratio，无 brief=16:9），兼容旧排队请求。
+                    from brief import aspect_ratio_of
                     from create_media import image_size_for_aspect, image_ratio_for_aspect
-                    ratio = str((packet.get('image_options') or {}).get('ratio') or '16:9')
+                    ratio = str((packet.get('image_options') or {}).get('ratio') or aspect_ratio_of(project))
                     client.generate_image(prompt, out_path=str(out), image_refs=paths, mode=packet['image_mode'], model=packet['model'], timeout=1800,
                                           extra={"size": image_size_for_aspect(ratio), "ratio": image_ratio_for_aspect(ratio)})
                 from PIL import Image
@@ -338,6 +417,17 @@ def execute(packet, providers):
                 client.generate_video(prompt, image_refs=paths, out_path=str(out), model=packet['model'],
                                       poll_max=7200, extra=extra, first_frame=first_frame, last_frame=last_frame)
                 info = probe(out)
+        if action == 'redo_segment':
+            # 新片段生成成功即自动拼回：原片[0,t0] + 新片段 + 原片[t1,末]；
+            # 拼回基准是入队时的源视频快照，登记候选的是拼回后的完整视频（原始片段留在请求目录备查）。
+            from redo_segment import splice_back
+            redo = packet['redo']
+            snapshot = inside(project, redo['source']['path'])
+            if digest(snapshot) != redo['source']['sha256']: raise ValueError('修补源视频快照发生变化，请重新提交')
+            spliced = folder / f"{Path(packet['board']).stem}_{packet['label']}_SPLICED.mp4"
+            splice_back(snapshot, out, redo['t0'], redo['t1'], spliced)
+            out = spliced
+            info = probe(out)
         if not out.is_file() or not out.stat().st_size: raise ValueError('生成未返回有效媒体文件')
         relative = out.relative_to(project).as_posix()
         update(status='done', outputs=['projects/' + project.name + '/' + relative],

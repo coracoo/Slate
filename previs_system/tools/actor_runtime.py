@@ -115,6 +115,37 @@ def _messages(request: dict, previous_errors: List[dict]) -> list[dict]:
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
+def _label_beat_time_roles(packet: dict) -> None:
+    """按节拍顺序给每个角色的 beats 默认打时间角色（update.md E07）。
+
+    首拍 ``start``、末拍 ``end``、中间拍 ``beat``；单拍镜头标 ``end``
+    （与图片模式取末拍的旧行为一致）。按 ``at`` 稳定排序后再打标，
+    乱序输出的 beats 也得到正确首末拍。只在生成时运行一次；
+    人工在分镜 JSON 上改标后不会再经本函数，修改得以保留。
+    """
+    if not isinstance(packet, dict):
+        return
+    for actor in packet.get("actors") or []:
+        if not isinstance(actor, dict):
+            continue
+        beats = [beat for beat in (actor.get("beats") or []) if isinstance(beat, dict)]
+        count = len(beats)
+        if not count:
+            continue
+        # 校验已通过，at/duration 必为有限数值，可直接排序。
+        order = sorted(range(count), key=lambda i: float(beats[i].get("at") or 0))
+        for rank, index in enumerate(order):
+            if count == 1:
+                role = "end"
+            elif rank == 0:
+                role = "start"
+            elif rank == count - 1:
+                role = "end"
+            else:
+                role = "beat"
+            beats[index]["time_role"] = role
+
+
 def perform(request: dict, call_llm: Callable[[list[dict]], dict], max_attempts: int = 2) -> dict:
     """生成并校验表演草稿。
 
@@ -152,6 +183,8 @@ def perform(request: dict, call_llm: Callable[[list[dict]], dict], max_attempts:
         errors = validate_performance(packet, request if isinstance(request, dict) else {})
         if errors:
             continue
+        # 校验通过的节拍按顺序默认打时间角色（start/beat/end），供首帧/图片模式按角色取图。
+        _label_beat_time_roles(packet)
         check = packet.get("ooc_check")
         if isinstance(check, dict) and check.get("passed") is False:
             warnings.append(_issue("SEMANTIC_REVIEW", "ooc_check", "模型自检认为可能崩人设，需人工复核", "warning"))

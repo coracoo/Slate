@@ -17,6 +17,8 @@ def image_policy(project_dir):
         style = {}
     positive = ""  # 画风来自 image skill
     image_skill = str(style.get("image") or "").strip()
+    if image_skill == "auto":
+        image_skill = ""  # E10：显式"自动"=不注 skill，避免追加空负面词
     negative = ["文字", "水印", "边框", "对白框", "字幕"]
     if image_skill:
         try:

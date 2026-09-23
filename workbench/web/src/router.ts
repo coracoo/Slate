@@ -107,6 +107,12 @@ export const routes = [
     meta: { title: '④ 环境检查', c1: '#f59e0b', c2: '#fbbf24', icon: 'server' }
   },
   {
+    path: '/billing',
+    name: 'billing',
+    component: () => import('./views/BillingView.vue'),
+    meta: { title: '⑥ 用量计费', c1: '#34d399', c2: '#22d3ee', icon: 'chart' }
+  },
+  {
     path: '/package',
     name: 'package',
     component: () => import('./views/PackageView.vue'),

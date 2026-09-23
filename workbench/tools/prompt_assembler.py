@@ -446,7 +446,10 @@ def assemble_shot_prompt(shot, project):
         # 旧项目没有资产注册表时继续按原逻辑装配。
         pass
     style = _style(project_dir)
+    # E10：显式 "auto"（仅知识库、不注 skill）视为未选，不能拼出 @style:auto 假引用
     image_skill = str(style.get("image") or "").strip()
+    if image_skill == "auto":
+        image_skill = ""
     image_style_text = _skill_positive(project_dir)
     board = project.get("board") if isinstance(project, dict) else None
     actors = (board or {}).get("actors") if isinstance(board, dict) else {}

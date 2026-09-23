@@ -9,6 +9,29 @@ from production_studio import project_store, inside, read_board
 from production_media import digest, probe
 from native_media import checked
 
+try:
+    import billing          # 计费账本；缺失时静默跳过
+except Exception:
+    billing = None
+
+
+def _bill(kind, cfg, op, ok=True, units=None, cost=None, error=None):
+    """直连 MiniMax 接口的补账入口；任何异常静默。"""
+    try:
+        if billing is None:
+            return
+        if cost is not None:    # 免费查询类：显式 cost=0，不走价格表
+            billing.record({"vendor": cfg.get("id") or "", "kind": kind,
+                            "model": (cfg.get("models") or {}).get("speech") or "",
+                            "op": op, "ok": ok, "cost": cost, "currency": None,
+                            **({"units": units} if units else {}),
+                            **({"error": str(error)[:300]} if error else {})})
+        else:
+            billing.bill(cfg, kind=kind, model=(cfg.get("models") or {}).get("speech") or "",
+                         op=op, ok=ok, units=units, error=error)
+    except Exception:
+        pass
+
 
 def library(project):
     path = Path(project) / '素材/音色/音色库.json'
@@ -113,6 +136,7 @@ def execute_voice(project, packet, client, folder):
     if profile(client.cfg) != packet['profile']: raise ValueError('排队期间厂商账户发生变化，已停止')
     if action == 'voice_catalog':
         data = checked(client._post(client.base + '/v1/get_voice', {'voice_type': 'all'}, 60))
+        _bill('voice', client.cfg, 'get_voice', cost=0)   # 免费查询类：记账不计费
         rows = [{**row, 'category': category} for category in ('system_voice', 'voice_cloning', 'voice_generation') for row in data.get(category, [])]
         cache = Path(__file__).resolve().parents[1] / 'cache/voices' / packet['profile'] / 'catalog.json'
         cache.parent.mkdir(parents=True, exist_ok=True)
@@ -138,6 +162,7 @@ def execute_voice(project, packet, client, folder):
     out = dest / 'sample.mp3'
     if action == 'voice_design':
         data = checked(client._post(client.base + '/v1/voice_design', {'prompt': packet['description'], 'preview_text': packet['preview_text']}, 300))
+        _bill('voice', client.cfg, 'voice_design', units={"calls": 1})   # 音色创作为计费接口
         # 官方 MiniMax-MCP 的 voice_design：voice_id + trial_audio(hex)。
         voice_id = str(data.get('voice_id') or '')
         (folder / 'voice_design_result.json').write_text(json.dumps({'voice_id': voice_id, 'profile': packet['profile'], 'local_asset_id': ident}, ensure_ascii=False), encoding='utf-8')

@@ -19,6 +19,10 @@ _TOOL_DIR = os.path.dirname(os.path.abspath(__file__))
 if _TOOL_DIR not in sys.path: sys.path.insert(0, _TOOL_DIR)
 from reference_limits import reference_limit
 try:
+    import billing          # 计费账本（workbench/tools/billing.py）；缺失时记账静默跳过
+except Exception:
+    billing = None
+try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
@@ -65,6 +69,7 @@ class VendorClient:
 
     def _setup(self, cfg, check_enabled):
         self.id = cfg.get("id", "draft")
+        self.last_usage = None   # 最近一次 chat 的 usage（token 计量），供计费与调用方排查
         if self.id == "local-codex":
             raise VendorError("本机 Codex 登录态生图已退役，请使用 ChatGPT · chrome-use")
         self.cfg = cfg
@@ -101,6 +106,16 @@ class VendorClient:
 
     def endpoint(self, kind):
         return self.endpoints.get(kind) or DEFAULT_ENDPOINTS[kind]
+
+    def _bill(self, kind, model, op, ok, usage=None, units=None, error=None, source=None):
+        """记账包装：billing 缺失或写盘异常一律静默，绝不影响生成主流程。"""
+        try:
+            if billing is None:
+                return
+            billing.bill(self.cfg, kind=kind, model=model or "", op=op, ok=ok,
+                         usage=usage, units=units, error=error, source=source)
+        except Exception:
+            pass
 
     def validate_video_config(self, model=None):
         """无网络配置预检，供入口和批处理在落任务之前共用。"""
@@ -186,18 +201,35 @@ class VendorClient:
         if not model: raise VendorError(f"厂商 {self.id} 未配置 {kind or 'vision/text'} 模型")
         if self.id == "gemini":
             from native_media import gemini_chat
-            return gemini_chat(self,messages,model,resolved_kind,max_tokens,temperature,timeout,extra)
+            try:
+                out = gemini_chat(self,messages,model,resolved_kind,max_tokens,temperature,timeout,extra)
+            except VendorError as e:
+                self._bill(resolved_kind, model, "chat", ok=False, error=str(e))
+                raise
+            self._bill(resolved_kind, model, "chat", ok=True,
+                       usage=self.last_usage if isinstance(self.last_usage, dict) else None)
+            return out
         payload = {"model": model, "messages": messages,
                    "max_tokens": max_tokens, "temperature": temperature}
         if isinstance(extra, dict): payload.update(extra)
         # 视觉调用必须走 vision 槽位端点；文本调用仍走 text。部分厂商两者相同，
         # 但不能把不同端点的配置静默忽略。
-        data = self._post(self._url(resolved_kind), payload, timeout)
         try:
-            return data["choices"][0]["message"]["content"]
+            data = self._post(self._url(resolved_kind), payload, timeout)
+        except VendorError as e:
+            self._bill(resolved_kind, model, "chat", ok=False, error=str(e))
+            raise
+        # 捕获 token 用量：存 self.last_usage（不改返回字符串，调用方零改动）并记账
+        self.last_usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
+        try:
+            result = data["choices"][0]["message"]["content"]
         except Exception:
-            raise VendorError("响应结构无法解析（缺少 choices[0].message.content）: " +
+            err = VendorError("响应结构无法解析（缺少 choices[0].message.content）: " +
                               json.dumps(data, ensure_ascii=False)[:300])
+            self._bill(resolved_kind, model, "chat", ok=False, error=str(err))
+            raise err
+        self._bill(resolved_kind, model, "chat", ok=True, usage=self.last_usage)
+        return result
 
     @staticmethod
     def image_part(path_or_b64, mime="image/jpeg"):
@@ -257,6 +289,26 @@ class VendorClient:
 
     def generate_image(self, prompt, out_path, model=None, timeout=900, extra=None, negative_prompt=None,
                        image_refs=None, strict_negative=False, mode="generate"):
+        """生图入口（记账包装）：成功计费一次（units images=1），VendorError 记 ok=false。
+        ComfyUI（本地）与 ChatGPT 网页队列为免费通道，不计账。"""
+        image_kind = "image_edit" if str(mode or "generate").lower() == "edit" else "image"
+        resolved_model = model or self.models.get(image_kind) or ""
+        if self.id in ("local-comfyui", "chatgpt-queue"):
+            return self._generate_image_impl(prompt, out_path, model=model, timeout=timeout, extra=extra,
+                                             negative_prompt=negative_prompt, image_refs=image_refs,
+                                             strict_negative=strict_negative, mode=mode)
+        try:
+            out = self._generate_image_impl(prompt, out_path, model=model, timeout=timeout, extra=extra,
+                                            negative_prompt=negative_prompt, image_refs=image_refs,
+                                            strict_negative=strict_negative, mode=mode)
+        except VendorError as e:
+            self._bill(image_kind, resolved_model, "generate_image", ok=False, error=str(e))
+            raise
+        self._bill(image_kind, resolved_model, "generate_image", ok=True, units={"images": 1})
+        return out
+
+    def _generate_image_impl(self, prompt, out_path, model=None, timeout=900, extra=None, negative_prompt=None,
+                       image_refs=None, strict_negative=False, mode="generate"):
         """POST endpoints.image（缺省 /images/generations），产物存 out_path。
         negative_prompt: 显式负面提示词，走 payload.negative_prompt；厂商不认（HTTP 4xx）
         自动去掉该参数重试一次（同时把负面词以"禁止："文本段并入正面提示词兜底）。
@@ -314,6 +366,31 @@ class VendorClient:
         return self._download_or_decode(data, out_path)
 
     def generate_video(self, prompt, image_refs=None, out_path=None, model=None, timeout=180,
+                       poll_interval=5, poll_max=600, extra=None, first_frame=None, last_frame=None):
+        """视频入口（记账包装）：视频是任务制，只在最终任务成功时计费一次（提交不计）；
+        失败（含轮询终点失败/超时抛 VendorError）记 ok=false。units 从 extra 取 duration/resolution。
+        本地 ComfyUI 不计账。"""
+        resolved_model = model or self.models.get("video") or ""
+        units = {}
+        if isinstance(extra, dict):
+            if extra.get("duration"): units["seconds"] = extra["duration"]
+            if extra.get("resolution"): units["resolution"] = extra["resolution"]
+        if self.id == "local-comfyui":
+            return self._generate_video_impl(prompt, image_refs=image_refs, out_path=out_path, model=model,
+                                             timeout=timeout, poll_interval=poll_interval, poll_max=poll_max,
+                                             extra=extra, first_frame=first_frame, last_frame=last_frame)
+        try:
+            out = self._generate_video_impl(prompt, image_refs=image_refs, out_path=out_path, model=model,
+                                            timeout=timeout, poll_interval=poll_interval, poll_max=poll_max,
+                                            extra=extra, first_frame=first_frame, last_frame=last_frame)
+        except VendorError as e:
+            self._bill("video", resolved_model, "generate_video", ok=False,
+                       units=units or None, error=str(e))
+            raise
+        self._bill("video", resolved_model, "generate_video", ok=True, units=units or None)
+        return out
+
+    def _generate_video_impl(self, prompt, image_refs=None, out_path=None, model=None, timeout=180,
                        poll_interval=5, poll_max=600, extra=None, first_frame=None, last_frame=None):
         """视频生成。豆包 Ark（endpoint 含 /tasks）走任务制：POST 创建 ->
         轮询 GET {base}{endpoint}/{task_id}；其余兼容同步返回或 {base}/tasks/{id} 轮询。"""
@@ -490,12 +567,29 @@ class VendorClient:
         raise VendorError(f"轮询超时（>{max_wait}s），任务 {task_id} 仍未完成")
 
     def generate_music(self, prompt, out_path, model=None, timeout=300, extra=None):
+        """音乐生成（记账包装）：成功按 music 槽计费一次，VendorError 记 ok=false。"""
         from native_media import audio
-        return audio(self,"music",prompt,out_path,model,timeout,extra)
+        resolved_model = model or self.models.get("music") or ""
+        try:
+            out = audio(self,"music",prompt,out_path,model,timeout,extra)
+        except VendorError as e:
+            self._bill("music", resolved_model, "generate_music", ok=False, error=str(e))
+            raise
+        self._bill("music", resolved_model, "generate_music", ok=True)
+        return out
 
     def generate_speech(self, text, out_path, model=None, timeout=300, extra=None):
+        """语音合成（记账包装）：成功按 speech 槽计费（units chars=文本字数），VendorError 记 ok=false。"""
         from native_media import audio
-        return audio(self,"speech",text,out_path,model,timeout,extra)
+        resolved_model = model or self.models.get("speech") or ""
+        try:
+            out = audio(self,"speech",text,out_path,model,timeout,extra)
+        except VendorError as e:
+            self._bill("speech", resolved_model, "generate_speech", ok=False, error=str(e))
+            raise
+        self._bill("speech", resolved_model, "generate_speech", ok=True,
+                   units={"chars": len(str(text or ""))})
+        return out
 
     def list_models(self, timeout=15):
         """GET {base}/models 拉取模型列表。OpenAI 风格解析 data[].id；

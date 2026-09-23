@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { useBoardSelection } from '../utils/useBoardSelection'
 // -*- coding: utf-8 -*-
-/** ③ 分镜与生成：按集生成分镜（知识注入）→ 逐镜明细；组装创意包 → 包明细 */
+/** ③ 分镜与生成：按集生成分镜（知识注入）→ 逐镜明细；生成拍摄资料包 → 包明细 */
 import { ref, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import {
@@ -356,7 +356,7 @@ useBoardSelection(board, boards, 'shots')
           <label class="w-56 shrink-0 text-xs text-slate-400">已有分镜
             <StyledSelect v-model="board" class="mt-1" :options="boards" :storage-key="`wb.${app.current}.shots.board`" placeholder="— 选择 —" />
           </label>
-          <button class="btn shrink-0" :disabled="!board" title="战略图推演 / 平面图 / 预演包 / 逐镜包——分镜定稿后的组装产物都在平面推演页" @click="goPackage">去平面推演 →</button>
+          <button class="btn shrink-0" :disabled="!board" title="走位战略图 / 平面图 / 预演包 / 逐镜包——分镜定稿后的组装产物都在平面推演页" @click="goPackage">去平面推演 →</button>
           <button class="btn btn-ghost shrink-0" :disabled="!!busy || !board" @click="doRebuildPrompts" title="只按当前全局资产和分镜事实重建静态参考图/生视频提示词，不调用模型，不生成媒体">只更新提示词</button>
           <button class="btn btn-ghost shrink-0" :disabled="!!busy || !board || !boardEpisode(board)" @click="doRebuildEpisode" title="重建当前分集的全部分镜提示词；不修改分集正文、大纲或已有图片视频">重建本集</button>
           <Versions v-if="board" :path="`projects/${app.current}/分镜/${board}`" kind="file" @restored="loadBoard" />

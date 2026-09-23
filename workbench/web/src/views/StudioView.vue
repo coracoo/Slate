@@ -4,13 +4,15 @@
 import { ref, computed, watch } from 'vue'
 import {
   fetchScriptData, importScript, scriptEpisodes, scriptOverview, scriptExpand, deleteScriptEpisode,
-  type ScriptBundle, type Episode
+  fetchBrief, saveBrief,
+  type ScriptBundle, type Episode, type ProductionBrief
 } from '../api'
 import { app, toast } from '../stores/app'
 import { trackJob } from '../stores/jobs'
 import { pendingEpisodeIds } from '../utils/scriptEpisodes'
 import EmptyState from '../components/EmptyState.vue'
 import StyleSelect from '../components/StyleSelect.vue'
+import StyledSelect from '../components/StyledSelect.vue'
 
 const data = ref<ScriptBundle | null>(null)
 const loading = ref(false)
@@ -22,6 +24,56 @@ const idea = ref('')
 const epsN = ref(6)
 const expanding = ref('')
 const epDeleting = ref('')
+
+/* ---------- 制作规格（E05）：剧本/brief.json 的编辑表单；保存即被大纲/扩写/生图/成片链路消费 ---------- */
+const briefOpen = ref(true)
+const briefSaving = ref(false)
+const briefForm = ref({
+  episode_minutes: 3 as number,
+  total_episodes: '' as string | number,
+  aspect_ratio: '16:9',
+  genre_tone: '',
+  dialogue_density: '中',
+  max_characters: '' as string | number,
+  max_scenes: '' as string | number,
+})
+
+function fillBriefForm(b: ProductionBrief) {
+  briefForm.value = {
+    episode_minutes: b.episode_minutes ?? 3,
+    total_episodes: b.total_episodes ?? '',
+    aspect_ratio: b.aspect_ratio || '16:9',
+    genre_tone: b.genre_tone || '',
+    dialogue_density: b.dialogue_density || '中',
+    max_characters: b.max_characters ?? '',
+    max_scenes: b.max_scenes ?? '',
+  }
+}
+
+/** 可空数字字段：空串 = 恢复默认（后端按 None 删键）。 */
+const nullIfEmpty = (v: string | number) => (v === '' || v === null || v === undefined ? null : Number(v))
+
+async function saveBriefForm() {
+  if (!app.current || briefSaving.value) return
+  briefSaving.value = true
+  try {
+    const r = await saveBrief(app.current, {
+      episode_minutes: Number(briefForm.value.episode_minutes),
+      total_episodes: nullIfEmpty(briefForm.value.total_episodes),
+      aspect_ratio: briefForm.value.aspect_ratio,
+      genre_tone: briefForm.value.genre_tone,
+      dialogue_density: briefForm.value.dialogue_density,
+      max_characters: nullIfEmpty(briefForm.value.max_characters),
+      max_scenes: nullIfEmpty(briefForm.value.max_scenes),
+    })
+    fillBriefForm(r.brief)
+    toast('制作规格已保存：大纲/扩写与生图画幅即刻生效', 'ok', 4500)
+  } catch (e) {
+    toast(e instanceof Error ? e.message : '保存制作规格失败', 'err', 6000)
+  } finally {
+    briefSaving.value = false
+  }
+}
 
 /** 删除分集：只删分集清单并解除资产来源标签；资产、图片和已生成产物保留。 */
 async function deleteEpisode(e: Episode) {
@@ -52,6 +104,10 @@ async function load() {
   try {
     data.value = await fetchScriptData(app.current)
     scriptText.value = data.value.script || ''
+    try {
+      // 制作规格接口不可用时（旧后端/缺 brief.py）不影响剧本页其余功能
+      fillBriefForm((await fetchBrief(app.current)).brief)
+    } catch { /* 保持表单默认值 */ }
   } catch (e) {
     toast(e instanceof Error ? e.message : '加载失败', 'err')
   } finally { loading.value = false }
@@ -215,11 +271,55 @@ async function doExpandAll() {
             <button class="btn" :disabled="busy || idea.trim().length < 5" @click="doExpand()">
               {{ busy ? '大纲生成中…' : '生成剧集大纲' }}
             </button>
-            <span class="text-xs-plus text-slate-500">一段话构想 → 全季大纲（钩子/落点/主线）→ 点各集「扩写」成完整分场剧本</span>
-            <StyleSelect target="script" label="拆剧本手法" />
+            <span class="text-xs-plus text-slate-500">一段话构想 → 全季大纲（钩子/落点/主线）→ 点各集「扩写」成完整分场剧本；编剧风格在下方「制作规格」卡选择</span>
           </div>
           <textarea v-model="idea" rows="5" class="textarea w-full text-xs leading-relaxed"
             placeholder="一段话创作构想，例如：一个外卖员捡到一部只能拨打给十年前自己的手机，他试图阻止一场事故，却发现每次改动都在制造更大的麻烦。悬疑基调，短剧节奏。"></textarea>
+        </div>
+      </section>
+
+      <!-- 制作规格（E05）：单集时长/画幅/编剧风格/对白密度等制片决策，保存即被大纲/扩写/生图链路消费 -->
+      <section class="glass mb-5 p-4">
+        <button class="flex w-full items-center gap-2 text-left" @click="briefOpen = !briefOpen">
+          <span class="flex h-6 w-6 items-center justify-center rounded-full bg-pink-400/15 text-xs font-black text-pink-300">规</span>
+          <h3 class="text-sm font-bold text-slate-200">制作规格</h3>
+          <span class="text-xs-plus text-slate-500">单集时长/画幅/编剧风格/对白密度——大纲、扩写与生图都会读它（存 剧本/brief.json，编剧风格存 style.json）</span>
+          <span class="ml-auto text-xs text-slate-500">{{ briefOpen ? '▲ 收起' : '▼ 展开' }}</span>
+        </button>
+        <div v-if="briefOpen" class="mt-3 border-t border-line-soft pt-3">
+          <div class="grid gap-3 sm:grid-cols-2 lg:grid-cols-3">
+            <label class="text-xs text-slate-400">单集目标时长（分钟，0.5~10）
+              <input v-model.number="briefForm.episode_minutes" type="number" min="0.5" max="10" step="0.5" class="input mt-1" />
+            </label>
+            <label class="text-xs text-slate-400">目标集数（可空）
+              <input v-model="briefForm.total_episodes" type="number" min="1" max="200" step="1" class="input mt-1" placeholder="不限" />
+            </label>
+            <label class="text-xs text-slate-400">对白密度
+              <StyledSelect v-model="briefForm.dialogue_density" :options="['低', '中', '高']" class="mt-1" />
+            </label>
+            <label class="text-xs text-slate-400">画幅
+              <StyledSelect v-model="briefForm.aspect_ratio" :options="['16:9', '9:16', '1:1', '4:3']" class="mt-1" />
+            </label>
+            <label class="text-xs text-slate-400">主要人物数上限（可空）
+              <input v-model="briefForm.max_characters" type="number" min="1" step="1" class="input mt-1" placeholder="不限" />
+            </label>
+            <label class="text-xs text-slate-400">主要场景数上限（可空）
+              <input v-model="briefForm.max_scenes" type="number" min="1" step="1" class="input mt-1" placeholder="不限" />
+            </label>
+            <div class="text-xs text-slate-400">
+              <StyleSelect target="script" label="编剧风格" hint="复用 Skill 中心拆剧本手法，选中即写 style.json 的 script 键；大纲/扩写自动注入" />
+              <p class="mt-1 text-2xs text-slate-500">镜头语言风格在分镜页选择（导演层）</p>
+            </div>
+            <label class="text-xs text-slate-400 sm:col-span-2">基调补充（可选）
+              <input v-model="briefForm.genre_tone" type="text" maxlength="200" class="input mt-1" placeholder="编剧风格之外的补充，例：悬疑冷峻，都市夜戏为主" />
+            </label>
+          </div>
+          <div class="mt-3 flex flex-wrap items-center gap-3">
+            <button class="btn btn-sm" :disabled="briefSaving" @click="saveBriefForm">
+              {{ briefSaving ? '保存中…' : '保存制作规格' }}
+            </button>
+            <span class="text-2xs text-slate-500">保存后立即生效：大纲单集时长与冲突节奏、扩写字数档位与题材基调、S/V 生图画幅缺省、V 分组时长提示（编剧风格选中即存，随下拉即刻生效）</span>
+          </div>
         </div>
       </section>
 

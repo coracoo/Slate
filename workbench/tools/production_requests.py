@@ -7,6 +7,7 @@ from production_studio import read_board, shot_list, shot_unit, timeline, inside
 from production_prompts import source_hash, media_source_hash
 from production_media import bound_path, digest
 from reference_limits import reference_limit
+from brief import aspect_ratio_of
 
 
 from video_profiles import capabilities, settings, validate_media, public_url
@@ -15,11 +16,39 @@ from video_profiles import capabilities, settings, validate_media, public_url
 
 PERFORMANCE_NOTE = '表演指导（只补充可见表演，不改变机位/走位/台词）'
 
+# 关键帧时间角色受控词表（update.md E07）：start=开始状态 / beat=动作关键点 / end=结束状态 / compose=构图参考。
+# 标注在分镜已采用关键帧 shot['keyframe']['time_role'] 上；旧数据无该字段=未分类，兜底放行并打警告日志。
+TIME_ROLES = ('start', 'beat', 'end', 'compose')
+TIME_ROLE_LABELS = {'start': '开始状态', 'beat': '动作关键点', 'end': '结束状态', 'compose': '构图参考'}
+# 首帧槽位只接受「开始状态」图、尾帧槽位只接受「结束状态」图——把结束图当首帧会让模型倒推动作。
+_FRAME_SLOT_NEED = {'first_frame': 'start', 'last_frame': 'end'}
+_FRAME_SLOT_LABEL = {'first_frame': '首帧', 'last_frame': '尾帧'}
+
+
+def _check_frame_time_role(shot_id, time_role, frame_role):
+    """按关键帧时间角色约束首帧/尾帧槽位；reference_image 不做时间角色约束。"""
+    need = _FRAME_SLOT_NEED.get(frame_role)
+    if not need:
+        return
+    slot = _FRAME_SLOT_LABEL[frame_role]
+    role = str(time_role or '').strip()
+    if not role:
+        # 向后兼容：未分类的旧关键帧维持既有行为，只打警告提醒补标。
+        print(f"[警告] {shot_id} 关键帧未标注时间角色 time_role，{slot}槽位按既有行为兜底；"
+              f"建议在分镜 JSON 给该 keyframe 标注 start/end（结束图当首帧会让模型倒推动作）")
+        return
+    if role not in TIME_ROLES:
+        print(f"[警告] {shot_id} 关键帧时间角色「{role}」不在受控词表 {TIME_ROLES}，按未分类兜底")
+        return
+    if role != need:
+        raise ValueError(f"{shot_id} 的关键帧是「{TIME_ROLE_LABELS[role]}」（time_role={role}），不能当{slot}用；"
+                         f"{slot}只接受「{TIME_ROLE_LABELS[need]}」图，请换图或改标后再提交")
+
 
 def _performance_rows(board, shots, media_type):
     """已采用且未过期的演员表演 → 提交时注入行。
 
-    复用 prompt_compiler 的节拍格式化（image 自动只取末拍）与新鲜度公式
+    复用 prompt_compiler 的节拍格式化（image 按角色取拍：优先 time_role=end，未标取末拍）与新鲜度公式
     （pop 本镜 performance 后 artifact_hash 比对）；过期表演静默不注入，
     与旧创作线行为一致——表演层永远不擅自改写镜头事实。
     """
@@ -41,6 +70,18 @@ def _performance_rows(board, shots, media_type):
         for r in _performance_text(perf, board.get('actors') or {}, media_type):
             rows.append(f"{shot['id']} {r}" if media_type == 'video' else r)
     return rows
+
+def _plan_refs_enabled(project, body):
+    """平面图参考帧注入开关：请求体 plan_refs 优先，缺省读项目 brief.plan_refs（默认开）。
+    brief 读取异常回 True（宁可注入也不改变旧链路容错性）。"""
+    if body.get('plan_refs') is not None:
+        return bool(body.get('plan_refs'))
+    try:
+        from brief import load_brief
+        return bool(load_brief(str(project)).get('plan_refs', True))
+    except Exception:
+        return True
+
 
 def compile_request(project, body, cfg):
     board, revision = read_board(project, body['board'])
@@ -71,6 +112,8 @@ def compile_request(project, body, cfg):
     kind = body['type']
     if not prompt.strip(): raise ValueError('当前类型的提示词为空，请先由 LLM 补全或手动编辑')
     if kind not in ('image', 'video'): raise ValueError('制作请求只支持关键帧或视频')
+    # 制作规格（E05）：画幅缺省读 brief.aspect_ratio；无 brief 保持 16:9
+    aspect = aspect_ratio_of(project)
     video_options = settings(cfg, {**(body.get('video_options') or {}), 'duration': unit['duration']}) if kind == 'video' else {}
     video_mode = video_options.get('mode', '')
     refs = []
@@ -99,6 +142,8 @@ def compile_request(project, body, cfg):
                 raise ValueError(f"{s['id']} 关键帧来源已过期，请确认画面后重新采用")
             r['purpose'] = f"{s['id']} 的已采用关键帧"; r['shot_id'] = s['id']
             r['frame_role'] = 'reference_image' if video_mode == 'reference' else 'last_frame' if video_mode == 'last_frame' or (video_mode == 'first_last' and len(refs) == (0 if (body.get('continuity') or {}).get('mode') == 'tail_first_frame' else 1)) else 'first_frame'
+            # E07：首帧槽位只准 start 角色关键帧、尾帧槽位只准 end 角色；未标注的旧图兜底放行并打警告。
+            _check_frame_time_role(s['id'], r.get('time_role'), r['frame_role'])
             if (body.get('image_urls') or {}).get(s['id']): r['public_url'] = public_url(body['image_urls'][s['id']])
             refs.append(r)
         beats = timeline(board, unit)
@@ -110,11 +155,30 @@ def compile_request(project, body, cfg):
     style = image_skill_text(str(project))
     if style: prompt += '\n画风：' + style
     if kind == 'image':
-        prompt += '\n只绘制一张独立关键帧，画幅 16:9。'
+        prompt += f'\n只绘制一张独立关键帧，画幅 {aspect}。'
     else:
-        prompt += f"\n总时长 {float(unit['duration']):g} 秒，画幅 {video_options.get('ratio', '16:9')}。连续视频，保持人物身份与场景空间连续。"
+        prompt += f"\n总时长 {float(unit['duration']):g} 秒，画幅 {video_options.get('ratio', aspect)}。连续视频，保持人物身份与场景空间连续。"
     perf_rows = _performance_rows(board, shots, kind)
     if perf_rows: prompt += '\n' + PERFORMANCE_NOTE + '：' + '；'.join(perf_rows)
+    # 平面图参考回流（plan v1）：V 视频走全能参考且非宫格时，把成员 S 的平面图帧按参考图
+    # 预算注入 refs（必含首尾），并补一句空间约束；无 plan/渲染失败/预算耗尽均静默跳过。
+    # 只加参考图与一句约束，不动镜头事实。开关：body.plan_refs > brief.plan_refs（默认开）。
+    plan_ref_count = 0
+    if (scope == 'V' and kind == 'video' and video_mode == 'reference'
+            and (body.get('ref_mode') or 'keyframes') != 'grid'
+            and _plan_refs_enabled(project, body)):
+        try:
+            _model = (cfg.get('models') or {}).get(kind)
+            _budget = reference_limit(cfg['id'], _model, kind, cfg) - len(refs)
+            if _budget > 0:
+                from plan_frames import plan_ref_frames
+                _prefs = plan_ref_frames(str(project), body['board'], shots, label, _budget, log=print)
+                if _prefs:
+                    refs.extend(_prefs)
+                    plan_ref_count = len(_prefs)
+                    prompt += '\n场景空间布局与人物走位以参考平面图为准，保持画左画右关系一致。'
+        except Exception as _e:
+            print(f"[警告] 平面图参考帧注入失败（忽略，不影响编译）: {_e}")
     negs = []
     for s in shots:
         n = s.get('negative') or []
@@ -166,12 +230,16 @@ def compile_request(project, body, cfg):
     if kind == 'image':
         from creation_media import image_route
         _, image_mode, model = image_route(cfg, bool(refs))
+    # S 图结构化画幅（N80 extra 的编译期来源）：body 显式指定优先，缺省落 brief.aspect_ratio
+    image_options = dict(body.get('image_options') or {})
+    if kind == 'image': image_options.setdefault('ratio', aspect)
     if count > reference_limit(cfg['id'], model, kind, cfg):
         raise ValueError(f'参考图数量 {count} 超过模型上限，请拆分 V 或明确选择宫格；不会丢弃图片')
     return {'scope': scope, 'target': target, 'label': label, 'board': body['board'], 'board_revision': revision,
             'shots': copy.deepcopy(shots), 'unit': unit, 'source_hash': media_source_hash(shots, kind, unit), 'type': kind,
             'prompt': prompt, 'negative': negative, 'refs': refs, 'ref_mode': ref_mode, 'prompt_grid': description,
-            'video_options': video_options, 'audio_urls': audio_urls, 'video_urls': video_urls,
+            'video_options': video_options, 'image_options': image_options, 'audio_urls': audio_urls, 'video_urls': video_urls,
             'audio_media': audio_media, 'video_media': video_media,
             'duration': unit.get('duration'), 'continuity': continuity, 'vendor_id': cfg['id'],
-            'model': model, 'image_mode': image_mode, 'include_voices': bool(body.get('include_voices')), 'voices': voices}
+            'model': model, 'image_mode': image_mode, 'include_voices': bool(body.get('include_voices')), 'voices': voices,
+            'plan_refs': plan_ref_count}

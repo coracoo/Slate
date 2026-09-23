@@ -9,6 +9,19 @@
 """
 import os,json,base64,urllib.request
 
+def _billing():
+    """加载 workbench/tools/billing.py；无 workbench 的环境（如 skill 独立运行）静默返回 None。"""
+    try:
+        here=os.path.dirname(os.path.abspath(__file__))
+        cand=os.path.normpath(os.path.join(here,"..","..","workbench","tools","billing.py"))
+        if not os.path.isfile(cand): return None
+        import importlib.util
+        spec=importlib.util.spec_from_file_location("billing",cand)
+        m=importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+        return m
+    except Exception:
+        return None
+
 def is_configured(): return bool(os.environ.get("ZHIPUAI_API_KEY") or os.environ.get("GLM_API_KEY"))
 def _key(): return os.environ.get("ZHIPUAI_API_KEY") or os.environ.get("GLM_API_KEY") or ""
 def text_model(): return os.environ.get("GLM_TEXT_MODEL","glm-5.3-flash")
@@ -25,6 +38,15 @@ def chat(messages,model=None,timeout=120,temperature=0.6):
         headers={"Content-Type":"application/json","Authorization":"Bearer "+_key()})
     with urllib.request.urlopen(req,timeout=timeout) as r:
         d=json.loads(r.read().decode("utf-8"))
+    # 计费补账：环境变量直连通道（vendor=glm-env），无价格配置时 cost=null 仍记录调用
+    try:
+        b=_billing()
+        if b:
+            usage=d.get("usage") if isinstance(d.get("usage"),dict) else None
+            b.bill(None, vendor="glm-env", kind="text", model=model or text_model(),
+                   op="chat", ok=True, usage=usage, source="glm-env")
+    except Exception:
+        pass
     return d["choices"][0]["message"]["content"]
 
 def image_part(jpg_bytes):

@@ -22,10 +22,16 @@ export interface StudioState {
   board: {shots: ProductionShot[]; video_units?: VideoUnit[]}; revision: string
   capabilities: Record<string, VideoCapability>
   asset_previews?: {path: string; purpose: string; shot_id: string}[]
+  /** 制作规格（E05）：V 总时长超过单集目标时长时后端给出的提示。 */
+  brief_notice?: string
 }
-export type ProductionItem = CreateItem & {scope?: string; unit_id?: string; actual_duration?: number; archive_error?: string}
+/** 局部修补（重做片段）候选的锚点溯源信息：redo.t0–t1 为拼回窗口，anchors 为原片首尾锚点帧。 */
+export interface RedoInfo {t0: number; t1: number; anchors?: {head: string; tail: string}; source_output?: {item_id: string; output_index: number; path?: string}}
+export type ProductionItem = CreateItem & {scope?: string; unit_id?: string; actual_duration?: number; archive_error?: string; redo?: RedoInfo}
 export const studioData = (project: string, board: string) => getJSON<StudioState>(`/api/studio/data?project=${encodeURIComponent(project)}&board=${encodeURIComponent(board)}`)
 export const studioPost = (path: string, body: unknown) => postJSON<{ok: boolean; id?: number; item_id?: string; reused?: boolean}>(`/api/studio/${path}`, body)
 export const fetchStudioSettings = () => getJSON<{ok: boolean; default_video_duration: number}>('/api/studio/settings')
 export const saveStudioSettings = (body: {default_video_duration: number}) => postJSON<{ok: boolean; default_video_duration: number}>('/api/studio/settings', body)
 export const submitStudioJob = (body: RequestBody, recover = false) => navigator.locks.request('slate-production:' + body.project, () => durableRequest(body, b => studioPost('job', b), recover))
+// 局部修补与生成走同一持久化通道（稳定 nonce + 未确认请求接管），只是落在独立路由上。
+export const submitRedoJob = (body: RequestBody, recover = false) => navigator.locks.request('slate-production:' + body.project, () => durableRequest(body, b => postJSON<{ok: boolean; id?: number; item_id?: string; reused?: boolean}>('/api/production/redo_segment', b), recover))

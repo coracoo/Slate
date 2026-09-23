@@ -24,6 +24,33 @@ from datetime import datetime, timezone
 CHUNK_SEC = 540  # 16k 单声道 16bit ≈ 32KB/s，540s ≈ 17MB，留足 25MB 余量
 
 
+def _billing():
+    """加载 workbench/tools/billing.py；无 workbench 的环境（skill 独立副本）静默返回 None。"""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        for up in (4, 3, 2, 1):
+            cand = os.path.normpath(os.path.join(here, *[".."] * up, "workbench", "tools", "billing.py"))
+            if os.path.isfile(cand):
+                import importlib.util
+                spec = importlib.util.spec_from_file_location("billing", cand)
+                m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+                return m
+    except Exception:
+        pass
+    return None
+
+
+def _bill_asr(cfg, vendor, model, seconds):
+    """云端 ASR 成功补账（kind=asr，units=识别秒数）；本地 faster-whisper 不走这里。异常静默。"""
+    try:
+        b = _billing()
+        if b:
+            b.bill(cfg, vendor=vendor, kind="asr", model=model or "", op="transcribe",
+                   ok=True, units={"seconds": round(seconds, 2)})
+    except Exception:
+        pass
+
+
 def extract_wav(video, start, end):
     """ffmpeg 抽 16k 单声道 wav，返回临时文件路径。"""
     wav = tempfile.NamedTemporaryFile(suffix=".wav", delete=False).name
@@ -135,7 +162,9 @@ def doubao_rows(video, a, cfg):
     if total > 0: t1 = min(t1, total)
     wav = extract_wav(video, t0, t1)
     try:
-        return transcribe_wav(wav, api_key, offset=t0)
+        rows = transcribe_wav(wav, api_key, offset=t0)
+        _bill_asr(cfg, "doubao", "seedasr-plan", max(t1 - t0, 0.0))   # 云端 ASR 补账
+        return rows
     finally:
         os.remove(wav)
 
@@ -210,6 +239,7 @@ def cloud_rows(video, a):
         print(f"[信息] 云端转写 {a.vendor}/{a.model}  分片 {seg_start:.0f}-{seg_end:.0f}s", flush=True)
         srt = post_transcription(base, key, a.model, wav, a.lang)
         os.remove(wav)
+        _bill_asr(cfg, a.vendor, a.model, seg_end - seg_start)   # 云端 ASR 补账（按分片计费一次）
         if not srt.strip().startswith("1") and "-->" not in srt:
             raise SystemExit(f"[错误] 响应不是 srt（该厂商可能不支持 /audio/transcriptions）: {srt[:200]}")
         for (x0, x1, text) in parse_srt(srt):

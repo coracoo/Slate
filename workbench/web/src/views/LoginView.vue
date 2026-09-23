@@ -3,7 +3,8 @@
 /** 登录/首次设置管理员口令（N85）。未配置口令时展示设置模式。 */
 import { ref, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { fetchAuthStatus, authSetup, authLogin } from '../api'
+import { fetchAuthStatus, authSetup, authLogin, markAuthed } from '../api'
+import { startJobDiscovery } from '../stores/jobs'
 
 const route = useRoute(), router = useRouter()
 const configured = ref(true), password = ref(''), confirm = ref('')
@@ -27,6 +28,8 @@ async function submit() {
   try {
     if (isSetup.value) await authSetup(password.value)
     else await authLogin(password.value)
+    markAuthed()          // SPA 内跳转不刷新模块：复位静默闸并恢复任务轮询
+    startJobDiscovery()
     router.replace('/')
   } catch (e) {
     error.value = e instanceof Error ? e.message : '操作失败'

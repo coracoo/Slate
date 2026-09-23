@@ -1,7 +1,10 @@
 <script setup lang="ts">
 // -*- coding: utf-8 -*-
 /** 项目风格选择：从 Skill 库按 target 过滤启用项，选中即写 项目 剧本/style.json。
- *  target=anchor 写项目默认锚定；显式选择 image 风格时，生图以 image 风格为准。 */
+ *  target=anchor 写项目默认锚定；显式选择 image 风格时，生图以 image 风格为准。
+ *  E10 显性选择：后端 /api/script/data 返回 style.json 显式值（含默认填入）；
+ *  "auto" 是显式的"自动"，下拉显示为「自动（仅知识库）」，选它会显式写 "auto"
+ *  （而不是删键——删键会被后端默认填入重新解析成唯一启用者，违背用户选择）。 */
 import { ref, computed, watch } from 'vue'
 import { getJSON, postJSON, type SkillItem } from '../api'
 import StyledSelect from './StyledSelect.vue'
@@ -22,6 +25,7 @@ const opts = computed(() => isAnchor.value
 const labels = computed<Record<string, string>>(() => {
   const m = Object.fromEntries(skills.value.map((s) => [s.id, `${s.name} — ${s.description.slice(0, 18)}`]))
   if (isAnchor.value) m['自定义画风'] = '自己写一句画风描述'
+  else m['自动'] = '自动（仅知识库）'
   return m
 })
 
@@ -34,7 +38,7 @@ async function load() {
 }
 watch(() => app.current, load, { immediate: true })
 
-// 回显项目当前选择（anchor 模式回显锚定句本身）
+// 回显项目当前显式选择（"auto"/缺失都归为「自动」；anchor 模式回显锚定句本身）
 watch(() => app.current, async () => {
   try {
     const d = await getJSON<{ style?: Record<string, string> }>(`/api/script/data?project=${encodeURIComponent(app.current)}`)
@@ -44,7 +48,8 @@ watch(() => app.current, async () => {
       customMode.value = !!a
       customText.value = a
     } else {
-      current.value = d.style?.[props.target] || '自动'
+      const v = (d.style?.[props.target] || '').trim()
+      current.value = v && v !== 'auto' ? v : '自动'
     }
   } catch { current.value = isAnchor.value ? '自定义画风' : '自动' }
 }, { immediate: true })
@@ -83,10 +88,10 @@ async function onChange(v: string) {
     return
   }
   const saved = await persist((style) => {
-    if (v === '自动') delete style[props.target]
-    else style[props.target] = v
+    // E10：「自动」写成显式 "auto"——删键会被默认填入当成"未选择"重新解析
+    style[props.target] = v === '自动' ? 'auto' : v
   })
-  if (saved) toast(`${props.label}：${v === '自动' ? '自动（知识库驱动）' : v}`, 'ok', 2500)
+  if (saved) toast(`${props.label}：${v === '自动' ? '自动（仅知识库）' : v}`, 'ok', 2500)
 }
 
 async function saveCustom() {

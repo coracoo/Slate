@@ -135,8 +135,9 @@ def concatenate(project, refs, out, spec='proxy'):
     """拼接已采用片段。
 
     spec='proxy'：预览代理，统一 1280×720@24（低成本快速看片）。
-    spec='master' 或 {'w','h','fps'}：交付母版——按片段推导（或显式给定）规格，绝不把高规格
-    素材降档；少数取向片段 pad 黑边，音频在拼接后整段响度归一（EBU R128 / -16 LUFS）。
+    spec='master' 或 {'w','h','fps'}：交付母版——按片段推导（或显式给定）规格出片，
+    绝不把高规格素材降档；少数取向片段 pad 黑边，音频在拼接后整段响度归一
+    （EBU R128 / -16 LUFS）。
     """
     if not refs: raise ValueError('请先采用本集的 V 视频')
     with tempfile.TemporaryDirectory(dir=Path(out).parent) as tmp:

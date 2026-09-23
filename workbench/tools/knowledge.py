@@ -4,7 +4,7 @@
 数据源: projects/*/拉片/*/analysis.json（受控词表齐全的解构镜头表）
 产物  : previs_system/knowledge/skills.json
         条目 = {id, skill 手法名, trigger 触发气氛/场面关键词, prescription 处方(典型镜头模式),
-                example 片例(项目+镜号), count 归纳自多少个镜头序列}
+                example 片例(项目+镜号), count 归纳自多少部片/场景（同一影片多版本去重后的来源数）}
 
 归纳器（确定性规则，非 LLM——知识库必须可复现、可增量化重建）：
   1. 对话正反打  ：连续镜 cam=cu/ots 且 speaker 交替 → 处方"ots(A,B)/ots(B,A) 交替，情绪升级切 cu"
@@ -39,26 +39,71 @@ TRIGGERS = {
 }
 
 
+def _split_analysis_path(path):
+    """解析 analysis.json 路径 → (项目名, 版本目录名)。
+    标准结构 projects/<项目>/拉片/<版本>/analysis.json：以末尾的"拉片"目录为锚点取项目名，
+    兼容 Windows 反斜杠 / POSIX 正斜杠与仓库根目录深度差异；异常结构回退到末尾四级解析。"""
+    parts = [p for p in str(path).replace("\\", "/").split("/") if p]
+    ver = parts[-2] if len(parts) >= 2 else ""
+    proj = ""
+    for i in range(len(parts) - 1, 0, -1):
+        if parts[i] == "拉片":
+            proj = parts[i - 1]
+            break
+    if not proj and len(parts) >= 4:
+        proj = parts[-4]
+    return proj, ver
+
+
 def _load_all_shots():
-    """全部拉片解构 → [(project, version, shots)]。"""
+    """全部拉片解构 → [(project, version, shots, meta)]；meta 为整份 analysis 文档，
+    供 build() 读取 source/name/created_at 做多版本归并。"""
     out = []
     for aj in glob.glob(os.path.join(VIDEO, "projects", "*", "拉片", "*", "analysis.json")):
-        parts = aj.replace("\\", "/").split("/")
         try:
             d = json.load(open(aj, encoding="utf-8"))
             if isinstance(d.get("shots"), list) and d["shots"]:
-                out.append((parts[-3], parts[-2], d["shots"]))
+                proj, ver = _split_analysis_path(aj)
+                out.append((proj, ver, d["shots"], d))
         except Exception:
             continue
     return out
 
 
+def _film_key(proj, ver, meta):
+    """归纳来源键（项目 × 影片维度）：同一影片的多个分析版本（拉片/<名>/、<名>_v2/…）只算一个来源。
+    优先 analysis.json 的 source（影片源文件，取 basename 免疫绝对/相对路径差异）；
+    缺失时用 name 或版本目录名，并去掉 _vN 版本后缀。"""
+    meta = meta if isinstance(meta, dict) else {}
+    src = str(meta.get("source") or "").strip()
+    if src:
+        return proj + "|src|" + os.path.basename(src.replace("\\", "/"))
+    nm = str(meta.get("name") or ver or "").strip()
+    nm = re.sub(r"_v\d+$", "", nm)
+    return proj + "|name|" + nm
+
+
+def _version_sort_key(meta, ver):
+    """版本新旧排序键：created_at（ISO 字符串可直接比）优先，其次 version 字段与目录名。"""
+    meta = meta if isinstance(meta, dict) else {}
+    return (str(meta.get("created_at") or ""), str(meta.get("version") or ""), str(ver or ""))
+
+
+def _vocab(shot, field):
+    """读取受控字段（shot_size/camera_move/angle/transition）的有效值。
+    「不确定」（证据不足的合法出口）与空值一律返回 None：该镜在此字段上无证据，
+    归纳统计时跳过——既不计入命中，也不充当反例（如不打断正反打交替段）。"""
+    v = str(shot.get(field) or "").strip()
+    return None if v in ("", "不确定") else v
+
+
 def _seq(spans):
-    """按说话人交替统计正反打段。"""
+    """最长说话人交替段长度。spans 是完整说话人标识列表（调用方传入角色字符串），
+    按整值比较——此前对字符串再取 [0] 只比首字符，char_a/char_b、角色甲/角色乙 会被误判为同一人。"""
     best = 0
     run = 1
     for i in range(1, len(spans)):
-        if spans[i][0] and spans[i - 1][0] and spans[i][0] != spans[i - 1][0]:
+        if spans[i] and spans[i - 1] and spans[i] != spans[i - 1]:
             run += 1
             best = max(best, run)
         else:
@@ -67,29 +112,44 @@ def _seq(spans):
 
 
 def build():
-    """扫描全部拉片，归纳手法条目（确定性规则）。"""
-    n_seq = {}
+    """扫描全部拉片，归纳手法条目（确定性规则）。
+    同一影片的多个分析版本先归并为一个来源（保留最新一版参与归纳），
+    count 统计去重后的来源（项目 × 影片）数，不再按版本/出现次数重复累加。
+    受控字段（shot_size/camera_move/angle/transition）为「不确定」/空的镜头
+    经 _vocab() 归一为无证据镜，不进统计（不命中、不作反例）。"""
+    src_of = {}   # skill -> set(来源键)
     ex = {}
 
-    def add(skill, n, example):
-        n_seq[skill] = n_seq.get(skill, 0) + n
+    def add(skill, src_key, example):
+        src_of.setdefault(skill, set()).add(src_key)
         ex.setdefault(skill, []).append(example)
 
-    for proj, ver, shots in _load_all_shots():
+    # 多版本归并：同来源键只保留最新一版（created_at 优先，退化为 version 字段与目录名）
+    films = {}
+    for proj, ver, shots, meta in _load_all_shots():
+        key = _film_key(proj, ver, meta)
+        old = films.get(key)
+        if old is None or _version_sort_key(meta, ver) > _version_sort_key(old[3], old[1]):
+            films[key] = (proj, ver, shots, meta)
+
+    for key in sorted(films):
+        proj, ver, shots, _meta = films[key]
         # 1) 对话正反打：连续带台词镜中说话人交替，且景别为 cu/ots/two
         dlg = [(s.get("dialogue") and s["dialogue"][0].get("speaker"), s) for s in shots]
         dlg = [(sp, s) for sp, s in dlg if sp]
         run, cur = [], None
         for sp, s in dlg:
-            size = str(s.get("shot_size", ""))
+            size = _vocab(s, "shot_size")
+            if size is None:
+                continue  # 景别无证据：跳过本镜，不累计也不打断交替段
             if size in ("近景", "特写", "中近景", "中景"):
                 run.append((sp, s))
             else:
                 if len(run) >= 3 and _seq([r[0] for r in run]) >= 2:
-                    add("对话正反打", 1, f"{proj}/{ver} " + "→".join(r[1]["id"] for r in run[:4]))
+                    add("对话正反打", key, f"{proj}/{ver} " + "→".join(r[1]["id"] for r in run[:4]))
                 run = []
         if len(run) >= 3 and _seq([r[0] for r in run]) >= 2:
-            add("对话正反打", 1, f"{proj}/{ver} " + "→".join(r[1]["id"] for r in run[:4]))
+            add("对话正反打", key, f"{proj}/{ver} " + "→".join(r[1]["id"] for r in run[:4]))
 
         # 2) 紧张快切：连续 3+ 短镜(dur<3.5)且含手持/甩/特写
         i = 0
@@ -102,7 +162,7 @@ def build():
                 mv = " ".join(str(s.get("camera_move", "")) for s in seg)
                 sz = " ".join(str(s.get("shot_size", "")) for s in seg)
                 if ("手持" in mv or "甩" in mv) or ("特写" in sz):
-                    add("紧张快切", 1, f"{proj}/{ver} {seg[0]['id']}~{seg[-1]['id']}({len(seg)}镜均<3.5s)")
+                    add("紧张快切", key, f"{proj}/{ver} {seg[0]['id']}~{seg[-1]['id']}({len(seg)}镜均<3.5s)")
             i = max(j, i + 1)
 
         # 3) 两人对峙：两名说话人交替 + 中间穿插全景/远景
@@ -111,35 +171,36 @@ def build():
             sps = [x["dialogue"][0].get("speaker") for x in w if x.get("dialogue")]
             wides = sum(1 for x in w if str(x.get("shot_size", "")) in ("全景", "远景", "大远景"))
             if len(set(sps)) >= 2 and wides >= 1 and len(sps) >= 2:
-                add("两人对峙", 1, f"{proj}/{ver} {w[0]['id']}~{w[-1]['id']}(交替+{wides}全景)")
+                add("两人对峙", key, f"{proj}/{ver} {w[0]['id']}~{w[-1]['id']}(交替+{wides}全景)")
                 break
 
         # 4) 大场面定场：前三镜内出现大远景/远景/鸟瞰
         for s in shots[:3]:
             if str(s.get("shot_size", "")) in ("大远景", "远景") or s.get("angle") == "鸟瞰":
-                add("大场面定场", 1, f"{proj}/{ver} {s['id']}({s.get('shot_size')}/{s.get('angle')})")
+                add("大场面定场", key, f"{proj}/{ver} {s['id']}({s.get('shot_size')}/{s.get('angle')})")
                 break
 
-        # 5) 转场语汇：只统计"非默认"转场（硬切/无是缺省值，统计它们不是知识）
+        # 5) 转场语汇：只统计"非默认"转场（硬切/无是缺省值，统计它们不是知识）；
+        #    「不确定」/空值是证据不足的无证据镜，跳过不计
         tr = {}
         for s in shots:
-            t = str(s.get("transition") or "无")
-            if t in ("无", "硬切", ""):
+            t = _vocab(s, "transition")
+            if t in (None, "无", "硬切"):
                 continue
             tr[t] = tr.get(t, 0) + 1
         for t, c in sorted(tr.items(), key=lambda kv: -kv[1]):
             if c >= 2:
-                add("转场语汇", c, f"{proj}/{ver} 「{t}」×{c}次")
+                add("转场语汇", key, f"{proj}/{ver} 「{t}」×{c}次")
 
         # 6) 仰视压迫：仰视镜数量成规模（权力/压迫的镜头语言）
         ups = [s for s in shots if s.get("angle") == "仰视"]
         if len(ups) >= 5:
-            add("仰视压迫", len(ups), f"{proj}/{ver} 仰视×{len(ups)}镜（如 {ups[0]['id']}）")
+            add("仰视压迫", key, f"{proj}/{ver} 仰视×{len(ups)}镜（如 {ups[0]['id']}）")
 
         # 7) 长镜台词轨：≥8s 且多句台词的长镜（一镜承载完整对话回合）
         longs = [s for s in shots if float(s.get("duration") or 0) >= 8 and len(s.get("dialogue") or []) >= 2]
         if len(longs) >= 2:
-            add("长镜台词轨", len(longs), f"{proj}/{ver} {longs[0]['id']}({longs[0]['duration']}s/{len(longs[0]['dialogue'])}句)等{len(longs)}镜")
+            add("长镜台词轨", key, f"{proj}/{ver} {longs[0]['id']}({longs[0]['duration']}s/{len(longs[0]['dialogue'])}句)等{len(longs)}镜")
 
     # 合成处方
     PRE = {
@@ -155,12 +216,12 @@ def build():
     TRIG2.update({"仰视压迫": ["仰视", "压迫", "权威", "审判", "权力", "训话", "威严"],
                   "长镜台词轨": ["长镜头", "训话", "谈判", "告白", "独白", "沉浸", "一镜"]})
     skills = []
-    for skill, n in n_seq.items():
+    for skill, keys in src_of.items():
         skills.append({
             "id": re.sub(r"\s+", "", skill), "skill": skill,
             "trigger": TRIG2.get(skill, TRIGGERS.get(skill, [skill])),
             "prescription": PRE.get(skill, skill),
-            "count": n,
+            "count": len(keys),
             "example": "；".join(ex[skill][:3]),
         })
     os.makedirs(os.path.dirname(KB), exist_ok=True)

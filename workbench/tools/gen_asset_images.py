@@ -366,6 +366,12 @@ def main():
         prompt = prompt.replace("性别不明，", "").replace("性别不明", "")
         # 资产级画风覆盖（资产档案 style 字段）优先于项目生图风格
         asset_style = str(it.get("style") or "").strip() or None
+        # E10 冻结：记录本资产实际注入的 image skill 快照（id/name/正文 sha 前12位）。
+        # style_prompt 自由文本优先于 skill（此时 skill 未注入，记空不写）；
+        # 资产级 style 覆盖优先、空则回落项目显式选择，与 resolve_asset_style_text 同口径。
+        asset_skill_snap = ({} if str(it.get("style_prompt") or "").strip()
+                            else skill_lib.skill_snapshot_for(proj, ["image"],
+                                                              overrides={"image": asset_style or ""}))
         # 三层组装唯一入口（母图/状态图同路）：外观事实 → 画风层 → 类别硬约束；负面=全局基础 ∪ skill 定制
         prompt, negative = skill_lib.compose_asset_image_prompt(
             proj, prompt, skill_id=asset_style, kind=kind, style_prompt=it.get("style_prompt"))
@@ -399,7 +405,9 @@ def main():
                                 "relation": it.get("relation"),
                                 "derived_from": it.get("derived_from"),
                                 "related_refs": it.get("related_refs") or [],
-                                "reference_refs": reference_tokens}
+                                "reference_refs": reference_tokens,
+                                # E10：实际注入的 skill 快照随索引归档（未注入则不写该键）
+                                **({"skill_snapshot": asset_skill_snap} if asset_skill_snap else {})}
             print(f"[跳过] {zone}/{aid} 已存在（补缺模式）")
         else:
             if missing_refs:
@@ -424,11 +432,22 @@ def main():
                                     "relation": it.get("relation"),
                                     "derived_from": it.get("derived_from"),
                                     "related_refs": it.get("related_refs") or [],
-                                    "reference_refs": reference_tokens}
+                                    "reference_refs": reference_tokens,
+                                    **({"skill_snapshot": asset_skill_snap} if asset_skill_snap else {})}
                 print(f"[完成] {zone}/{aid} -> 素材/{zone}/{aid}.png")
             except Exception as e:
                 ok_all = False; fail.append(f"{zone}/{aid}: {e}")
                 print(f"[失败] {zone}/{aid}: {e}")
+        # ---- 场景平面图派生：场景母图就位后自动确保 plan → 底图 PNG → 素材图派生注册 ----
+        # fail-soft：无厂商/生成失败只告警；注册只改内存 index，随本轮统一落盘（行尾 dump）。
+        if kind == "scene" and os.path.isfile(out):
+            try:
+                import plan_frames as _PF
+                _pr = _PF.ensure_scene_plan(proj, aid, log=print)
+                if _pr.get("png"):
+                    _PF.register_plan_derivative(proj, aid, _pr["png"], index=index)
+            except Exception as _e:
+                print(f"[告警] 场景「{aid}」平面图派生失败（不影响资产生图）: {_e}")
         # ---- 状态资产图：同一角色的剧情阶段变体（锚点+差异），文件 <aid>__<状态id>.png ----
         if kind != "character" or plan.get("skip_states"):
             continue
@@ -450,7 +469,8 @@ def main():
             s_out = os.path.join(out_dir, f"{aid}__{sid}.png")
             if not asset_image_needs_generation(s_out, a.force):
                 states_entry[sid] = {"path": f"素材/{zone}/{aid}__{sid}.png",
-                                     "prompt": s_prompt, "label": st_item.get("label", sid)}
+                                     "prompt": s_prompt, "label": st_item.get("label", sid),
+                                     **({"skill_snapshot": asset_skill_snap} if asset_skill_snap else {})}
                 continue
             import versions as _V2; _V2.snapshot(s_out)
             try:
@@ -463,7 +483,8 @@ def main():
                 states_entry[sid] = {"path": f"素材/{zone}/{aid}__{sid}.png",
                                      "prompt": s_prompt, "label": st_item.get("label", sid),
                                      "episodes": st_item.get("episodes") or [],
-                                     "camp": st_item.get("camp", "")}
+                                     "camp": st_item.get("camp", ""),
+                                     **({"skill_snapshot": asset_skill_snap} if asset_skill_snap else {})}
                 print(f"[完成] {zone}/{aid}#{sid} -> {aid}__{sid}.png")
             except Exception as e:
                 ok_all = False; fail.append(f"{zone}/{aid}#{sid}: {e}")

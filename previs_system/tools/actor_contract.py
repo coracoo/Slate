@@ -15,6 +15,13 @@ except Exception:
     pass
 
 
+# 关键帧/表演节拍的时间角色受控词表（update.md E07）：
+#   start=开始状态（视频首帧只准取它）、beat=动作关键点、end=结束状态（图片模式取此拍）、compose=构图参考。
+# 落在表演节拍的 ``time_role`` 字段与分镜已采用关键帧 ``shot["keyframe"]["time_role"]`` 上；
+# 旧数据没有该字段即未分类，消费方兜底放行并打警告，不阻断。
+TIME_ROLES = ("start", "beat", "end", "compose")
+
+
 def _issue(code: str, path: str, message: str, severity: str = "error") -> dict:
     return {"code": code, "path": path, "message": message, "severity": severity}
 
@@ -360,7 +367,7 @@ def validate_performance(packet: dict, request: dict) -> list[dict]:
     return issues
 
 
-__all__ = ["validate_context", "validate_performance"]
+__all__ = ["validate_context", "validate_performance", "TIME_ROLES"]
 
 
 

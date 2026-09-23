@@ -10,17 +10,21 @@
 frontmatter 字段：id/name/category/target/enabled/description；正文=注入给 LLM 的风格指令。
 用户/社区可新增 .md（拷入即生效）；置 enabled: false 停用；正文可自由编辑。
 
-项目级选择：projects/<项目>/剧本/style.json {"导演风格":"realism-cold","生图风格":"cinematic-real","拆剧本":null}
-  - 选中的 skill 注入对应 LLM 调用；null=自动（只用知识库，不注固定风格）。
+项目级选择：projects/<项目>/剧本/style.json {"storyboard":"realism-cold","image":"cinematic-real","script":"auto"}
+  - 选中的 skill 注入对应 LLM 调用；"auto"/缺失=自动（只用知识库，不注固定风格）。
+  - E10 起显性选择：style_for/image_skill_id 只吃 style.json 显式值，不再隐式推导；
+    读取入口经 ensure_explicit_defaults 幂等补默认（唯一启用者冻结为显式值，否则写 "auto"）。
   - server /api/script/data 返回 style；分镜提示词页/资产提炼页有下拉，Skill 中心页(/skills)管理库。
 
 API:
-  list_skills()                -> [ {id,name,category,target,enabled,builtin,description,path} ]
-  load_skill_text(id)          -> 正文（含 frontmatter 剥离）
-  style_for(project, target)   -> 该项目该注入点当前选中的 skill 正文（未选/停用 -> ""）
+  list_skills()                     -> [ {id,name,category,target,enabled,builtin,description,path} ]
+  load_skill_text(id)               -> 正文（含 frontmatter 剥离）
+  style_for(project, target)        -> 该项目该注入点显式选中的 skill 正文（未选/"auto"/停用 -> ""）
+  ensure_explicit_defaults(project) -> 补全 style.json 缺失 target 的显式默认值（幂等，不覆盖已有选择）
+  skill_snapshot_for(project, targets, overrides=None) -> 本次实际注入的 skill 快照 {target:{id,name,sha}}
   save_skill(id, text) / create_skill(...) / delete_skill(id)
 """
-import sys, os, json, re
+import sys, os, json, re, hashlib
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -168,24 +172,65 @@ def set_project_style(proj, style):
         json.dump(style, f, ensure_ascii=False, indent=1)
 
 
+# style.json 中"自动"的显式值（E10）：与缺失键同义（仅知识库驱动），但不会被默认填入改写
+AUTO_VALUE = "auto"
+
+# 参与默认填入的注入点兜底集合（实际 target 以 Skill 库为准，这里是库为空时的保底）
+KNOWN_TARGETS = ("script", "storyboard", "image", "acting")
+
+
+def ensure_explicit_defaults(proj):
+    """E10 显性选择 + 默认填入：把 style.json 缺失的 target 冻结成显式值。
+
+    规则：某 target 无显式选择（缺键/空串）时，按旧隐式规则解析——该 target 恰好
+    一个启用 skill 则取其 id，多个启用或无启用则写 "auto"；只补缺失键，绝不覆盖
+    已有显式选择（含用户手选的 "auto"）。写回仅在项目目录真实存在且内容有变化时
+    发生（幂等；之后增删/启停 Skill 不再让项目选择飘移）。返回完整 style dict。
+    """
+    style = project_style(proj)
+    if not isinstance(style, dict):
+        style = {}
+    else:
+        style = dict(style)
+    skills = list_skills()
+    targets = sorted({str(s.get("target") or "") for s in skills if s.get("target")} | set(KNOWN_TARGETS))
+    changed = False
+    for target in targets:
+        if str(style.get(target) or "").strip():
+            continue  # 已有显式选择（skill id 或 "auto"）：不动
+        enabled = [s for s in skills if s["target"] == target and s["enabled"]]
+        style[target] = enabled[0]["id"] if len(enabled) == 1 else AUTO_VALUE
+        changed = True
+    if changed and os.path.isdir(proj):
+        # 只在真实项目目录落盘；读取入口不允许因写盘失败而中断
+        try:
+            set_project_style(proj, style)
+        except Exception:
+            pass
+    return style
+
+
 def style_for(proj, target):
-    """该项目 target 注入点（script/storyboard/image）当前应注入的 skill 正文串。
-    项目未选 -> 取该 target 下唯一启用的（若恰好一个）；多个启用则不注入（避免误配）。"""
-    sel = project_style(proj).get(target)
-    skills = [s for s in list_skills() if s["target"] == target and s["enabled"]]
-    if sel:
-        return "".join(load_skill_text(s["id"]) + "\n" for s in skills if s["id"] == sel)
-    if len(skills) == 1:
-        return load_skill_text(skills[0]["id"]) + "\n"
+    """该项目 target 注入点（script/storyboard/image/acting）当前应注入的 skill 正文串。
+    E10 起只吃 style.json 的显式选择（首次读取由 ensure_explicit_defaults 把旧隐式
+    默认冻结成显式值）；未选择/"auto"=仅知识库驱动，不注入任何 skill 正文。"""
+    sel = str(ensure_explicit_defaults(proj).get(target) or "").strip()
+    if not sel or sel == AUTO_VALUE:
+        return ""
+    for s in list_skills():
+        if s["id"] == sel and s["target"] == target and s["enabled"]:
+            return load_skill_text(s["id"]) + "\n"
     return ""
 
 
 def image_skill_id(proj, override=None):
-    """资产生图实际使用的 image skill id：资产级覆盖（资产档案 style 字段）优先，其次项目选择。"""
+    """资产生图实际使用的 image skill id：资产级覆盖（资产档案 style 字段）优先，
+    其次项目显式选择（E10 与 style_for 同一口径：只吃 style.json，"auto"/未选 -> ""）。"""
     ov = str(override or "").strip()
     if ov:
         return ov
-    return str(project_style(proj).get("image") or "").strip()
+    sel = str(ensure_explicit_defaults(proj).get("image") or "").strip()
+    return "" if sel == AUTO_VALUE else sel
 
 
 def image_skill_text(proj, override=None):
@@ -198,8 +243,56 @@ def image_skill_text(proj, override=None):
     return str(style_for(proj, "image") or "")
 
 
-# 资产负面提示词全局基础（唯一来源；与画风 skill 定制负面取并集）
-ASSET_BASE_NEGATIVE = "文字,水印,边框,画框,多人,重复角色,畸形手指,多余肢体,肢体交叉错乱,面部变形"
+def skill_meta_snapshot(skill_id, target=None):
+    """单个 skill 的冻结快照 {"id","name","sha"}（sha=正文 sha256 前 12 位，E10 追溯用）。
+    skill 不存在、已停用或与 target 不符时返回 None（视为未注入）。"""
+    sid = str(skill_id or "").strip()
+    if not sid:
+        return None
+    for s in list_skills():
+        if s["id"] != sid:
+            continue
+        if not s["enabled"] or (target and s["target"] != target):
+            return None
+        body = load_skill_text(sid)
+        return {"id": sid, "name": s.get("name") or sid,
+                "sha": hashlib.sha256(body.encode("utf-8")).hexdigest()[:12]}
+    return None
+
+
+def skill_snapshot_for(proj, targets, overrides=None):
+    """本次生成实际注入的 skill 快照 {target: {"id","name","sha"}}（E10 任务创建冻结）。
+
+    auto/未注入的 target 不出现在结果里（style.json 里有显式值可查）。overrides 可给
+    某 target 传资产级覆盖 id（如资产档案 style 字段）；覆盖值为空串时回落项目显式选择。
+    """
+    style = ensure_explicit_defaults(proj)
+    out = {}
+    for target in targets:
+        sid = str((overrides or {}).get(target) or "").strip()
+        if not sid:
+            sel = str(style.get(target) or "").strip()
+            sid = "" if (not sel or sel == AUTO_VALUE) else sel
+        snap = skill_meta_snapshot(sid, target)
+        if snap:
+            out[target] = snap
+    return out
+
+
+# 负面提示词分两层（E11 修复，唯一来源；与画风 skill 定制负面取并集）：
+# ① 全局基础负面 ASSET_BASE_NEGATIVE——对资产设定图与剧情帧都安全的通用禁令。
+#    不再含"多人/重复角色"：角色三视图就是同一主体在一张图里并列三个角度，
+#    这类禁令与 ASSET_KIND_CONSTRAINTS.character 的"同一主体三视图"硬约束正面冲突，
+#    图像模型会把三视图拉成单人或拒绝生成。
+# ② 剧情帧专属负面 STORY_FRAME_NEGATIVE——只进剧情关键帧/画格/视频首帧类产物。
+#    按 shot-prompt-v1 规范（docs/shot-prompt-v1-资产引用.md）只禁"额外角色/重复角色"，
+#    不禁"多人"——多角色与群像镜头是合法构图，禁"多人"会误删三人/群像画面。
+ASSET_BASE_NEGATIVE = "文字,水印,边框,画框,畸形手指,多余肢体,肢体交叉错乱,面部变形"
+STORY_FRAME_NEGATIVE = "额外角色,重复角色"
+
+# 剧情帧类 kind：compose_asset_negative 仅对这些 kind 并入剧情帧专属负面；
+# character/scene/prop 等资产设定图 kind 永远不带（三视图/空镜/单道具的正约束已够）
+STORY_FRAME_KINDS = frozenset({"frame", "keyframe", "panel", "shot", "video_frame", "story_frame"})
 
 # 类别硬约束：拼在最终提示词末尾并声明不可覆盖，保证不被外观/画风文本冲淡
 ASSET_KIND_CONSTRAINTS = {
@@ -209,9 +302,13 @@ ASSET_KIND_CONSTRAINTS = {
 }
 
 
-def compose_asset_negative(proj, skill_id=None):
-    """资产负面提示词统一入口：全局基础 ∪ 画风 skill 定制。"""
+def compose_asset_negative(proj, skill_id=None, kind=None):
+    """负面提示词统一入口：全局基础 ∪（剧情帧类 kind 追加剧情帧专属）∪ 画风 skill 定制。
+    kind 为 character/scene/prop/None（资产设定图）时不带"额外角色/重复角色"禁令（E11）；
+    kind 命中 STORY_FRAME_KINDS（剧情关键帧/画格/视频首帧类）才并入 STORY_FRAME_NEGATIVE。"""
     parts = [ASSET_BASE_NEGATIVE]
+    if str(kind or "").strip().lower() in STORY_FRAME_KINDS:
+        parts.append(STORY_FRAME_NEGATIVE)
     selected = image_skill_id(proj, skill_id)
     neg = skill_negative(selected) if selected else ""
     if neg:
@@ -238,7 +335,8 @@ def resolve_asset_style_text(proj, skill_id=None, style_prompt=None):
 def compose_asset_image_prompt(proj, source_prompt, skill_id=None, kind="character", style_prompt=None):
     """资产生图最终提示词与负面词的唯一组装入口（母图/状态图/子图同路）。
     分层：外观事实（资产档案，提取层零画风词）→ 画风层（resolve_asset_style_text）
-    → 类别硬约束（末尾、声明不可覆盖）。返回 (final_prompt, negative)。"""
+    → 类别硬约束（末尾、声明不可覆盖）。负面按 kind 组装（E11：资产图不带剧情帧禁令）。
+    返回 (final_prompt, negative)。"""
     content = str(source_prompt or "").strip()
     style_text, _src = resolve_asset_style_text(proj, skill_id, style_prompt)
     parts = [content] if content else []
@@ -249,7 +347,7 @@ def compose_asset_image_prompt(proj, source_prompt, skill_id=None, kind="charact
     constraint = ASSET_KIND_CONSTRAINTS.get(str(kind or "").strip())
     if constraint:
         parts.append(constraint)
-    return "\n".join(parts), compose_asset_negative(proj, skill_id)
+    return "\n".join(parts), compose_asset_negative(proj, skill_id, kind=kind)
 
 
 if __name__ == "__main__":

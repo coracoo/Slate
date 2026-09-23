@@ -128,6 +128,29 @@ class HttpRouteTests(unittest.TestCase):
                         self.assertEqual(code,400)
                 spawn.assert_not_called()
 
+    def test_script_brief_roundtrip(self):
+        # 制作规格（E05）：GET 缺文件返回完整默认；POST 校验并落 剧本/brief.json
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            code, _, payload = self.request('/api/script/brief?project=test')
+            self.assertEqual(code, 200)
+            body = json.loads(payload)
+            self.assertEqual(body['brief']['episode_minutes'], 3)
+            self.assertEqual(body['brief']['aspect_ratio'], '16:9')
+            self.assertNotIn('resolution', body['brief'])   # resolution/fps 已下线
+            self.assertNotIn('fps', body['brief'])
+            self.assertFalse(body['exists'])
+            code, _, payload = self.request('/api/script/brief', 'POST',
+                                            json.dumps({'project': 'test', 'patch': {'episode_minutes': 7}}).encode())
+            self.assertEqual(code, 200, payload)
+            self.assertEqual(json.loads(payload)['brief']['episode_minutes'], 7)
+            self.assertTrue((Path(folder) / '剧本' / 'brief.json').is_file())
+            code, _, payload = self.request('/api/script/brief', 'POST',
+                                            json.dumps({'project': 'test', 'patch': {'fps': 23}}).encode())
+            self.assertEqual(code, 400)
+            self.assertIn('fps', json.loads(payload)['err'])
+            code, _, _ = self.request('/api/script/brief', 'POST', json.dumps({'project': 'test'}).encode())
+            self.assertEqual(code, 400)   # 缺 patch 对象
+
     def test_error_payload_redacts_bearer_and_url_credentials(self):
         secret='Bearer abc.def-ghi_jkl https://user:password@example.test/x?api_key=secret-value'
         with patch.object(server,'knowledge_save',side_effect=RuntimeError(secret)):
@@ -150,6 +173,25 @@ class HttpRouteTests(unittest.TestCase):
                 request=json.loads(Path(cmd[2]).read_text(encoding='utf-8'))
                 self.assertEqual(request['revision'],'revision')
                 self.assertNotIn('api_key',request)
+
+    def test_white_from_analysis_passes_mode(self):
+        # E09：--mode 可选 body 参数透传（schematic/faithful），非法/缺省不透传（工具内默认 schematic）
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(server, 'proj_dir', return_value=folder), \
+             patch.object(server.H, 'spawn_job', return_value=88) as spawn:
+            code, _, body = self.request('/api/white/from_analysis', 'POST',
+                                         b'{"project":"p","mode":"faithful"}')
+            self.assertEqual(code, 200, body)
+            self.assertEqual(json.loads(body)['id'], 88)
+            cmd = spawn.call_args.args[1]
+            self.assertEqual(cmd[cmd.index('--mode') + 1], 'faithful')
+            code, _, _ = self.request('/api/white/from_analysis', 'POST', b'{"project":"p"}')
+            self.assertEqual(code, 200)
+            self.assertNotIn('--mode', spawn.call_args.args[1])
+            code, _, _ = self.request('/api/white/from_analysis', 'POST',
+                                      b'{"project":"p","mode":"bogus"}')
+            self.assertEqual(code, 200)
+            self.assertNotIn('--mode', spawn.call_args.args[1])
 
     def test_client_errors_have_distinct_statuses(self):
         with patch.object(server,'knowledge_save',return_value=None):
@@ -272,6 +314,69 @@ class HttpRouteTests(unittest.TestCase):
         with patch.object(server, 'proj_dir', return_value='/test'), patch.object(server.chatgpt_import, 'import_package', return_value={'ok': True}) as importer:
             self.assertEqual(self.request('/api/create/chatgpt/import', 'POST', body, {'Content-Type': f'multipart/form-data; boundary={boundary}'})[0], 200)
             self.assertEqual(importer.call_args.args, ('/test', {}, {'image.png': blob}))
+
+    def test_project_delete_moves_to_recycle_bin(self):
+        # 删除项目=整目录移入 projects/.回收站/<项目>_<时间戳>/（不物理删除）；回收站与已删项目都不再进项目扫描
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'VIDEO', folder):
+            pj = Path(folder)/'projects'; proj = pj/'zzz_test_del'
+            proj.mkdir(parents=True)
+            (proj/'项目.json').write_text('{"type":"拆片"}', encoding='utf-8')
+            keep = pj/'zzz_keep'; keep.mkdir()
+            code, _, payload = self.request('/api/project/delete', 'POST', json.dumps({'project': 'zzz_test_del'}).encode())
+            self.assertEqual(code, 200, payload)
+            row = json.loads(payload)
+            self.assertTrue(row['ok'])
+            self.assertIn('.回收站', row['recycled'])
+            self.assertFalse(proj.exists())
+            recycled = list((pj/'.回收站').iterdir())
+            self.assertEqual(len(recycled), 1)
+            self.assertTrue(recycled[0].name.startswith('zzz_test_del_'))
+            self.assertTrue((recycled[0]/'项目.json').is_file())
+            self.assertTrue(keep.is_dir())
+            names = [p['name'] for p in server.scan_projects()]
+            self.assertEqual(names, ['zzz_keep'])
+            # 再删一次 → 404
+            code, _, payload = self.request('/api/project/delete', 'POST', json.dumps({'project': 'zzz_test_del'}).encode())
+            self.assertEqual(code, 404, payload)
+
+    def test_project_delete_rejects_traversal_and_missing(self):
+        # 路径穿越/分隔符/隐藏名/空名 → 400；不存在的项目 → 404；目录原样保留
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'VIDEO', folder):
+            proj = Path(folder)/'projects'/'zzz_keep'; proj.mkdir(parents=True)
+            outside = Path(folder)/'outside'; outside.mkdir()
+            for bad in ('../outside', 'a/b', 'a\\b', '.', '..', '.回收站', ''):
+                with self.subTest(bad=bad):
+                    code = self.request('/api/project/delete', 'POST', json.dumps({'project': bad}).encode())[0]
+                    self.assertEqual(code, 400)
+            self.assertEqual(self.request('/api/project/delete', 'POST', json.dumps({'project': '不存在项目'}).encode())[0], 404)
+            self.assertTrue(proj.is_dir())
+            self.assertTrue(outside.is_dir())
+            self.assertFalse((Path(folder)/'projects'/'.回收站').exists())
+
+
+    def test_production_redo_segment_route_validation(self):
+        # 局部修补路由：项目不存在 → 400；缺稳定 nonce → 入队前 400 拦截
+        code, _, _ = self.request('/api/production/redo_segment', 'POST', json.dumps({'project': '不存在'}).encode())
+        self.assertEqual(code, 400)
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            code, _, payload = self.request('/api/production/redo_segment', 'POST',
+                                            json.dumps({'project': 'p', 'board': 'E1.json', 'target': 'v-1', 't0': 1, 't1': 2}).encode())
+            self.assertEqual(code, 400)
+            self.assertIn('nonce', json.loads(payload)['err'])
+
+    def test_production_redo_segment_forces_action_and_spawns_job(self):
+        # 路由强制 action=redo_segment/scope=V/type=video 后走 job 体系入队
+        from types import SimpleNamespace
+        from unittest.mock import Mock
+        module = SimpleNamespace(enqueue=Mock(return_value={'ok': True, 'id': 55, 'item_id': 'prod-x'}))
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder), patch.object(server, 'tools_mod', return_value=module):
+            code, _, data = self.request('/api/production/redo_segment', 'POST',
+                                         json.dumps({'project': 'p', 'board': 'E1.json', 'target': 'v-1', 't0': 6, 't1': 8, 'nonce': 'redo-nonce-12345'}).encode())
+            self.assertEqual(code, 200, data)
+            self.assertEqual(json.loads(data)['id'], 55)
+            body = module.enqueue.call_args.args[1]
+            self.assertEqual((body['action'], body['scope'], body['type']), ('redo_segment', 'V', 'video'))
+            self.assertEqual((body['t0'], body['t1'], body['target']), (6, 8, 'v-1'))
 
 
 class RegistryTests(unittest.TestCase):

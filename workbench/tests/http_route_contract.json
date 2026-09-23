@@ -41,6 +41,14 @@
  ],
  [
   "GET",
+  "/api/billing/records"
+ ],
+ [
+  "GET",
+  "/api/billing/summary"
+ ],
+ [
+  "GET",
   "/api/comfy/workflows"
  ],
  [
@@ -121,6 +129,14 @@
  ],
  [
   "GET",
+  "/api/plan"
+ ],
+ [
+  "GET",
+  "/api/plan/list"
+ ],
+ [
+  "GET",
   "/api/projects"
  ],
  [
@@ -130,6 +146,10 @@
  [
   "GET",
   "/api/reference-media"
+ ],
+ [
+  "GET",
+  "/api/script/brief"
  ],
  [
   "GET",
@@ -417,6 +437,14 @@
  ],
  [
   "POST",
+  "/api/plan/generate"
+ ],
+ [
+  "POST",
+  "/api/plan/save"
+ ],
+ [
+  "POST",
   "/api/previz/export"
  ],
  [
@@ -433,6 +461,14 @@
  ],
  [
   "POST",
+  "/api/production/redo_segment"
+ ],
+ [
+  "POST",
+  "/api/project/delete"
+ ],
+ [
+  "POST",
   "/api/project/new"
  ],
  [
@@ -446,6 +482,10 @@
  [
   "POST",
   "/api/run"
+ ],
+ [
+  "POST",
+  "/api/script/brief"
  ],
  [
   "POST",

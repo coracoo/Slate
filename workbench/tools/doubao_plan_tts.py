@@ -48,6 +48,19 @@ def decode_tts_response(raw):
     raise RuntimeError('TTS 未返回可解析的音频')
 
 
+def _bill_speech(cfg, text):
+    """TTS 成功补账（kind=speech，units=字符数）；billing 缺失或异常静默。"""
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        if here not in sys.path:
+            sys.path.insert(0, here)
+        import billing
+        billing.bill(cfg, kind="speech", model=(cfg.get("models") or {}).get("speech") or TTS_RESOURCE_ID,
+                     op="synthesize", ok=True, units={"chars": len(str(text or ""))})
+    except Exception:
+        pass
+
+
 def synthesize(text, speaker, out_path, cfg, *, audio_format='mp3', timeout=120):
     if cfg.get('id') != 'doubao' or cfg.get('base_url','').rstrip('/') != 'https://ark.cn-beijing.volces.com/api/plan/v3':
         raise ValueError('TTS 只允许豆包 Agent Plan 配置')
@@ -61,6 +74,7 @@ def synthesize(text, speaker, out_path, cfg, *, audio_format='mp3', timeout=120)
     except urllib.error.HTTPError as exc:
         raise RuntimeError(f'TTS HTTP {exc.code}: '+exc.read().decode('utf-8','replace')[:250]) from exc
     with open(out_path,'wb') as fh: fh.write(audio)
+    _bill_speech(cfg, text)   # 计费补账：合成成功记 kind=speech 一条
     return out_path
 
 

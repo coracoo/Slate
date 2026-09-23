@@ -35,6 +35,8 @@ def _refs(shot, style):
     if scene:
         refs.append(scene if scene.startswith("@") else "@scene:" + scene)
     style_id = str(style.get("image") or "").strip()
+    if style_id == "auto":
+        style_id = ""  # E10：显式"自动"不是真实画风引用，不能拼出 @style:auto
     if style_id:
         refs.append("@style:" + style_id)
     return list(dict.fromkeys(refs))

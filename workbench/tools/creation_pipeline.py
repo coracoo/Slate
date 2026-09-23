@@ -128,7 +128,7 @@ def cmd_expand(proj, vendor, idea, eps_n, episode):
         except (OSError, ValueError) as exc:
             raise ValueError(f"既有大纲无法读取：{exc}")
     else:
-        sys_p, user_p = PM.outline_prompt(idea, eps_n=eps_n, style_text=skill_lib.style_for(proj, "script"))
+        sys_p, user_p = PM.outline_prompt(idea, eps_n=eps_n, style_text=skill_lib.style_for(proj, "script"), proj=proj)
         txt = chat_retry(cli, [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
                          max_tokens=12000, timeout=420, extra=FAST_THINK)
         data = parse_json(txt)
@@ -149,6 +149,8 @@ def cmd_expand(proj, vendor, idea, eps_n, episode):
             e["text"] = old_ep_data[str(e["id"])].get("text") or ""
     data["idea"] = idea
     data["prompt_version"] = PM.PROMPT_VERSION
+    # E10 冻结：记录本次大纲/扩写实际注入的拆剧本 skill（id/name/正文 sha 前12位）
+    data["skill_snapshot"] = skill_lib.skill_snapshot_for(proj, ["script"])
     _dump(outline_path, data)
     # 画风不再自动落 style.json：visual_style 只留在大纲里作参考，
     # 视觉画风统一到资产提炼页手选（故事链路不携带视觉画风）。
@@ -171,7 +173,7 @@ def cmd_expand(proj, vendor, idea, eps_n, episode):
         print(f"[错误] 大纲中没有 {episode}"); sys.exit(1)
     idx = eps.index(tgt)
     prev_s = eps[idx-1].get("summary") if idx > 0 else None
-    sys_p, user_p = PM.expand_episode_prompt(idea, tgt, prev_s, style_text=skill_lib.style_for(proj, "script"))
+    sys_p, user_p = PM.expand_episode_prompt(idea, tgt, prev_s, style_text=skill_lib.style_for(proj, "script"), proj=proj)
     script_txt = chat_retry(cli, [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
                             max_tokens=6000).strip()
     tgt["text"] = script_txt
@@ -606,6 +608,15 @@ def cmd_extract(proj, vendor, ep_id):
         reconcile_characters(proj, cli, text)
     except Exception as e:
         print(f"[警告] 角色跨集校准失败（可重跑 extract 或单独调 reconcile）：{e}")
+    # 平面图初稿（plan v1）：每个场景资产自动出一张，已有同 scene_ref 的跳过；
+    # 失败只警告不阻断——提炼主产物（三件套）已落盘，平面图可稍后在⑥平面推演页补。
+    try:
+        from gen_plan import draft_missing_scene_plans
+        stats = draft_missing_scene_plans(proj, vendor=vendor)
+        if stats.get("生成") or stats.get("失败"):
+            print(f"[完成] 平面图初稿：生成 {stats['生成']} / 跳过已有 {stats['跳过']} / 失败 {stats['失败']}")
+    except Exception as e:
+        print(f"[警告] 平面图初稿生成失败（可稍后在⑥平面推演页生成）：{e}")
 
 def _storyboard_completion(cli, system_prompt, user_prompt):
     """生成并解析分镜 JSON；截断时用压缩约束自动重试一次。"""
@@ -771,6 +782,8 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
            "w": 960, "h": 540, "fps": 24, "set": {}, "env": {},
            "prompt_version": PM.PROMPT_VERSION,
            "script_rev": _rev_of(os.path.join(base, "分集.json")),
+           # E10 冻结：记录本次分镜实际注入的导演风格 skill（id/name/正文 sha 前12位）
+           "skill_snapshot": skill_lib.skill_snapshot_for(proj, ["storyboard"]),
            "actors": {c["id"]: {"name": c.get("name", c["id"]),
                                 "shirt": [(160, 60, 60), (40, 90, 160), (60, 140, 90), (150, 120, 50),
                                           (120, 70, 150), (60, 150, 150)][i % 6],
@@ -824,8 +837,39 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
     print(f"[提示] 可直接进白模页渲染 / 3D 页构建 / 平面图生成")
 
 
-def cmd_assemble(proj, sb_name):
-    """分镜 -> 创作包 manifest：逐镜脚本 + 平面图 + 白模参考(预演包帧) + 用户素材引用。"""
+def collect_plans(proj):
+    """扫 推演/平面图_*.plan.json（plan v1）→ 组装/页面共用的清单（mtime 降序，最新在前）。
+    每张：{name, scene_ref, counts(props/actors/paths 数), validate_ok, canvas_html, path, mtime}；
+    scene_ref = plan 绑定的场景资产 id（--scene 生成时写入，老图没有为 None）；
+    canvas_html = 对应 战略图_平面图_<名>.html 存在则填相对路径否则 None。
+    validate_plan 缺失/异常时 validate_ok=None（不阻断组装）。"""
+    out = []
+    for fp in glob.glob(os.path.join(proj, "推演", "平面图_*.plan.json")):
+        try:
+            plan = json.load(open(fp, encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        name = os.path.basename(fp)[len("平面图_"):-len(".plan.json")]
+        counts = {k: len(plan.get(k) or []) for k in ("props", "actors", "paths")}
+        try:
+            from validate_plan import validate_document
+            validate_ok = not validate_document(plan)["errors"]
+        except Exception:
+            validate_ok = None
+        canvas = os.path.join(proj, "推演", f"战略图_平面图_{name}.html")
+        out.append({"name": name, "scene_ref": plan.get("scene_ref") or None,
+                    "counts": counts, "validate_ok": validate_ok,
+                    "canvas_html": f"推演/战略图_平面图_{name}.html" if os.path.isfile(canvas) else None,
+                    "path": fp, "mtime": os.path.getmtime(fp)})
+    out.sort(key=lambda r: -r["mtime"])
+    return out
+
+
+def cmd_assemble(proj, sb_name, with_diagram=False):
+    """分镜 -> 创作包 manifest：逐镜脚本 + 白模参考(预演包帧) + AI 平面图(plans) + 用户素材引用。
+    with_diagram=False（09-23 起默认）：逐镜平面图（shot_diagram）不再自动生成——
+    平面推演主入口已改由 AI 平面图（plan v1，manifest.plans）承接；
+    想要逐镜调度图的老流程用 CLI `--with-diagram` 手动打开。"""
     jp = os.path.join(proj, "分镜", sb_name)
     if not os.path.isfile(jp):
         print(f"[错误] 分镜不存在: {jp}"); sys.exit(1)
@@ -837,30 +881,51 @@ def cmd_assemble(proj, sb_name):
         pass
     from artifact_provenance import artifact_hash, is_current
     sb_base = os.path.splitext(sb_name)[0]
-    # 平面图（无则生成）
+    # 逐镜平面图（shot_diagram）：默认跳过（主入口已由 AI 平面图承接），--with-diagram 手动生成
     import subprocess
     diag_dir = os.path.join(proj, "推演", f"平面图_{sb_base}")
-    diagram_hash = artifact_hash(cfg, "diagram", "2")
-    diagram_meta = os.path.join(diag_dir, "_provenance.json")
-    old_diagram_hash = ""
-    try:
-        old_diagram_hash = json.load(open(diagram_meta, encoding="utf-8")).get("source_hash", "")
-    except (OSError, ValueError, TypeError):
-        pass
-    if not glob.glob(os.path.join(diag_dir, "*.png")) or old_diagram_hash != diagram_hash:
-        r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "shot_diagram.py"),
-                            jp, "--outdir", diag_dir], capture_output=True, text=True, encoding="utf-8")
-        if r.returncode != 0:
-            print("[警告] 平面图生成失败: " + (r.stderr or r.stdout or "")[-300:])
-        else:
-            json.dump({"source_hash": diagram_hash, "artifact_kind": "diagram", "tool_version": "2"},
-                      open(diagram_meta, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-    # 剧情战略图（每次重组装都刷新——它就是创意包的"主线视图"）
+    if with_diagram:
+        diagram_hash = artifact_hash(cfg, "diagram", "2")
+        diagram_meta = os.path.join(diag_dir, "_provenance.json")
+        old_diagram_hash = ""
+        try:
+            old_diagram_hash = json.load(open(diagram_meta, encoding="utf-8")).get("source_hash", "")
+        except (OSError, ValueError, TypeError):
+            pass
+        if not glob.glob(os.path.join(diag_dir, "*.png")) or old_diagram_hash != diagram_hash:
+            r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "shot_diagram.py"),
+                                jp, "--outdir", diag_dir], capture_output=True, text=True, encoding="utf-8")
+            if r.returncode != 0:
+                print("[警告] 平面图生成失败: " + (r.stderr or r.stdout or "")[-300:])
+            else:
+                json.dump({"source_hash": diagram_hash, "artifact_kind": "diagram", "tool_version": "2"},
+                          open(diagram_meta, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    # 剧情战略图（每次重组装都刷新——它就是拍摄资料包的"主线视图"）；
+    # 项目有 AI 平面图（plan v1）时按分镜 scene_ref 多数镜匹配底图（同场景 S1/S2 共用一张），
+    # 无匹配回退最新一张，无 plan 维持原行为。
+    plans = collect_plans(proj)
+    from plan_adapt import choose_plan
+    chosen = choose_plan(plans, cfg.get("shots") or [])
     strat = os.path.join(proj, "推演", f"战略图_{sb_base}.html")
-    r = subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_map.py"),
-                        jp, "--out", strat], capture_output=True, text=True, encoding="utf-8")
+    strat_cmd = [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "strategy_map.py"),
+                 jp, "--out", strat]
+    if chosen:
+        strat_cmd += ["--plan", chosen["path"]]
+        print(f"[信息] 战略图底图：{chosen['name']}"
+              + (f"（scene_ref={chosen['scene_ref']}）" if chosen.get("scene_ref") else "（最新一张）"))
+    r = subprocess.run(strat_cmd, capture_output=True, text=True, encoding="utf-8")
     if r.returncode != 0:
         print("[警告] 战略图生成失败: " + (r.stderr or r.stdout or "")[-300:])
+    # 平面图帧（plan v1 底图叠加逐镜渲染）：供 ⑦ 创作生成 V 编译参考回流与推演页 V 维度展示；
+    # fail-soft + 幂等（plan/分镜签名不变直接复用，见 plan_frames.ensure_plan_frames）。
+    plan_frames_dir = None
+    if chosen:
+        try:
+            from plan_frames import ensure_plan_frames, frames_dir_for_board
+            if ensure_plan_frames(proj, jp, chosen["path"], log=print):
+                plan_frames_dir = os.path.relpath(frames_dir_for_board(proj, sb_name), proj).replace(os.sep, "/")
+        except Exception as exc:
+            print(f"[警告] 平面图帧渲染失败（忽略）: {exc}")
     # 白模参考（预演包干净帧优先）
     previz = os.path.join(proj, "白模", f"预演包_{sb_base}")
     # 用户素材（拉片素材/ 目录按场景关键词引用）
@@ -868,8 +933,10 @@ def cmd_assemble(proj, sb_name):
     pkg = {"storyboard": "分镜/" + sb_name, "title": cfg.get("title", sb_base),
            "source_hash": artifact_hash(cfg, "prompt", "2"), "artifact_kind": "creation_manifest", "tool_version": "2",
            "strategy_map": f"推演/战略图_{sb_base}.html" if os.path.isfile(strat) else None,
+           "plan_frames_dir": plan_frames_dir,
+           "plans": [{k: p[k] for k in ("name", "scene_ref", "counts", "validate_ok", "canvas_html")} for p in plans],
+           "diagram_note": "逐镜平面图（shot_diagram）已转手动（assemble --with-diagram）；默认由 AI 平面图 plans 承接",
            "shots": [], "materials": [os.path.basename(m) for m in mats]}
-    diag_files = sorted(glob.glob(os.path.join(diag_dir, "*.png")))
     from prompt_compiler import compile_shot
     for i, sh in enumerate(cfg.get("shots") or [], 1):
         sid = str(sh.get("id", f"S{i}"))
@@ -884,7 +951,8 @@ def cmd_assemble(proj, sb_name):
                  "action": sh.get("action", ""),
                  "script": [{"speaker": L.get("speaker"), "text": L.get("line")}
                             for L in (sh.get("lines") or [])],
-                 "diagram": os.path.basename(diag) if os.path.isfile(diag) else None,
+                 # diagram 字段保留兼容旧包：新包默认 None（改由 plans 承接），--with-diagram 才填
+                 "diagram": os.path.basename(diag) if with_diagram and os.path.isfile(diag) else None,
                  "white_ref": ref, "prompt": compiled.get("text", ""),
                  "baseline_prompt": compiled.get("baseline_prompt", ""),
                  "mode_used": compiled.get("mode_used", "baseline"),
@@ -893,9 +961,11 @@ def cmd_assemble(proj, sb_name):
                  "performance_used": bool(compiled.get("performance_used")),
                  "source_hash": compiled.get("source_hash", "")}
         pkg["shots"].append(entry)
+    diag_files = sorted(glob.glob(os.path.join(diag_dir, "*.png"))) if with_diagram else []
     out = os.path.join(proj, "推演", f"创作包_{sb_base}", "manifest.json")
     _dump(out, pkg)
-    print(f"[完成] 创作包 {len(pkg['shots'])} 镜（平面图 {len(diag_files)} 张 / 白模参考见 white_ref / 拉片素材 {len(mats)} 个）")
+    print(f"[完成] 创作包 {len(pkg['shots'])} 镜（AI平面图 {len(plans)} 张 / 拉片素材 {len(mats)} 个"
+          + (f" / 逐镜平面图 {len(diag_files)} 张" if with_diagram else "") + "）")
 
 
 def main():
@@ -906,6 +976,8 @@ def main():
     ap.add_argument("--episode", default=None, help="集 id（缺省全本）")
     ap.add_argument("--out", default=None)
     ap.add_argument("--storyboard", dest="sb", default=None, help="assemble: 分镜文件名")
+    ap.add_argument("--with-diagram", action="store_true",
+                    help="assemble: 手动生成逐镜平面图（shot_diagram）；默认跳过，主入口已由 AI 平面图承接")
     ap.add_argument("--idea", default=None, help="expand: 一段话创作构想（缺省读 剧本/构想.txt）")
     ap.add_argument("--eps", type=int, default=6, help="expand: 目标集数（默认 6）")
     a = ap.parse_args()
@@ -955,7 +1027,7 @@ def main():
     elif a.cmd == "assemble":
         if not a.sb:
             print("[错误] assemble 需要 --storyboard 文件名"); sys.exit(1)
-        cmd_assemble(proj, a.sb)
+        cmd_assemble(proj, a.sb, with_diagram=a.with_diagram)
 
 
 if __name__ == "__main__":

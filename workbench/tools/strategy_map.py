@@ -8,15 +8,20 @@
 数据源：
   分镜.json    shots[].scene_ref/@scene → 定位该镜场景；staging=在场过滤；pos/look=机位；camera_move=运动
   素材/场景.json scenes[].layout{bounds,entry,furniture,markers,spawn} + compass（平面底图）
+  --plan <plan.json>  plan v1 平面图作底图（room/props/zones/openings/走位轨迹；plan_adapt 转换坐标）。
+                      镜头数据缺省时以 plan 补（相机 pos/look、演员站位），已有字段以分镜为准。
+                      不带分镜时为平面图独立渲染模式（每相机一"镜"，纯底图浏览）。
 
 产物: 推演/战略图_<分镜名>.html（自包含，零依赖）
-用法: python strategy_map.py <分镜.json> [--out 路径]
+用法: python strategy_map.py <分镜.json> [--out 路径] [--plan plan.json]
+      python strategy_map.py --plan plan.json [--out 路径]   # 独立渲染 plan
 """
 import sys, os, json, argparse
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 
 def load_scenes(board_path):
@@ -166,15 +171,42 @@ function drawScenePlane(s) {
     ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 3;
     ctx.beginPath(); ctx.moveTo(X - 10, Y); ctx.lineTo(X + 10, Y); ctx.stroke();
     ctx.fillStyle = '#38bdf8'; ctx.textAlign = 'center';
-    ctx.fillText((e.kind || '口') + '·' + (e.at || ''), X, Y - 6);
+    ctx.fillText((e.kind || '口') + (e.at ? '·' + e.at : ''), X, Y - 6);
   }
   for (const f of lay.furniture || []) {
     const X = MX((f.pos || [0, 0])[0]), Y = MZ((f.pos || [0, 0])[1]);
     const w = ((f.size && f.size[0]) || 1.5) / (VIEW.x1 - VIEW.x0) * cv.width;
     const h = ((f.size && f.size[1]) || 1) / (VIEW.z1 - VIEW.z0) * cv.height;
-    ctx.fillStyle = '#334155cc'; ctx.fillRect(X - w / 2, Y - h / 2, w, h);
-    ctx.strokeStyle = '#94a3b8'; ctx.strokeRect(X - w / 2, Y - h / 2, w, h);
+    ctx.fillStyle = '#334155cc';
+    ctx.strokeStyle = '#94a3b8';
+    if (f.shape === 'circle') {
+      ctx.beginPath(); ctx.arc(X, Y, w / 2, 0, 7); ctx.fill(); ctx.stroke();
+    } else {
+      ctx.fillRect(X - w / 2, Y - h / 2, w, h);
+      ctx.strokeRect(X - w / 2, Y - h / 2, w, h);
+    }
     if (f.label || f.kind) { ctx.fillStyle = '#cbd5e1'; ctx.textAlign = 'center'; ctx.fillText(f.label || f.kind, X, Y + 3); }
+  }
+  // plan v1 扩展层：墙多边形 / 命名区域（虚线框）/ plan 走位轨迹（虚线+落点）
+  if ((lay.walls || []).length >= 3) {
+    ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 3; ctx.beginPath();
+    lay.walls.forEach((p, i) => { const X = MX(p[0]), Y = MZ(p[1]); if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); });
+    ctx.closePath(); ctx.stroke();
+  }
+  for (const z of lay.zones || []) {
+    const r = z.rect || [0, 0, 0, 0];
+    ctx.setLineDash([6, 4]); ctx.strokeStyle = '#f472b688'; ctx.lineWidth = 1.5;
+    ctx.strokeRect(MX(r[0]), MZ(r[3]), MX(r[2]) - MX(r[0]), MZ(r[1]) - MZ(r[3]));
+    ctx.setLineDash([]);
+    if (z.label) { ctx.fillStyle = '#f9a8d4'; ctx.font = '11px sans-serif'; ctx.textAlign = 'left';
+      ctx.fillText(z.label, MX(r[0]) + 4, MZ(r[3]) + 14); }
+  }
+  for (const pt of lay.paths || []) {
+    ctx.setLineDash([5, 5]); ctx.strokeStyle = '#34d39999'; ctx.lineWidth = 2; ctx.beginPath();
+    (pt.points || []).forEach((p, i) => { const X = MX(p[0]), Y = MZ(p[1]); if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); });
+    ctx.stroke(); ctx.setLineDash([]);
+    const lp = (pt.points || []).slice(-1)[0];
+    if (lp) { ctx.fillStyle = '#34d399'; ctx.beginPath(); ctx.arc(MX(lp[0]), MZ(lp[1]), 4, 0, 7); ctx.fill(); }
   }
   for (const m of lay.markers || []) {
     const X = MX((m.pos || [0, 0])[0]), Y = MZ((m.pos || [0, 0])[1]);
@@ -275,35 +307,81 @@ draw();
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("storyboard")
+    ap.add_argument("storyboard", nargs="?", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--plan", default=None, help="plan v1 平面图 JSON（作底图；镜头缺省字段以 plan 补）")
     a = ap.parse_args()
-    jp = os.path.abspath(a.storyboard)
-    cfg = json.load(open(jp, encoding="utf-8"))
-    shots = cfg.get("shots") or []
-    if not shots:
-        print("[错误] 无 shots"); sys.exit(1)
-    scenes = load_scenes(jp)
-    from shot_presence import actor_positions
-    for s in shots:
-        s["_scene_id"] = shot_scene_id(s, scenes)
-        s["_actor_positions"] = actor_positions(s,cfg.get('actors') or {},scenes.get(s['_scene_id']))
-    data = {"title": cfg.get("title") or os.path.splitext(os.path.basename(jp))[0],
-            "actors": cfg.get("actors") or {}, "scenes": scenes, "shots": shots}
-    out = a.out or os.path.join(os.path.dirname(os.path.dirname(jp)),
-                                "推演", f"战略图_{os.path.splitext(os.path.basename(jp))[0]}.html")
+    plan = None
+    if a.plan:
+        from plan_adapt import load_plan
+        plan = load_plan(a.plan)
+        if plan is None:
+            print(f"[错误] plan 不存在或解析失败: {a.plan}"); sys.exit(1)
+    if not a.storyboard and plan is None:
+        print("[错误] 需要分镜.json 或 --plan 之一"); sys.exit(1)
+
+    if a.storyboard:
+        jp = os.path.abspath(a.storyboard)
+        cfg = json.load(open(jp, encoding="utf-8"))
+        shots = cfg.get("shots") or []
+        if not shots:
+            print("[错误] 无 shots"); sys.exit(1)
+        scenes = load_scenes(jp)
+        actors = dict(cfg.get("actors") or {})
+        from shot_presence import actor_positions
+        if plan is not None:
+            # plan 底图模式：底图只认 plan（room/props/zones），镜头已有字段以分镜为准
+            from plan_adapt import plan_scene, plan_cameras_world, plan_actor_positions, plan_actors_map
+            scenes = {"_plan": plan_scene(plan)}
+            for aid, info in plan_actors_map(plan).items():
+                actors.setdefault(aid, info)
+            cams = plan_cameras_world(plan)
+            plan_pos = plan_actor_positions(plan)
+        for i, s in enumerate(shots):
+            s["_scene_id"] = "_plan" if plan is not None else shot_scene_id(s, scenes)
+            s["_actor_positions"] = actor_positions(s, cfg.get('actors') or {}, scenes.get(s['_scene_id']))
+            if plan is not None:
+                if not s["_actor_positions"] and plan_pos:
+                    s["_actor_positions"] = dict(plan_pos)
+                if not s.get("pos") and cams:
+                    cam = cams[i % len(cams)]
+                    s["pos"], s["look"] = cam["pos"], cam["look"]
+                    s.setdefault("fov", cam["fov"])
+        title = cfg.get("title") or os.path.splitext(os.path.basename(jp))[0]
+        out = a.out or os.path.join(os.path.dirname(os.path.dirname(jp)),
+                                    "推演", f"战略图_{os.path.splitext(os.path.basename(jp))[0]}.html")
+    else:
+        # 独立渲染 plan：每相机一"镜"（无相机则一个总览镜）
+        from plan_adapt import plan_scene, plan_cameras_world, plan_actor_positions, plan_actors_map
+        scenes = {"_plan": plan_scene(plan)}
+        actors = plan_actors_map(plan)
+        cams = plan_cameras_world(plan)
+        plan_pos = plan_actor_positions(plan)
+        shots = []
+        for i, cam in enumerate(cams or [{"id": "总览", "pos": None, "look": None, "fov": 50}]):
+            shots.append({"id": str(cam.get("id") or f"cam{i+1}"), "dur": 5,
+                          "pos": cam.get("pos"), "look": cam.get("look"),
+                          "fov": cam.get("fov") or 50, "move": "plan", "action": "",
+                          "_scene_id": "_plan", "_actor_positions": dict(plan_pos)})
+        title = f"平面图_{plan.get('name') or 'plan'}"
+        out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.plan)), f"战略图_{title}.html")
+
+    data = {"title": title, "actors": actors, "scenes": scenes, "shots": shots}
     os.makedirs(os.path.dirname(out), exist_ok=True)
     html = HTML.replace("__TITLE__", data["title"]).replace("__DATA__", json.dumps(data, ensure_ascii=False))
     from versions import snapshot
     snapshot(out)
     open(out, "w", encoding="utf-8").write(html)
-    bound = sum(1 for s in shots if s.get("_scene_id"))
-    lay_n = sum(1 for sc in scenes.values() if isinstance((sc.get("layout") or {}).get("bounds"), dict))
-    print(f"[完成] 战略图 {len(shots)} 镜（场景绑定 {bound}/{len(shots)}；{lay_n}/{len(scenes)} 场景带 layout 底图）-> {out}")
-    if scenes and lay_n < len(scenes):
-        print("[警告] 部分场景无 layout（旧版 geometry 文本）——底图退化为空白场地；重提炼场景可补 layout DSL")
-    if not scenes:
-        print("[警告] 项目无 素材/场景.json——战略图退化为无底图模式")
+    if plan is not None:
+        print(f"[完成] 战略图（plan 底图）{len(shots)} 镜 -> {out}")
+    else:
+        bound = sum(1 for s in shots if s.get("_scene_id"))
+        lay_n = sum(1 for sc in scenes.values() if isinstance((sc.get("layout") or {}).get("bounds"), dict))
+        print(f"[完成] 战略图 {len(shots)} 镜（场景绑定 {bound}/{len(shots)}；{lay_n}/{len(scenes)} 场景带 layout 底图）-> {out}")
+        if scenes and lay_n < len(scenes):
+            print("[警告] 部分场景无 layout（旧版 geometry 文本）——底图退化为空白场地；重提炼场景可补 layout DSL")
+        if not scenes:
+            print("[警告] 项目无 素材/场景.json——战略图退化为无底图模式")
     print("OUTPUT:" + out)
 
 

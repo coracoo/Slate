@@ -91,6 +91,8 @@ def normalize_vendors(rows):
             row.setdefault(field,{})
             for k in KINDS: row[field].setdefault(k,'')
         for k,v in default.items(): row.setdefault(k,copy.deepcopy(v))
+        # pricing 单价表（计费用，见 tools/billing.py）只补不覆盖：默认目录不带价格，用户已配置的原样保留
+        if row.get('pricing') is not None and not isinstance(row.get('pricing'),dict): row.pop('pricing',None)
         row['label']=default['label']
         if vid=='gemini' and row.get('note')=='走 OpenAI 兼容端点；拉取模型自动切 ?key= 鉴权':
             row['note']=default['note']

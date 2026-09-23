@@ -12,6 +12,7 @@ test('成功、失败、中断、丢失均通知一次，排队不提前完成',
   const js = ts.transpile(helpers + source, {target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS})
   const context = {exports:{}, reactive:x=>x, toast:(...x)=>notices.push(x),
     fetchJob:async id=>responses.get(id), fetchJobs:async()=>({jobs:[]}),
+    authReady:Promise.resolve(true), isGuest:()=>false,
     sessionStorage:{getItem:()=>null,setItem:()=>{}},
     window:{setTimeout:(fn,ms)=>{if(ms!==3000)timers.push(fn);return timers.length}}, Date, Map, Set}
   vm.runInNewContext(js,context)

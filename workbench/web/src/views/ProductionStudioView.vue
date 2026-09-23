@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { app, projectFiles, toast } from '../stores/app'
 import { trackJob } from '../stores/jobs'
 import { fetchCreate, fetchEnvConfig, mediaUrl, type Vendor } from '../api'
-import { studioData, studioPost, submitStudioJob, type StudioState, type VideoUnit, type ProductionShot, type ProductionItem } from '../utils/productionStudio'
+import { studioData, studioPost, submitStudioJob, submitRedoJob, type StudioState, type VideoUnit, type ProductionShot, type ProductionItem } from '../utils/productionStudio'
 import { useBoardSelection } from '../utils/useBoardSelection'
 import VideoSettings from '../components/VideoSettings.vue'
 import MediaReferences from '../components/MediaReferences.vue'
@@ -184,6 +184,43 @@ async function adopt(item: ProductionItem) {
   try { await studioPost('adopt', {...base(), scope: scope.value, target: currentTarget.value, type: kind.value, item_id: item.id}); await load() }
   catch (e) { error.value = String(e) }
 }
+// ── 局部修补（重做片段）：抽已采用 V 视频的 t0/t1 锚点帧 → 首尾帧生成中段 → 自动拼回 → 新候选（人工采用照旧）
+const redoOpen = ref(false), redoT0 = ref(0), redoT1 = ref(0), redoPrompt = ref(''), redoBusy = ref(false), redoVideoDur = ref(0)
+const redoLength = computed(() => Math.max(0, Math.round((redoT1.value - redoT0.value) * 10) / 10))
+function openRedo() {
+  const u = unit.value
+  if (!u?.video_binding) return
+  redoT0.value = 0; redoT1.value = 0; redoVideoDur.value = 0   // 末点等视频元数据到达后填实际时长
+  redoPrompt.value = u.prompt_video || ''
+  redoOpen.value = true
+}
+function onRedoMeta(event: Event) {
+  const el = event.target as HTMLVideoElement
+  if (Number.isFinite(el.duration) && el.duration > 0) {
+    redoVideoDur.value = el.duration
+    if (!redoT1.value || redoT1.value > el.duration) redoT1.value = Math.round(el.duration * 10) / 10
+  }
+}
+async function submitRedo() {
+  const u = unit.value, project = app.current, name = board.value
+  if (!u?.video_binding || redoBusy.value) return
+  if (!Number.isFinite(redoT0.value) || !Number.isFinite(redoT1.value) || redoT0.value < 0 || redoT1.value <= redoT0.value) { error.value = '修补窗口需满足 0 ≤ 起点 < 终点'; return }
+  if (redoVideoDur.value && redoT1.value > redoVideoDur.value + 0.05) { error.value = `修补终点超出视频实际时长 ${redoVideoDur.value.toFixed(1)}s`; return }
+  redoBusy.value = true; error.value = ''
+  const video_options: Record<string, unknown> = {}
+  if (videoOptions.value.resolution) video_options.resolution = videoOptions.value.resolution
+  if (videoOptions.value.ratio) video_options.ratio = videoOptions.value.ratio
+  try {
+    const result = await submitRedoJob({project, board: name, target: u.id, t0: redoT0.value, t1: redoT1.value,
+      prompt: redoPrompt.value, vendor_id: vendor.value, video_options})
+    redoOpen.value = false
+    await gallery()
+    if (result.id) void trackJob(result.id, `局部修补 ${redoT0.value}–${redoT1.value}s`).then(async () => {
+      if (app.current === project) { await gallery(); if (!dirty.value) await load(); else toast('后台完成，请保存当前编辑后刷新', 'info') }
+    })
+    toast(result.reused ? '已复用同一请求' : '修补任务已提交，产出为新候选待人工采用', 'ok')
+  } catch (e) { error.value = String(e) } finally { redoBusy.value = false }
+}
 watch([() => app.current, board], () => {
   error.value = ''
   try { const old = JSON.parse(localStorage.getItem(selectionKey()) || '{}'); selectedUnit.value = old.unit || ''; selectedShot.value = old.shot || ''; scope.value = old.scope === 'S' ? 'S' : 'V'; kind.value = old.kind === 'image' ? 'image' : 'video' } catch { /* 选择记录损坏不影响分镜源 */ }
@@ -204,6 +241,8 @@ onBeforeUnmount(() => window.clearInterval(timer))
       <nav class="flex gap-3 text-xs text-sky-300"><RouterLink to="/studio/shots">分镜生成</RouterLink><RouterLink to="/studio/asset/voices">角色音色</RouterLink><RouterLink to="/create/free">自由创作 · 音乐 · 全部画廊</RouterLink></nav>
     </header>
     <div v-if="error" role="alert" class="mb-3 rounded-xl bg-rose-950/40 p-3 text-sm text-rose-200">{{ error }}<button class="ml-3" @click="error = ''">×</button></div>
+    <!-- 制作规格（E05）：V 总时长超过单集目标时后端 state 给出提示 -->
+    <div v-if="data?.brief_notice" class="mb-3 rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs-plus text-amber-200">！{{ data.brief_notice }}</div>
     <p v-if="!app.current" class="p-10 text-slate-400">请先选择项目。</p>
     <div v-else class="studio-columns">
       <aside class="glass studio-sidebar">
@@ -289,14 +328,34 @@ onBeforeUnmount(() => window.clearInterval(timer))
         <button class="btn w-full" :disabled="busy || !vendor || !currentTarget || (scope === 'V' && kind === 'image') || (kind === 'video' && !capability?.known)" @click="job('generate')">{{ busy ? '提交中…' : `生成${kind === 'image' ? '关键帧' : '视频'}` }}</button>
         <p class="text-xs text-slate-500">后台执行，可刷新页面。实际时长以生成文件为准；每次产出均保留为候选。</p>
         <button class="text-xs text-sky-300" :disabled="busy" @click="job('recover', true)">接管未确认请求</button>
+        <section v-if="scope === 'V' && kind === 'video' && unit?.video_binding" class="space-y-2 rounded-xl border border-white/10 p-3">
+          <div class="flex items-center justify-between text-sm"><b>已采用视频</b><span v-if="unit.video_stale" class="text-xs text-amber-300">已采用视频待确认</span></div>
+          <video :src="pathUrl(unit.video_binding.path)" controls preload="metadata" class="w-full" />
+          <button class="btn btn-sm w-full" :disabled="busy || !vendor" title="抽首尾锚点帧重做中间段并自动拼回原片" @click="openRedo">局部修补（重做片段）</button>
+          <p class="text-2xs text-slate-500">修补产出只进候选列表，人工采用后剪辑自然归位。</p>
+        </section>
         <section class="space-y-3 border-t border-white/10 pt-4"><div class="flex justify-between text-sm"><b>当前目标产出</b><button @click="gallery">刷新</button></div>
-          <article v-for="item in candidates" :key="item.id" class="rounded-lg bg-black/25 p-2"><p class="mb-2 text-xs text-slate-400">{{ item.status }} · {{ item.created_at }} <span v-if="item.actual_duration">· {{ item.actual_duration }}s</span></p>
+          <article v-for="item in candidates" :key="item.id" class="rounded-lg bg-black/25 p-2"><p class="mb-2 text-xs text-slate-400">{{ item.status }} · {{ item.created_at }} <span v-if="item.actual_duration">· {{ item.actual_duration }}s</span><span v-if="item.redo" class="ml-1 rounded bg-violet-900/60 px-1.5 py-0.5 text-violet-200" :title="item.redo.anchors ? `锚点：${item.redo.anchors.head} / ${item.redo.anchors.tail}` : ''">修补 {{ item.redo.t0 }}–{{ item.redo.t1 }}s</span></p>
             <video v-if="item.type === 'video' && outputPath(item)" :src="pathUrl(outputPath(item))" controls preload="metadata" class="w-full" />
             <img v-else-if="outputPath(item)" :src="pathUrl(outputPath(item))" class="w-full" :alt="item.shot_id" />
             <p v-if="item.note" class="mt-2 break-words text-xs text-amber-200">{{ item.note }}</p><button v-if="item.status === 'done'" class="btn btn-sm mt-2" @click="adopt(item)">采用此{{ item.type === 'image' ? '关键帧' : '视频' }}</button>
           </article><p v-if="!candidates.length" class="text-xs text-slate-500">暂无候选</p>
         </section>
       </aside>
+    </div>
+    <!-- 局部修补面板：视频预览 + 起止时间 + 提示词（预填原 prompt_video 可改），提交走 trackJob 既有模式 -->
+    <div v-if="redoOpen && unit?.video_binding" class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 p-4" @click.self="redoOpen = false">
+      <div class="glass w-full max-w-xl space-y-3 p-4">
+        <div class="flex items-center justify-between"><b class="text-sky-200">局部修补 · {{ unit.label }}</b><button class="text-slate-400" @click="redoOpen = false">×</button></div>
+        <video :src="pathUrl(unit.video_binding.path)" controls preload="metadata" class="w-full rounded-lg" @loadedmetadata="onRedoMeta" />
+        <div class="flex gap-3 text-xs text-slate-400">
+          <label class="flex-1">起点（秒）<input v-model.number="redoT0" type="number" min="0" step="0.1" class="control mt-1" /></label>
+          <label class="flex-1">终点（秒）<input v-model.number="redoT1" type="number" min="0" step="0.1" class="control mt-1" /></label>
+        </div>
+        <p class="text-2xs text-slate-500">重做 {{ redoT0 }}–{{ redoT1 }}s（{{ redoLength }}s 新片段）：抽两端锚点帧走首尾帧模式生成，成功后自动拼回原片作为新候选；片段时长须落在所选模型的时长范围内（过短会按模型下限报错）。</p>
+        <label class="block text-xs text-slate-400">修补提示词<textarea v-model="redoPrompt" rows="4" class="control mt-1" /></label>
+        <button class="btn w-full" :disabled="redoBusy || !vendor || !redoLength" @click="submitRedo">{{ redoBusy ? '提交中…' : '提交修补任务' }}</button>
+      </div>
     </div>
   </div>
 </template>
