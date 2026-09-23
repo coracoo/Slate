@@ -32,16 +32,15 @@ function viewOf(s: any): string {
         <tr class="text-slate-300">
           <th class="border-b border-line px-2 py-1.5">镜号</th>
           <th class="border-b border-line px-2 py-1.5">场景</th>
-          <th class="border-b border-line px-2 py-1.5">景别</th>
           <th class="border-b border-line px-2 py-1.5 w-16">时长s</th>
+          <th class="border-b border-line px-2 py-1.5">机位(视角)</th>
+          <th class="border-b border-line px-2 py-1.5">器械</th>
+          <th class="border-b border-line px-2 py-1.5">镜头</th>
+          <th class="border-b border-line px-2 py-1.5">运镜</th>
           <th class="border-b border-line px-2 py-1.5 min-w-40">内容</th>
           <th class="border-b border-line px-2 py-1.5 min-w-36">动作</th>
           <th class="border-b border-line px-2 py-1.5 min-w-28">声音</th>
-          <th class="border-b border-line px-2 py-1.5">机位(视角)</th>
-          <th class="border-b border-line px-2 py-1.5">运镜</th>
           <th class="border-b border-line px-2 py-1.5 min-w-28">光影</th>
-          <th class="border-b border-line px-2 py-1.5">器械</th>
-          <th class="border-b border-line px-2 py-1.5">镜头</th>
           <th class="border-b border-line px-2 py-1.5 min-w-40">台词</th>
           <th class="border-b border-line px-2 py-1.5 min-w-48">提示词</th>
         </tr>
@@ -50,10 +49,9 @@ function viewOf(s: any): string {
         <tr v-for="s in shots" :key="s.id" class="align-top hover:bg-white/5">
           <td class="whitespace-nowrap border-b border-line-soft px-2 py-1 font-black text-sky-300">{{ s.id }}</td>
           <td class="border-b border-line-soft px-2 py-1">
-            <span class="rounded px-1 text-2xs" :class="s.scene === 'field' ? 'bg-amber-400/15 text-amber-300' : 'bg-white/10 text-slate-400'">{{ s.scene }}</span>
+            <span class="rounded px-1 text-2xs font-bold" :class="s.scene === 'field' ? 'bg-amber-400/15 text-amber-300' : s.scene === 'room' ? 'bg-white/10 text-slate-400' : 'bg-violet-400/15 text-violet-300'">{{ s.scene === 'field' ? '外景' : s.scene === 'room' ? '室内' : (s.scene || '—') }}</span>
           </td>
-          <td class="whitespace-nowrap border-b border-line-soft px-2 py-1 text-slate-300">{{ s.shot_size }}</td>
-          <td class="border-b border-line-soft px-2 py-1 text-center tabular-nums text-slate-200">{{ s.dur }}</td>
+          <td class="border-b border-line-soft px-2 py-1 text-center tabular-nums text-slate-200">{{ s.dur ?? 4 }}</td>
           <td class="whitespace-pre-line border-b border-line-soft px-2 py-1 leading-relaxed text-slate-300">{{ s.content }}</td>
           <td class="whitespace-pre-line border-b border-line-soft px-2 py-1 leading-relaxed text-slate-200">{{ s.action }}</td>
           <td class="whitespace-pre-line border-b border-line-soft px-2 py-1 leading-relaxed text-slate-400">{{ s.sound }}</td>
