@@ -98,6 +98,11 @@ def terminate_tree(proc):
 
 
 def main():
+    # 解释器守卫（与 server.py 同款）：用错 Python 时给出明确指引，而不是崩溃循环
+    if sys.version_info[:2] != (3, 12):
+        log("当前解释器是 Python {}.{}，Slate 必须 3.12——请用：.\\.venv\\Scripts\\python.exe workbench\\keepalive.py 8775（或双击 启动工作台.bat）".format(
+            sys.version_info.major, sys.version_info.minor))
+        sys.exit(1)
     port = sys.argv[1] if len(sys.argv) > 1 else '8775'
     # 单实例锁（P05）：已有守护在跑直接退出，杜绝双守护抢端口；该提示走 log()（自带 pythonw 防护）
     guard = acquire_guard()
