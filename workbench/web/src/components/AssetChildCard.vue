@@ -6,6 +6,8 @@ import type { AssetRegistryItem } from '../api'
 import Versions from './Versions.vue'
 import { deleteAssetImage } from '../api'
 import { toast } from '../stores/app'
+import { computed } from 'vue'
+import { RouterLink } from 'vue-router'
 
 /** kind → 素材目录名（与后端 projects/<项目>/素材/<目录>/<id>.png 约定一致）。 */
 const KIND_DIR: Record<string, string> = { character: '人物', scene: '场景', prop: '道具' }
@@ -32,6 +34,9 @@ const emit = defineEmits<{
   (e: 'deleted'): void
 }>()
 
+/** 平面图派生（usage=plan）：独立链路——由 plan.json 确定性渲染，不走生图、不可删除，管理入口在⑥平面推演 */
+const isPlan = computed(() => props.child.usage === 'plan')
+
 async function delChild() {
   const c = props.child
   if (!confirm(`删除子素材图「${c.name}」（${c.id}）？\n删除前自动快照到 .versions，可从版本面板恢复。`)) return
@@ -51,10 +56,14 @@ async function delChild() {
     @dragend.stop="emit('drag-end', $event)">
     <button v-if="imageUrlOf(child)" class="block h-24 w-full overflow-hidden rounded-lg border border-line bg-black/20" @click="emit('show', child)"><img :src="imageUrlOf(child)" class="h-full w-full object-contain" :alt="child.name" /></button>
     <div v-else class="flex h-24 items-center justify-center rounded-lg border border-dashed border-line text-2xs text-slate-500">子图未生成</div>
-    <div class="mt-1 flex items-center gap-1"><button class="min-w-0 flex-1 truncate text-left text-xs text-slate-200 underline-offset-2 transition hover:text-cyan-200 hover:underline" @click="emit('details', child)">{{ child.name }}</button></div>
+    <div class="mt-1 flex items-center gap-1"><button class="min-w-0 flex-1 truncate text-left text-xs text-slate-200 underline-offset-2 transition hover:text-cyan-200 hover:underline" @click="emit('details', child)">{{ child.name }}</button><span v-if="isPlan" class="shrink-0 rounded bg-violet-400/15 px-1 text-2xs font-bold text-violet-300">平面图</span></div>
     <div class="text-2xs text-slate-500">{{ relationLabel(child) }}</div>
-    <div class="mt-1 flex gap-1"><button class="btn btn-ghost btn-sm flex-1" :disabled="genDisabled" @click="emit('gen', child)">{{ genning === child.kind + child.id ? '生成中…' : '生成子图' }}</button><Versions :path="'projects/' + project + '/素材/' + (KIND_DIR[child.kind] || '人物') + '/' + child.id + '.png'" kind="image" @restored="emit('restored')" @deleted="emit('deleted')" /></div>
-    <button class="mt-1 w-full rounded border border-rose-400/30 py-0.5 text-2xs text-rose-300 transition hover:bg-rose-400/10"
+    <div class="mt-1 flex gap-1">
+      <RouterLink v-if="isPlan" to="/package" class="btn btn-ghost btn-sm flex-1 text-center" title="平面图由 plan.json 确定性渲染；编辑/重渲染请到平面推演页">去平面推演</RouterLink>
+      <button v-else class="btn btn-ghost btn-sm flex-1" :disabled="genDisabled" @click="emit('gen', child)">{{ genning === child.kind + child.id ? '生成中…' : '生成子图' }}</button>
+      <Versions :path="'projects/' + project + '/素材/' + (KIND_DIR[child.kind] || '人物') + '/' + child.id + '.png'" kind="image" @restored="emit('restored')" @deleted="emit('deleted')" />
+    </div>
+    <button v-if="!isPlan" class="mt-1 w-full rounded border border-rose-400/30 py-0.5 text-2xs text-rose-300 transition hover:bg-rose-400/10"
       title="删除子素材图（删除前自动快照到 .versions，可从版本面板恢复）" @click="delChild">删除子素材图</button>
   </div>
 </template>

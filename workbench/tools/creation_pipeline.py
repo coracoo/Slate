@@ -716,7 +716,7 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
     if not shots:
         print("[错误] LLM 未产出 shots:\n" + txt[:400]); sys.exit(1)
     from production_prompts import require_prompts, normalize_prompts, source_hash
-    from production_studio import default_units, validate_units, shot_list, retain_production
+    from production_studio import default_units, validate_units, shot_list, retain_production, auto_split_units
     require_prompts(shots)
     for shot in shots:
         normalize_prompts(shot)
@@ -835,6 +835,10 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
     units = split_units_by_scene(cfg, units)
     if len(units) != pre:
         print(f"[自愈] {pre} 个 V 中存在跨场景/缺场景引用，已按场景切分为 {len(units)} 个；请到⑦核对各段汇总提示词")
+    pre = len(units)
+    units = auto_split_units(cfg, units)
+    if len(units) != pre:
+        print(f"[自愈] {pre} 个 V 中存在超时长分组，已按时长上限自动拆分为 {len(units)} 个；片段继承了原汇总提示词，请到⑦按片段核对重写")
     validate_units(cfg, units)
     cfg['video_units'] = units
     if os.path.isfile(out):

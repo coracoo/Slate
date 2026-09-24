@@ -5,6 +5,7 @@ import unittest
 import copy
 import json
 import tempfile
+from unittest import mock
 from unittest.mock import Mock, patch
 from pathlib import Path
 
@@ -429,3 +430,36 @@ class VoiceBindingTests(unittest.TestCase):
             self.assertEqual(voice_assets.video_voices(root, [{'actor_refs': ['@character:hero'], 'lines': []}]), [])
             got = voice_assets.video_voices(root, [{'lines': [{'speaker': 'hero'}, {'speaker': 'narrator'}]}])
             self.assertEqual([v['character_id'] for v in got], ['hero'])
+
+
+class StoryboardGenerationChainTests(unittest.TestCase):
+    """分镜生成链（cmd_storyboard）：LLM 超上限分组落盘前按时长自动拆，不再整单打回。"""
+
+    def test_over_cap_llm_grouping_auto_splits_and_writes(self):
+        import creation_pipeline as cp
+        shots = [{"id": f"S{i}", "dur": 4, "shot_size": "中景", "camera_move": "固定",
+                  "angle": "平视", "cam": "wide", "scene": "room", "action": "甲走动",
+                  "prompt_image": f"静帧{i}", "prompt_video": f"运动{i}", "lines": []}
+                 for i in range(1, 7)]
+        llm_out = {"shots": shots,
+                   "video_units": [{"shot_ids": [f"S{i}" for i in range(1, 7)],
+                                    "title": "整段", "prompt_video": "整段汇总视频描述"}]}
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td)
+            (project / "剧本").mkdir()
+            (project / "剧本" / "分集.json").write_text(json.dumps(
+                {"episodes": [{"id": "E1", "text": "甲在车间走动。"}], "rev": 1},
+                ensure_ascii=False), encoding="utf-8")
+            (project / "素材").mkdir()
+            (project / "素材" / "场景.json").write_text(json.dumps(
+                {"scenes": [{"id": "cj", "name": "车间"}]}, ensure_ascii=False), encoding="utf-8")
+            with mock.patch.object(cp, "pick_vendor", lambda v=None: "fake"), \
+                 mock.patch.object(cp, "VendorClient", lambda vid: object()), \
+                 mock.patch.object(cp, "chat_retry",
+                                   lambda *a, **k: json.dumps(llm_out, ensure_ascii=False)):
+                cp.cmd_storyboard(str(project), None, "E1")
+            cfg = json.loads((project / "分镜" / "剧本_E1.json").read_text(encoding="utf-8"))
+            units = cfg["video_units"]
+            self.assertEqual([u["shot_ids"] for u in units], [["S1", "S2", "S3"], ["S4", "S5", "S6"]])
+            self.assertTrue(all(u["duration"] == 12 for u in units))
+            self.assertTrue(all(u["prompt_video"] == "整段汇总视频描述" for u in units))

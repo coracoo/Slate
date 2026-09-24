@@ -27,6 +27,7 @@ class DeleteAssetImageTests(unittest.TestCase):
         png.write_bytes(b"fake-png")
         idx = {"场景": {
             "a": {"path": "素材/场景/a.png", "name": "中军帐", "source_episode_ids": ["E1"]},
+            "a_sub": {"path": "素材/场景/a_sub.png", "name": "中军帐·挂毯"},
             "a__plan": {"path": "素材/场景/a__plan.png", "name": "中军帐·平面图", "usage": "plan",
                         "parent_ref": "@scene:a", "source_episode_ids": ["E1"]},
         }}
@@ -36,15 +37,26 @@ class DeleteAssetImageTests(unittest.TestCase):
         self._td.cleanup()
 
     def test_delete_removes_file_sidecar_and_index_entry(self):
-        side = self.proj / "素材" / "场景" / "a__plan.png.comfy-task.json"
+        (self.proj / "素材" / "场景" / "a_sub.png").write_bytes(b"sub")
+        side = self.proj / "素材" / "场景" / "a_sub.png.comfy-task.json"
         side.write_text("{}", encoding="utf-8")
-        rel = gen_asset_images.delete_asset_image(str(self.proj), "scene", "a__plan")
-        self.assertEqual(rel.replace("\\", "/"), "素材/场景/a__plan.png")
-        self.assertFalse((self.proj / "素材" / "场景" / "a__plan.png").exists())
+        rel = gen_asset_images.delete_asset_image(str(self.proj), "scene", "a_sub")
+        self.assertEqual(rel.replace("\\", "/"), "素材/场景/a_sub.png")
+        self.assertFalse((self.proj / "素材" / "场景" / "a_sub.png").exists())
         self.assertFalse(side.exists())
         idx = json.load(open(self.proj / "素材" / "素材图.json", encoding="utf-8"))
-        self.assertNotIn("a__plan", idx["场景"])
+        self.assertNotIn("a_sub", idx["场景"])
         self.assertIn("a", idx["场景"])          # 母条目不受影响
+
+    def test_delete_plan_derivative_refused(self):
+        # usage=plan 的条目由 plan.json 驱动，独立链路：不可删除，只可推演页重渲染覆盖
+        idx_path = self.proj / "素材" / "素材图.json"
+        idx = json.load(open(idx_path, encoding="utf-8"))
+        idx["场景"]["a__plan"]["usage"] = "plan"
+        json.dump(idx, open(idx_path, "w", encoding="utf-8"), ensure_ascii=False)
+        with self.assertRaisesRegex(ValueError, "平面图"):
+            gen_asset_images.delete_asset_image(str(self.proj), "scene", "a__plan")
+        self.assertTrue((self.proj / "素材" / "场景" / "a__plan.png").exists())   # 文件未动
 
     def test_delete_missing_raises(self):
         with self.assertRaises(ValueError):

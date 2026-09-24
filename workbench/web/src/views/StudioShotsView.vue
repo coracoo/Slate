@@ -2,7 +2,7 @@
 import { useBoardSelection } from '../utils/useBoardSelection'
 // -*- coding: utf-8 -*-
 /** ② 分镜生成：按集生成分镜（知识注入）→ 逐镜明细；生成拍摄资料包 → 包明细 */
-import { ref, computed, watch } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   fetchScriptData, fetchWhiteBoard, fetchCreate, scriptStoryboard,
@@ -92,6 +92,7 @@ async function loadBoard() {
   shots.value = []
   shotOutputs.value = {}
   boardRev.value = null
+  detail.value = null
   if (!project || !name) return
   try {
     const b: WhiteBoard = await fetchWhiteBoard(project, name)
@@ -147,6 +148,17 @@ watch(board, loadBoard)
 const sbRunning = ref<string[]>([])
 const kbHits = ref<KnowledgeSkill[]>([])
 const viewTab = ref<'grid' | 'cards'>('grid')
+/** 汇总表格全屏：默认随页面流展示全部行；全屏=fixed overlay 一眼看全（Esc 或按钮退出） */
+const gridFullscreen = ref(false)
+function onGridKey(e: KeyboardEvent) {
+  if (e.key === 'Escape' && gridFullscreen.value) gridFullscreen.value = false
+}
+onMounted(() => window.addEventListener('keydown', onGridKey))
+onUnmounted(() => window.removeEventListener('keydown', onGridKey))
+watch(viewTab, (tab) => {
+  gridFullscreen.value = false
+  if (tab === 'cards' && shots.value.length && !detail.value) detail.value = shots.value[0]
+})
 const gridDirty = ref(false)
 const savingGrid = ref(false)
 
@@ -433,6 +445,8 @@ useBoardSelection(board, boards, 'shots')
           <span class="flex-1"></span>
           <template v-if="viewTab === 'grid'">
             <span v-if="gridDirty" class="text-xs-plus text-amber-300">有未保存修改</span>
+            <button class="btn btn-ghost" :disabled="!shots.length"
+              @click="gridFullscreen = !gridFullscreen">{{ gridFullscreen ? '退出全屏 (Esc)' : '全屏' }}</button>
             <button class="btn btn-ghost" :disabled="!shots.length" title="按景别/运镜为空白格填默认镜头焦距与器械"
               @click="fillDefaults">补默认</button>
             <button class="btn btn-ghost" :disabled="savingGrid" @click="doXlsx">导出 Excel</button>
@@ -445,7 +459,7 @@ useBoardSelection(board, boards, 'shots')
         <!-- 汇总表格（Excel 式）：镜号/场景/时长/机位视角/器械/镜头/运镜/内容/动作/声音/光影/台词/三提示词（景别数据保留在 JSON 与逐镜明细） -->
         <div v-if="viewTab === 'grid'">
           <div v-if="!shots.length" class="py-10 text-center text-sm text-slate-500">选择或生成一个剧本分镜</div>
-          <div v-else class="modal-h-sm overflow-auto rounded-lg border border-line">
+          <div v-else :class="gridFullscreen ? 'fixed inset-0 z-50 overflow-auto bg-[#0a0e17] p-4' : 'overflow-x-auto rounded-lg border border-line'">
             <table class="tbl-view border-collapse">
               <thead>
                 <tr>
@@ -493,81 +507,76 @@ useBoardSelection(board, boards, 'shots')
           </div>
         </div>
 
-        <!-- 逐镜明细（卡片） -->
+        <!-- 逐镜明细：左列表 + 右详情（主从布局，无弹窗） -->
         <div v-else>
-        <div v-if="!shots.length" class="py-10 text-center text-sm text-slate-500">选择或生成一个剧本分镜</div>
-        <div class="grid gap-2 md:grid-cols-2">
-          <button v-for="s in shots" :key="s.id" class="rounded-lg bg-white/5 p-2.5 text-left transition hover:bg-white/10" @click="detail = s">
-            <div class="flex flex-wrap items-center gap-1.5">
-              <span class="rounded bg-sky-400/15 px-1.5 py-0.5 text-xs-plus font-black text-sky-300">{{ s.id }}</span>
-              <span class="text-xs-plus text-slate-300">{{ s.move || s.shot_size }}</span>
-              <span class="rounded bg-white/5 px-1 text-2xs text-slate-500">{{ s.cam }}</span>
-              <span class="ml-auto text-2xs text-slate-500">{{ s.dur }}s</span>
+          <div v-if="!shots.length" class="py-10 text-center text-sm text-slate-500">选择或生成一个剧本分镜</div>
+          <div v-else class="flex items-start gap-3">
+            <!-- 左：镜头列表 -->
+            <div class="modal-h-lg w-64 shrink-0 overflow-y-auto rounded-lg border border-line">
+              <button v-for="s in shots" :key="s.id"
+                class="flex w-full items-center gap-2 border-b border-line-soft px-2.5 py-2 text-left transition"
+                :class="detail?.id === s.id ? 'bg-sky-400/10' : 'hover:bg-white/5'"
+                @click="detail = s">
+                <div class="h-9 w-14 shrink-0 overflow-hidden rounded border border-line bg-black/30">
+                  <img v-if="shotOutput(s)?.image" :src="mediaUrl(shotOutput(s)!.image!)" class="h-full w-full object-cover" loading="lazy" :alt="`${s.id} 参考图`" />
+                  <div v-else class="flex h-full items-center justify-center text-2xs text-slate-600">无图</div>
+                </div>
+                <div class="min-w-0 flex-1">
+                  <div class="flex items-center gap-1.5">
+                    <span class="font-black text-sky-300">{{ s.id }}</span>
+                    <span class="truncate text-2xs text-slate-400">{{ s.move || s.shot_size }}</span>
+                    <span class="ml-auto shrink-0 text-2xs tabular-nums text-slate-500">{{ s.dur }}s</span>
+                  </div>
+                  <div class="mt-0.5 truncate text-2xs text-slate-500">{{ s.action || s.prompt || '未填写动作摘要' }}</div>
+                </div>
+              </button>
             </div>
-            <div class="mt-2 flex gap-2">
-              <div class="h-14 w-24 shrink-0 overflow-hidden rounded-md border border-line bg-black/30">
-                <img v-if="shotOutput(s)?.image" :src="mediaUrl(shotOutput(s)!.image!)" class="h-full w-full object-cover" loading="lazy" :alt="`${s.id} 参考图`" />
-                <div v-else class="flex h-full items-center justify-center text-2xs text-slate-500">暂无缩略图</div>
+            <!-- 右：镜详情 -->
+            <div v-if="detail" class="modal-h-lg min-w-0 flex-1 overflow-y-auto rounded-lg border border-line p-3">
+              <div class="mb-3 flex flex-wrap items-center gap-3">
+                <span class="rounded bg-sky-400/15 px-2 py-0.5 text-sm font-black text-sky-300">{{ detail.id }}</span>
+                <b class="text-base text-slate-100">{{ detail.move }}</b>
+                <span class="text-xs text-slate-500">{{ detail.dur }}s · {{ detail.scene }}</span>
+                <span class="text-2xs text-slate-500">{{ outputStatusLabel(shotOutput(detail)?.status) }}<span v-if="shotOutput(detail)?.count"> · {{ shotOutput(detail)?.count }} 次产出</span></span>
               </div>
-              <div class="min-w-0 flex-1">
-                <div class="line-clamp-2 text-xs-plus text-slate-400">{{ s.action || s.prompt || '未填写动作摘要' }}</div>
-                <div class="mt-1 flex items-center gap-1.5 text-2xs text-slate-500">
-                  <span>{{ outputStatusLabel(shotOutput(s)?.status) }}</span>
-                  <span v-if="shotOutput(s)?.count">· {{ shotOutput(s)?.count }} 次产出</span>
+              <details class="mb-3 rounded-lg border border-line-soft bg-black/15 px-2 py-1.5">
+                <summary class="cursor-pointer text-2xs text-slate-500">高级：主角演员表现候选（可选）</summary>
+                <div class="mt-2 flex flex-wrap items-center gap-2">
+                  <button class="btn" :disabled="actingCompiling" @click="detail && doActingPrompt(detail)">
+                    {{ actingCompiling ? '编译中…' : '编译主角演员表现' }}
+                  </button>
+                  <button class="btn btn-ghost" :disabled="!!busy || !actingVendor" @click="detail && doRunActing(detail)">
+                    {{ actingVendor ? '生成主角演员候选' : '请先配置 text 厂商' }}
+                  </button>
+                  <span class="text-2xs text-slate-500">只补表情、视线和节奏，不改变镜头机位、走位和台词</span>
+                </div>
+              </details>
+              <div class="space-y-3 text-xs">
+                <div class="grid grid-cols-2 gap-2">
+                  <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">景别/角度</b><p class="mt-1 text-slate-200">{{ detail.shot_size }} · {{ detail.angle }}</p></div>
+                  <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">运镜/转场</b><p class="mt-1 text-slate-200">{{ detail.camera_move }} · {{ detail.transition }}</p></div>
+                  <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">机位 pos</b><p class="mt-1 font-mono text-slate-200">{{ JSON.stringify(detail.pos) }}</p></div>
+                  <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">视点 look</b><p class="mt-1 font-mono text-slate-200">{{ JSON.stringify(detail.look) }}</p></div>
+                </div>
+                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-emerald-300">动作</b><p class="mt-1 text-slate-300">{{ detail.action || '—' }}</p></div>
+                <div class="rounded-lg bg-violet-400/5 p-2.5"><b class="text-violet-300">静态参考图提示词</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.prompt_image || detail.prompt || '—' }}</p></div>
+                <div class="rounded-lg bg-sky-400/5 p-2.5"><b class="text-sky-300">生视频提示词</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.prompt_video || '尚未重建' }}</p></div><div class="rounded-lg bg-violet-400/5 p-2.5"><b class="text-violet-300">宫格布局提示词</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.prompt_grid || '待 LLM 补全' }}</p></div>
+                <div v-if="detail.asset_refs?.length" class="rounded-lg bg-cyan-400/5 p-2.5"><b class="text-cyan-300">关联资产</b><p class="mt-1 break-all text-slate-300">{{ detail.asset_refs.join('、') }}</p></div>
+                <div v-if="detail.asset_revisions" class="rounded-lg bg-amber-400/5 p-2.5"><b class="text-amber-300">资产修订</b><p class="mt-1 break-all text-slate-300">{{ Object.entries(detail.asset_revisions).map(([ref, rev]) => `${ref} v${rev}`).join(' · ') }}</p></div>
+                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">本镜产出</b><img v-if="shotOutput(detail)?.image" :src="mediaUrl(shotOutput(detail)!.image!)" class="mt-2 aspect-video w-full rounded-md border border-line bg-black object-contain" loading="lazy" :alt="`${detail.id} 参考图`" /></div>
+                <div v-if="actingPrompt" class="rounded-lg bg-emerald-400/10 p-2.5"><b class="text-emerald-300">演员层编译结果</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ actingPrompt }}</p></div>
+                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-amber-300">台词轨</b>
+                  <div v-for="(L, i) in detail.lines || []" :key="i" class="mt-1 text-slate-300">
+                    <span class="text-slate-500">at {{ L.at }}s</span> 【{{ spk(L.speaker) }}】{{ L.line }}
+                  </div>
+                  <div v-if="!detail.lines?.length" class="mt-1 text-slate-500">无台词</div>
                 </div>
               </div>
             </div>
-          </button>
-        </div>
-        </div>
-      </section>
-
-      <!-- 镜明细抽屉 -->
-      <Teleport to="body">
-        <div v-if="detail" class="overlay-end" @click.self="detail = null">
-          <div class="drawer-panel">
-            <div class="mb-4 flex items-center gap-3">
-              <span class="rounded bg-sky-400/15 px-2 py-0.5 text-sm font-black text-sky-300">{{ detail.id }}</span>
-              <b class="text-lg text-slate-100">{{ detail.move }}</b>
-              <span class="text-xs text-slate-500">{{ detail.dur }}s · {{ detail.scene }}</span>
-              <button class="btn btn-ghost ml-auto" @click="detail = null">关闭</button>
-            </div>
-            <details class="mb-3 rounded-lg border border-line-soft bg-black/15 px-2 py-1.5">
-              <summary class="cursor-pointer text-2xs text-slate-500">高级：主角演员表现候选（可选）</summary>
-              <div class="mt-2 flex flex-wrap items-center gap-2">
-                <button class="btn" :disabled="actingCompiling" @click="detail && doActingPrompt(detail)">
-                  {{ actingCompiling ? '编译中…' : '编译主角演员表现' }}
-                </button>
-                <button class="btn btn-ghost" :disabled="!!busy || !actingVendor" @click="detail && doRunActing(detail)">
-                  {{ actingVendor ? '生成主角演员候选' : '请先配置 text 厂商' }}
-                </button>
-                <span class="text-2xs text-slate-500">只补表情、视线和节奏，不改变镜头机位、走位和台词</span>
-              </div>
-            </details>
-            <div class="space-y-3 text-xs">
-              <div class="grid grid-cols-2 gap-2">
-                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">景别/角度</b><p class="mt-1 text-slate-200">{{ detail.shot_size }} · {{ detail.angle }}</p></div>
-                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">运镜/转场</b><p class="mt-1 text-slate-200">{{ detail.camera_move }} · {{ detail.transition }}</p></div>
-                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">机位 pos</b><p class="mt-1 font-mono text-slate-200">{{ JSON.stringify(detail.pos) }}</p></div>
-                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">视点 look</b><p class="mt-1 font-mono text-slate-200">{{ JSON.stringify(detail.look) }}</p></div>
-              </div>
-              <div class="rounded-lg bg-white/5 p-2.5"><b class="text-emerald-300">动作</b><p class="mt-1 text-slate-300">{{ detail.action || '—' }}</p></div>
-              <div class="rounded-lg bg-violet-400/5 p-2.5"><b class="text-violet-300">静态参考图提示词</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.prompt_image || detail.prompt || '—' }}</p></div>
-              <div class="rounded-lg bg-sky-400/5 p-2.5"><b class="text-sky-300">生视频提示词</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.prompt_video || '尚未重建' }}</p></div><div class="rounded-lg bg-violet-400/5 p-2.5"><b class="text-violet-300">宫格布局提示词</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.prompt_grid || '待 LLM 补全' }}</p></div>
-              <div v-if="detail.asset_refs?.length" class="rounded-lg bg-cyan-400/5 p-2.5"><b class="text-cyan-300">关联资产</b><p class="mt-1 break-all text-slate-300">{{ detail.asset_refs.join('、') }}</p></div>
-              <div v-if="detail.asset_revisions" class="rounded-lg bg-amber-400/5 p-2.5"><b class="text-amber-300">资产修订</b><p class="mt-1 break-all text-slate-300">{{ Object.entries(detail.asset_revisions).map(([ref, rev]) => `${ref} v${rev}`).join(' · ') }}</p></div>
-              <div class="rounded-lg bg-white/5 p-2.5"><div class="flex items-center gap-2"><b class="text-slate-400">本镜产出</b><span class="text-2xs text-slate-500">{{ outputStatusLabel(shotOutput(detail)?.status) }}<span v-if="shotOutput(detail)?.count"> · {{ shotOutput(detail)?.count }} 次</span></span></div><img v-if="shotOutput(detail)?.image" :src="mediaUrl(shotOutput(detail)!.image!)" class="mt-2 aspect-video w-full rounded-md border border-line bg-black object-contain" loading="lazy" :alt="`${detail.id} 参考图`" /></div>
-              <div v-if="actingPrompt" class="rounded-lg bg-emerald-400/10 p-2.5"><b class="text-emerald-300">演员层编译结果</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ actingPrompt }}</p></div>
-              <div class="rounded-lg bg-white/5 p-2.5"><b class="text-amber-300">台词轨</b>
-                <div v-for="(L, i) in detail.lines || []" :key="i" class="mt-1 text-slate-300">
-                  <span class="text-slate-500">at {{ L.at }}s</span> 【{{ spk(L.speaker) }}】{{ L.line }}
-                </div>
-                <div v-if="!detail.lines?.length" class="mt-1 text-slate-500">无台词</div>
-              </div>
-            </div>
+            <div v-else class="modal-h-lg flex-1 rounded-lg border border-dashed border-line p-6 text-center text-sm text-slate-500">从左侧选择一个镜头查看详情</div>
           </div>
         </div>
-      </Teleport>
+      </section>
 
     </template>
 

@@ -119,6 +119,9 @@ def delete_asset_image(project, kind, asset_id):
     ent = (index.get(zone) or {}).get(asset_id)
     if not ent or not ent.get("path"):
         raise ValueError(f"索引中没有该素材图：{zone}/{asset_id}")
+    if ent.get("usage") == "plan":
+        raise ValueError("平面图由 plan.json 驱动（确定性渲染缓存），不支持独立删除——"
+                         "请到 ⑥ 平面推演 编辑/重渲染覆盖，PNG 会自动重新生成")
     rel = str(ent["path"]).replace("\\", "/")
     abs_path = os.path.join(os.path.abspath(str(project)), rel)
     if not os.path.isfile(abs_path):
