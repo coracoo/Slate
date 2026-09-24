@@ -3609,6 +3609,21 @@ class H(BaseHTTPRequestHandler):
         jid=self.spawn_job("creation",cmd)
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"id":jid,"job":True},ensure_ascii=False).encode())
 
+    @route('POST', '/api/asset/image/delete')
+    def route_post_api_asset_image_delete(self, ctx):
+        ln = ctx.content_length
+        body=json.loads(self.rfile.read(ln).decode("utf-8","replace") or b"{}")
+        d=proj_dir(body.get("project")); kind=str(body.get("kind") or ""); key=str(body.get("id") or "")
+        if not d or kind not in ("character","scene","prop") or not key or not safe_proj(key):
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"project/kind/id 不合法"},ensure_ascii=False).encode())
+        import importlib.util as _iu
+        _sp=_iu.spec_from_file_location("gai",os.path.join(TOOLS,"gen_asset_images.py"))
+        g=_iu.module_from_spec(_sp); _sp.loader.exec_module(g)
+        try: rel=g.delete_asset_image(d,kind,key)
+        except Exception as e:
+            return self._send_run_error(e)
+        return self._send_run_json(200,{'ok':True,'deleted':rel})
+
     @route('POST', '/api/versions/restore')
     def route_post_api_versions_restore(self, ctx):
         u, q = ctx.url, ctx.query
@@ -3624,6 +3639,22 @@ class H(BaseHTTPRequestHandler):
         try: m.restore(pth,ts)
         except Exception as e:
             return self._send_run_error(e)
+
+    @route('POST', '/api/versions/delete')
+    def route_post_api_versions_delete(self, ctx):
+        ln = ctx.content_length
+        body=json.loads(self.rfile.read(ln).decode("utf-8","replace") or b"{}")
+        rel=str(body.get("p") or ""); ts=str(body.get("ts") or "")
+        pth=os.path.normpath(os.path.join(VIDEO,rel))
+        if not under(VIDEO,pth) or not re.fullmatch(r"\d{8}_\d{6}(?:_\d+)?",ts):
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"路径或版本号不合法"},ensure_ascii=False).encode())
+        import importlib.util as _iu
+        _sp=_iu.spec_from_file_location("versions",os.path.join(TOOLS,"versions.py"))
+        m=_iu.module_from_spec(_sp); _sp.loader.exec_module(m)
+        try: removed=m.delete_version(pth,ts)
+        except Exception as e:
+            return self._send_run_error(e)
+        return self._send_run_json(200,{'ok':True,'removed':os.path.relpath(removed,VIDEO)})
         return self._send(200,"application/json",json.dumps({"ok":True},ensure_ascii=False).encode())
 
     @route('POST', '/api/storyboard/save')

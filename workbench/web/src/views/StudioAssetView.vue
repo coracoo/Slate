@@ -4,6 +4,7 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount, reactive, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import {
+  deleteAssetImage,
   fetchScriptData, scriptExtract, genAssetImage, fetchEnvConfig, fetchAssets, fetchAssetPromptLayers, createAsset, editAsset, saveAssetRelations, rebuildProductionPrompts, queueChatGPTAssets, fetchChatGPTJobs, importChatGPTPackage, importChatGPTImages, mediaUrl, getJSON,
   type ScriptBundle, type CharacterItem, type SceneItem, type PropItem, type Vendor, type AssetRegistryItem, type AssetStateItem, type ChatGPTJobSummary, type SkillItem, type AssetPromptLayers
 } from '../api'
@@ -546,6 +547,17 @@ async function doGen(kind: string, id?: string, force = false, states?: 'include
   }
 }
 
+async function delAssetImage(kind: 'character' | 'scene' | 'prop', id: string) {
+  if (!app.current) return
+  const tip = `删除素材图「${id}」？删除前自动快照到 .versions，可从版本面板恢复。`
+  if (!confirm(tip)) return
+  try {
+    await deleteAssetImage(app.current, kind, id)
+    toast('素材图已删除', 'ok')
+    await load()
+  } catch (e) { toast(e instanceof Error ? e.message : '删除失败', 'err') }
+}
+
 async function queueChatGPTAssetRefs(refs: Array<string | { ref: string; state_id?: string }>) {
   if (!app.current || !refs.length) return
   genning.value = 'chatgpt'
@@ -745,7 +757,7 @@ function parentAsset(row?: AssetRegistryItem | null) {
             :gen-disabled="!!genning || (!selectedVendor && !isChatGPTQueue)" :drag-target="dragTargetRef"
             @details="openAssetDetails" @show="showAsset" @gen="doGen('character', c.id, true, 'skip')"
             @create-child="openCreate('child', assetRef('character', c.id))" @child-gen="openChildGen"
-            @drag-start="startAssetDrag" @drag-over="dragOverAsset" @drop="dropAsset" @drag-end="endAssetDrag" @restored="load">
+            @drag-start="startAssetDrag" @drag-over="dragOverAsset" @drop="dropAsset" @drag-end="endAssetDrag" @restored="load" @deleted="load">
             <template #badge><span class="ml-2 rounded bg-amber-400/15 px-1.5 text-2xs text-amber-300">{{ c.role || '角色' }}</span></template>
             <template #meta>{{ c.id }} · {{ c.basis || '项目母素材' }}</template>
             <template #states>
@@ -758,6 +770,9 @@ function parentAsset(row?: AssetRegistryItem | null) {
                     <div class="mt-1 truncate text-xs text-slate-200" :title="st.look_diff">{{ st.label }}</div>
                     <div class="text-2xs text-slate-500">派生状态{{ st.camp && st.camp !== '不明' ? ' · ' + st.camp : '' }}</div>
                     <div class="mt-1 flex gap-1"><button class="btn btn-ghost btn-sm flex-1" :disabled="!!genning || (!selectedVendor && !isChatGPTQueue)" :title="'以本角色母图为参考' + (st.path ? '重新生成该状态图（旧版本自动保存）' : '生成该状态图') + '；母图不受影响'" @click="doGen('character', c.id, true, 'only', st.id)">{{ genning === 'character' + c.id + '#' + st.id ? '生成中…' : '生成派生图' }}</button><Versions :path="'projects/' + app.current + '/素材/人物/' + c.id + '__' + st.id + '.png'" kind="image" @restored="load" /></div>
+                    <button class="w-full rounded border border-rose-400/30 py-0.5 text-2xs text-rose-300 transition hover:bg-rose-400/10"
+                      title="删除该状态派生图（删除前自动快照到 .versions，可从版本面板恢复）"
+                      @click="delAssetImage('character', c.id + '__' + st.id)">删除状态图</button>
                   </div>
                 </div>
               </div>
@@ -774,7 +789,7 @@ function parentAsset(row?: AssetRegistryItem | null) {
             :gen-disabled="!!genning || (!selectedVendor && !isChatGPTQueue)" :drag-target="dragTargetRef"
             @details="openAssetDetails" @show="showAsset" @gen="doGen('scene', s.id, true)"
             @create-child="openCreate('child', assetRef('scene', s.id))" @child-gen="openChildGen"
-            @drag-start="startAssetDrag" @drag-over="dragOverAsset" @drop="dropAsset" @drag-end="endAssetDrag" @restored="load">
+            @drag-start="startAssetDrag" @drag-over="dragOverAsset" @drop="dropAsset" @drag-end="endAssetDrag" @restored="load" @deleted="load">
             <template #meta>{{ s.id }} · {{ s.time }} · {{ s.light }}</template>
           </AssetCard>
         </section>
@@ -788,7 +803,7 @@ function parentAsset(row?: AssetRegistryItem | null) {
             :gen-disabled="!!genning || (!selectedVendor && !isChatGPTQueue)" :drag-target="dragTargetRef"
             @details="openAssetDetails" @show="showAsset" @gen="doGen('prop', p.id, true)"
             @create-child="openCreate('child', assetRef('prop', p.id))" @child-gen="openChildGen"
-            @drag-start="startAssetDrag" @drag-over="dragOverAsset" @drop="dropAsset" @drag-end="endAssetDrag" @restored="load">
+            @drag-start="startAssetDrag" @drag-over="dragOverAsset" @drop="dropAsset" @drag-end="endAssetDrag" @restored="load" @deleted="load">
             <template #meta>{{ p.id }} · {{ p.kind || '叙事' }}</template>
           </AssetCard>
         </section>

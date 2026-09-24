@@ -944,6 +944,12 @@ export interface ActingEval {
   summary?: { wins?: Record<string, number>; avg_total?: Record<string, number | null>; model?: string; note?: string }
   scores: Record<string, ActingEvalShot>
 }
+// ---- 子素材图/版本删除（N89）----
+export const deleteAssetImage = (project: string, kind: 'character' | 'scene' | 'prop', id: string) =>
+  postJSON<{ ok: boolean; deleted: string }>('/api/asset/image/delete', { project, kind, id })
+export const deleteVersion = (p: string, ts: string) =>
+  postJSON<{ ok: boolean; removed: string }>('/api/versions/delete', { p, ts })
+
 export const fetchActingEvals = (project: string, storyboard: string) =>
   getJSON<{ ok: boolean; evals: ActingEval[] }>('/api/acting/evals?project=' + encodeURIComponent(project) + '&storyboard=' + encodeURIComponent(storyboard))
 

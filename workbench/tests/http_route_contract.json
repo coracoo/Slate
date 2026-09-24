@@ -281,6 +281,10 @@
  ],
  [
   "POST",
+  "/api/asset/image/delete"
+ ],
+ [
+  "POST",
   "/api/assets/create"
  ],
  [
@@ -602,6 +606,10 @@
  [
   "POST",
   "/api/update/rollback"
+ ],
+ [
+  "POST",
+  "/api/versions/delete"
  ],
  [
   "POST",

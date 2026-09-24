@@ -40,6 +40,7 @@ const emit = defineEmits<{
   (e: 'drop', row: AssetRegistryItem | undefined, ev: DragEvent): void
   (e: 'drag-end', ev: DragEvent): void
   (e: 'restored'): void
+  (e: 'deleted'): void
 }>()
 
 const assetRef = computed(() => '@' + props.kind + ':' + props.id)
@@ -76,7 +77,7 @@ function fwdDrop(row: AssetRegistryItem, ev: DragEvent) { emit('drop', row, ev) 
       <div class="grid gap-2 sm:grid-cols-2">
         <AssetChildCard v-for="child in children" :key="child.ref" :child="child" :project="project" :image-url-of="imageUrlOf" :relation-label="relationLabel" :genning="genning" :gen-disabled="genDisabled" :drag-target="dragTarget"
           @show="emit('show', $event)" @details="emit('details', $event)" @gen="emit('child-gen', $event)"
-          @drag-start="fwdDragStart" @drag-over="fwdDragOver" @drop="fwdDrop" @drag-end="emit('drag-end', $event)" @restored="emit('restored')" />
+          @drag-start="fwdDragStart" @drag-over="fwdDragOver" @drop="fwdDrop" @drag-end="emit('drag-end', $event)" @restored="emit('restored')" @deleted="emit('deleted')" />
       </div>
     </div>
     <slot name="states" />

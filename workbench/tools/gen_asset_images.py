@@ -105,6 +105,47 @@ def load_asset_index(project):
         return {}
 
 
+def delete_asset_image(project, kind, asset_id):
+    """删除子素材图（N89）：快照到 .versions（可恢复）→ 删文件与 sidecar → 清索引条目。
+
+    kind: character|scene|prop；asset_id 为索引键（母图 id、状态 `<母id>__<状态id>`、
+    派生子图/平面图 `<id>__plan` 等）。返回删除的相对路径。
+    """
+    zones = {"character": "人物", "scene": "场景", "prop": "道具"}
+    zone = zones.get(kind)
+    if not zone:
+        raise ValueError(f"未知的素材类型: {kind}")
+    index = load_asset_index(project)
+    ent = (index.get(zone) or {}).get(asset_id)
+    if not ent or not ent.get("path"):
+        raise ValueError(f"索引中没有该素材图：{zone}/{asset_id}")
+    rel = str(ent["path"]).replace("\\", "/")
+    abs_path = os.path.join(os.path.abspath(str(project)), rel)
+    if not os.path.isfile(abs_path):
+        raise ValueError(f"文件不存在: {rel}")
+    try:
+        import versions
+        versions.snapshot(abs_path)   # 删除前快照，可从版本面板恢复
+    except Exception:
+        pass
+    os.remove(abs_path)
+    for side in (abs_path + ".comfy-task.json",):
+        if os.path.isfile(side):
+            try: os.remove(side)
+            except OSError: pass
+    index.setdefault(zone, {}).pop(asset_id, None)
+    idx_path = os.path.join(os.path.abspath(str(project)), "素材", "素材图.json")
+    if os.path.isfile(idx_path):
+        try:
+            import versions
+            versions.snapshot(idx_path)
+        except Exception:
+            pass
+    with open(idx_path, "w", encoding="utf-8") as fh:
+        json.dump(index, fh, ensure_ascii=False, indent=1)
+    return rel
+
+
 def collect_asset_image_plan(project, kind="all", asset_id=None, vendor_id="",
                              strict_dependencies=False):
     """收集待生成资产及其派生参考图，供 CLI 与 HTTP 前置校验共用。

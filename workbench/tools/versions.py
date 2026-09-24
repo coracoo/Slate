@@ -152,6 +152,16 @@ def list_versions(path):
     return out
 
 
+def delete_version(path, ts):
+    """删除指定 ts 的历史快照文件（当前原位文件不可通过此接口删除）。"""
+    path = os.path.abspath(path)
+    for v in list_versions(path):
+        if not v["current"] and v["ts"] == ts:
+            os.remove(v["path"])
+            return v["path"]
+    raise FileNotFoundError(f"版本不存在: {ts}")
+
+
 def restore(path, ts):
     """回滚到指定 ts 版本：先快照当前，再覆盖。"""
     path = os.path.abspath(path)

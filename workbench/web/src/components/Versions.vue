@@ -2,7 +2,7 @@
 // -*- coding: utf-8 -*-
 /** 产出版本切换器：徽标显示历史数，展开看各版本（图片带缩略图），可预览/回滚（最新文件原位不动） */
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
-import { getJSON, postJSON, mediaUrl } from '../api'
+import { getJSON, postJSON, mediaUrl, deleteVersion } from '../api'
 import { toast } from '../stores/app'
 import OverlayViewer from './OverlayViewer.vue'
 import StoryboardGrid from './StoryboardGrid.vue'
@@ -64,6 +64,14 @@ function closeOnOutside(event: PointerEvent) {
 onMounted(() => document.addEventListener('pointerdown', closeOnOutside))
 onBeforeUnmount(() => document.removeEventListener('pointerdown', closeOnOutside))
 
+async function removeVer(v: Ver) {
+  if (!confirm('删除这条历史版本？（不可恢复；当前文件不受影响）')) return
+  try {
+    await deleteVersion(props.path, v.ts)
+    await load()
+    toast('已删除该版本', 'ok')
+  } catch (e) { toast(e instanceof Error ? e.message : '删除失败', 'err') }
+}
 async function restore(v: Ver) {
   if (!confirm(`回滚到 ${v.ts}？（当前版本会先自动快照，不会丢失）`)) return
   try {
@@ -130,6 +138,7 @@ const fmt = (ts: string) => { const m = ts.match(/^(\d{4})(\d{2})(\d{2})_(\d{2})
           </div>
           <button class="text-2xs text-sky-300 hover:underline" @click.stop="showPreview(v)">打开</button>
           <button v-if="!v.current" class="text-2xs text-amber-300 hover:underline" @click.stop="restore(v)">恢复</button>
+          <button v-if="!v.current" class="text-2xs text-rose-300 hover:underline" @click.stop="removeVer(v)">删除</button>
         </div>
         <div v-if="!vers.length" class="py-2 text-center text-2xs text-slate-500">暂无历史版本</div>
       </div>
