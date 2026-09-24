@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { useBoardSelection } from '../utils/useBoardSelection'
 // -*- coding: utf-8 -*-
-/** 拍摄资料包总览页：左=V 列表（与⑦创作生成同源 video_units；无 V 老分镜回退场景列表），右=选中场景详情 + 走位战略图/预演包/逐镜包 */
+/** 平面推演页（⑥）：本页产物全部服务 AI 视频模型——平面图=布局参考(注入V请求)、走位战略图=运镜核对(人工)、拍摄资料包=逐镜资料固化。
+ *  白模(2D)/3D 是辅助系统的独立链路：辅助·白模 出预演帧、辅助·Blender 出 3D 预演，产物同步本页素材；本页只放转跳链接。左=V 列表（与⑦同源 video_units；无 V 老分镜回退场景列表），右=选中场景详情 */
 import { ref, computed, watch } from 'vue'
 import {
-  fetchWhiteBoard, fetchProjectFile, creationAssemble, buildStrategy, exportPreviz,
+  fetchWhiteBoard, fetchProjectFile, creationAssemble, buildStrategy,
   mediaUrl, generatePlan, fetchPlanList, buildPlanCanvas, fetchScriptData,
   type WhiteBoard, type PlanSummary
 } from '../api'
@@ -24,13 +25,11 @@ const shots = ref<Shot[]>([])
 const pkg = ref<Pkg | null>(null)
 const loading = ref(false)
 const busy = ref('')
-const tab = ref<'strategy' | 'plan' | 'previz' | 'shots' | 'aiplan'>('aiplan')
+const tab = ref<'strategy' | 'shots' | 'aiplan'>('aiplan')
 const TABS = computed(() => [
-  { k: 'aiplan', label: '平面图' },                       // 主入口：AI 平面图（plan v1）
-  { k: 'strategy', label: '走位战略图' },
-  { k: 'previz', label: '预演包 (' + previzDir.value.length + ')' },
-  { k: 'shots', label: '逐镜包 (' + (pkg.value?.shots?.length ?? 0) + ') · 脚本/素材' },
-  { k: 'plan', label: '逐镜平面图 (' + planDir.value.length + ')' }
+  { k: 'aiplan', label: '平面图' },                       // 主入口：AI 平面图（plan v1）——布局参考，注入 V 视频请求
+  { k: 'strategy', label: '走位战略图' },                 // 运镜/走位动态核对（人工）
+  { k: 'shots', label: '拍摄资料包 (' + (pkg.value?.shots?.length ?? 0) + ') · 脚本/素材' }
 ] as const)
 const currentShot = ref(0)
 const overlay = ref<{ visible: boolean; src: string; kind: 'image' | 'html'; title: string }>({ visible: false, src: '', kind: 'image', title: '' })
@@ -38,12 +37,6 @@ const overlay = ref<{ visible: boolean; src: string; kind: 'image' | 'html'; tit
 const baseName = computed(() => board.value.replace(/\.json$/, ''))
 const strategyUrl = computed(() =>
   baseName.value ? `/media?p=${encodeURIComponent(`projects/${app.current}/推演/战略图_${baseName.value}.html`)}` : '')
-const planDir = computed(() => (projectFiles('推演') || [])
-  .filter((f) => f.startsWith(`平面图_${baseName.value}/`) && /\.(png|jpe?g)$/i.test(f))
-  .map((f) => `projects/${app.current}/推演/${f}`))
-const previzDir = computed(() => (projectFiles('白模') || [])
-  .filter((f) => f.startsWith(`预演包_${baseName.value}/`) && /\.(png|jpe?g)$/i.test(f))
-  .map((f) => `projects/${app.current}/白模/${f}`))
 
 let loadSeq = 0
 async function load() {
@@ -88,7 +81,6 @@ async function run(label: string, fn: () => Promise<{ id?: number; err?: string 
 }
 const doAssemble = () => run('拍摄资料包', () => creationAssemble(app.current!, board.value), load)
 const doStrategy = () => run('生成战略图', () => buildStrategy(app.current!, board.value), load)
-const doPreviz = () => run('导出预演包', () => exportPreviz({ project: app.current!, json: board.value, frame: 'mid' }), load)
 
 /* ── AI 平面图（plan v1 场景级布局：左=场景列表，右=选中场景详情，S 降级为场景内标签） ── */
 const plans = ref<PlanSummary[]>([])
@@ -305,10 +297,10 @@ useBoardSelection(board, boards, 'package')
           <button class="btn btn-ghost btn-sm flex-1 justify-center" :disabled="!!busy || !board" @click="doStrategy">
             {{ busy === '生成战略图' ? '生成中…' : '刷新战略图' }}
           </button>
-          <button class="btn btn-ghost btn-sm flex-1 justify-center" :disabled="!!busy || !board"
-            title="逐镜导出干净预演帧+表演提示词+manifest（图生视频参考输入）" @click="doPreviz">
-            {{ busy === '导出预演包' ? '导出中…' : '导出预演包' }}
-          </button>
+          <RouterLink class="btn btn-ghost btn-sm flex-1 justify-center" to="/white"
+            title="白模渲染与预演帧导出在辅助·白模专栏（产物同步本页素材）">辅助·白模 →</RouterLink>
+          <RouterLink class="btn btn-ghost btn-sm flex-1 justify-center" to="/white3d"
+            title="3D 白模构建/渲染在辅助·Blender 专栏（独立旁路，产物不参与⑦参考注入）">辅助·Blender →</RouterLink>
         </div>
       </div>
       <div class="glass min-h-0 flex-1 overflow-y-auto p-2">
@@ -395,21 +387,6 @@ useBoardSelection(board, boards, 'package')
         <iframe v-if="strategyUrl" id="strategyFrame" :src="strategyUrl" class="h-full w-full rounded-lg border-0 bg-white"
           title="战略图"></iframe>
         <div v-else class="grid h-full place-items-center text-xs text-slate-500">选择分镜后展示战略图</div>
-      </div>
-
-      <!-- 逐镜平面图（shot_diagram，旧流程：assemble 已默认跳过，--with-diagram 手动生成） -->
-      <div v-else-if="tab === 'plan'" class="glass min-h-0 flex-1 overflow-y-auto p-3">
-        <div v-if="!planDir.length" class="grid h-full place-items-center gap-2 text-xs text-slate-500">
-          <span>暂无逐镜平面图——平面推演主入口已由「平面图」（AI 平面图）承接</span>
-          <span class="text-2xs text-slate-500">仍想要逐镜调度图：assemble 加 --with-diagram 手动生成</span>
-        </div>
-        <div v-else class="grid grid-cols-2 gap-2 xl:grid-cols-3">
-          <button v-for="p in planDir" :key="p" class="group overflow-hidden rounded-lg border border-line"
-            @click="overlay = { visible: true, kind: 'image', src: mediaUrl(p), title: p.split('/').pop() || '' }">
-            <img :src="mediaUrl(p)" class="aspect-video w-full object-cover" loading="lazy" alt="平面图" />
-            <div class="truncate px-1.5 py-1 text-2xs text-slate-400">{{ p.split('/').pop() }}</div>
-          </button>
-        </div>
       </div>
 
       <!-- AI 平面图：选中场景的详情面板 -->
@@ -501,20 +478,6 @@ useBoardSelection(board, boards, 'package')
         </div>
       </div>
 
-      <!-- 预演包：干净帧给图生视频 -->
-      <div v-else-if="tab === 'previz'" class="glass min-h-0 flex-1 overflow-y-auto p-3">
-        <div v-if="!previzDir.length" class="grid h-full place-items-center gap-2 text-xs text-slate-500">
-          <span>暂无预演包——点左上「导出预演包」生成</span>
-          <span class="text-2xs text-slate-500">逐镜干净帧（无HUD）+ 表演提示词 txt + manifest，喂 Seedance/Wan 的参考输入</span>
-        </div>
-        <div v-else class="grid grid-cols-2 gap-2 xl:grid-cols-3">
-          <button v-for="p in previzDir" :key="p" class="overflow-hidden rounded-lg border border-line transition hover:border-sky-400/50"
-            @click="overlay = { visible: true, kind: 'image', src: mediaUrl(p), title: p.split('/').pop() || '' }">
-            <img :src="mediaUrl(p)" class="aspect-video w-full object-cover" loading="lazy" alt="预演帧" />
-            <div class="truncate px-1.5 py-1 text-2xs text-slate-400">{{ p.split('/').pop() }}</div>
-          </button>
-        </div>
-      </div>
 
       <!-- 逐镜包 -->
       <div v-else class="glass min-h-0 flex-1 overflow-y-auto p-3">

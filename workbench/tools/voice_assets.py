@@ -49,11 +49,50 @@ def profile(cfg):
 
 
 def state(project, cfg=None):
-    result = {'characters': characters(project), **library(project), 'catalog': []}
+    chars = characters(project)
+    # 分状态音色绑定要展示派生状态图：探测约定路径 素材/人物/<角色id>__<状态id>.png
+    for c in chars:
+        for s in c.get('states') or []:
+            img = Path(project) / '素材' / '人物' / f"{c.get('id')}__{s.get('id')}.png"
+            if img.is_file():
+                s['image'] = img.relative_to(Path(project)).as_posix()
+    result = {'characters': chars, **library(project), 'catalog': []}
     if cfg:
         cache = Path(__file__).resolve().parents[1] / 'cache/voices' / profile(cfg) / 'catalog.json'
         if cache.exists(): result['catalog'] = json.loads(cache.read_text(encoding='utf-8'))['voices']
     return result
+
+
+AUDIO_EXT = ('.mp3', '.wav', '.m4a', '.ogg', '.flac')
+
+def upload_voice(project, name, stream, length):
+    """上传本地音色参考文件（mp3/wav/m4a/ogg/flac）入库：素材/音色/<id>/r001/sample.<ext> + 音色库.json 登记。"""
+    ext = Path(name).suffix.lower()
+    if ext not in AUDIO_EXT: raise ValueError('音色文件仅支持 mp3 / wav / m4a / ogg / flac')
+    if not 0 < length <= 100 * 1024 * 1024: raise ValueError('文件必须非空且不超过 100 MB')
+    ident = 'voice-' + uuid.uuid4().hex[:16]
+    dest = Path(project) / '素材' / '音色' / ident / 'r001'
+    dest.mkdir(parents=True, exist_ok=True)
+    out = dest / ('sample' + ext)
+    try:
+        with out.open('xb') as f:
+            left = length
+            while left:
+                chunk = stream.read(min(left, 1024 * 1024))
+                if not chunk: raise ValueError('上传中断，请重新选择文件')
+                f.write(chunk); left -= len(chunk)
+        probe(out)
+    except Exception:
+        out.unlink(missing_ok=True)
+        raise ValueError('文件不是可解析的音频，请检查格式后重新上传')
+    row = {'id': ident, 'revision': 1, 'name': Path(name).stem, 'voice_id': '', 'vendor_id': 'local',
+           'profile': 'local', 'description': '', 'sample': out.relative_to(Path(project)).as_posix(),
+           'sha256': digest(out), 'origin': 'upload', 'tts_verified': False}
+    (dest / 'voice.json').write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding='utf-8')
+    def add(data):
+        data.setdefault('voices', []).append(row)
+    project_store.update_json(Path(project) / '素材' / '音色' / '音色库.json', add, create_default={'voices': []})
+    return row
 
 
 def resolve(project, character_id, voice_asset_id=None):
@@ -75,6 +114,27 @@ def resolve(project, character_id, voice_asset_id=None):
 
 
 def bind(project, body):
+    state_id = str(body.get('state') or '').strip()
+    if state_id:
+        # 分状态音色：不复制资产，仅在角色的 voice_variants 上挂/摘状态链接（voice_asset_id 为空=恢复跟随全剧默认）
+        actor = next((c for c in characters(project) if c.get('id') == body.get('character_id')), None)
+        if not actor: raise ValueError('角色不存在')
+        label = next((str(s.get('label') or '') for s in actor.get('states') or [] if s.get('id') == state_id), '')
+        if not label: raise ValueError('派生状态不存在，请先在素材提炼中定义状态资产')
+        voice_ref = str(body.get('voice_asset_id') or '').strip()
+        voice = next((v for v in library(project)['voices'] if v['id'] == voice_ref), None) if voice_ref else None
+        if voice_ref and (not voice or not voice.get('sample')): raise ValueError('请先保存可试听的音色资产')
+        def mutate_state(data):
+            row = next((c for c in data['characters'] if c.get('id') == actor['id']), None)
+            if not row: raise ValueError('角色不存在')
+            variants = [v for v in row.get('voice_variants') or [] if v.get('state') != state_id]
+            if voice:
+                variants.append({'voice_asset_id': voice['id'], 'revision': voice['revision'],
+                                 'name': '角色音乐·' + label, 'state': state_id})
+            if variants: row['voice_variants'] = variants
+            else: row.pop('voice_variants', None)
+        project_store.update_json(Path(project) / '素材' / '人物.json', mutate_state)
+        return {'ok': True}
     voice = next((v for v in library(project)['voices'] if v['id'] == body.get('voice_asset_id') and v['revision'] == body.get('revision')), None)
     if not voice or not voice.get('sample'): raise ValueError('请先保存可试听的音色资产')
     inside(project, voice['sample'])
@@ -106,6 +166,7 @@ def bind(project, body):
 
 def prepare(project, body, cfg):
     if not cfg or cfg.get('id') != 'minimax': raise ValueError('当前音色适配器支持 MiniMax，请启用并配置该厂商')
+    if not str(cfg.get('api_key') or '').strip(): raise ValueError('MiniMax 未配置 API Key，请到环境页填写并保存后再试')
     action = body['action']
     packet = {'type': 'speech' if action == 'speech' else 'voice', 'vendor_id': cfg['id'], 'profile': profile(cfg)}
     if action == 'voice_sample':

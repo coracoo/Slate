@@ -751,7 +751,7 @@ class H(BaseHTTPRequestHandler):
             if handler is not None:
                 # 二进制上传保持流式；其余 POST 在业务分支前验证对象 JSON。
                 multipart_import = url.path == '/api/create/chatgpt/import' and self.headers.get('Content-Type','').lower().startswith('multipart/form-data')
-                if method == 'POST' and url.path not in ('/api/import', '/api/reference-media/upload') and not multipart_import:
+                if method == 'POST' and url.path not in ('/api/import', '/api/reference-media/upload', '/api/voice/upload') and not multipart_import:
                     import io
                     raw=self.rfile.read(length)
                     try: parsed=json.loads(raw.decode('utf-8') or '{}')
@@ -1759,6 +1759,17 @@ class H(BaseHTTPRequestHandler):
             if not project: raise ValueError('请选择项目')
             row = upload(proj_dir(project), ctx.query.get('kind', [''])[0], ctx.query.get('name', [''])[0], self.rfile, ctx.content_length)
             return self._send(200, 'application/json', json.dumps({'ok': True, **row}, ensure_ascii=False).encode())
+        except Exception as e:
+            self.close_connection = True
+            return self._send_run_error(e)
+
+    @route('POST', '/api/voice/upload')
+    def route_post_voice_upload(self, ctx):
+        try:
+            project = safe_proj(ctx.query.get('project', [''])[0])
+            if not project: raise ValueError('请选择项目')
+            row = tools_mod('voice_assets.py').upload_voice(proj_dir(project), ctx.query.get('name', [''])[0], self.rfile, ctx.content_length)
+            return self._send(200, 'application/json', json.dumps({'ok': True, 'voice': row}, ensure_ascii=False).encode())
         except Exception as e:
             self.close_connection = True
             return self._send_run_error(e)

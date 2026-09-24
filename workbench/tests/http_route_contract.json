@@ -485,6 +485,10 @@
  ],
  [
   "POST",
+  "/api/voice/upload"
+ ],
+ [
+  "POST",
   "/api/run"
  ],
  [

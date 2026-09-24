@@ -162,7 +162,7 @@ watch(viewTab, (tab) => {
 const gridDirty = ref(false)
 const savingGrid = ref(false)
 
-/** 汇总表格：行内编辑 dur/action/prompt，整组回写（版本快照保护） */
+/** 汇总表格：行内编辑 内容/动作/声音/光影/三提示词（时长/器械/镜头只读，调整在⑦创作生成），整组回写（版本快照保护） */
 function markDirty() { gridDirty.value = true }
 async function saveGrid() {
   if (!app.current || !board.value || !shots.value.length) return
@@ -456,7 +456,8 @@ useBoardSelection(board, boards, 'shots')
           </template>
         </div>
 
-        <!-- 汇总表格（Excel 式）：镜号/场景/时长/机位视角/器械/镜头/运镜/内容/动作/声音/光影/台词/三提示词（景别数据保留在 JSON 与逐镜明细） -->
+        <!-- 汇总表格（Excel 式）：镜号/场景/时长/机位视角/器械/镜头/运镜/内容/动作/声音/光影/台词/三提示词。
+             时长/器械/镜头为只读——初稿由 LLM 生成，实际调整在⑦创作生成；其余列行内编辑，整组回写（版本快照保护）。 -->
         <div v-if="viewTab === 'grid'">
           <div v-if="!shots.length" class="py-10 text-center text-sm text-slate-500">选择或生成一个剧本分镜</div>
           <div v-else :class="gridFullscreen ? 'fixed inset-0 z-50 overflow-auto bg-[#0a0e17] p-4' : 'overflow-x-auto rounded-lg border border-line'">
@@ -484,14 +485,10 @@ useBoardSelection(board, boards, 'shots')
                   <td class="whitespace-nowrap">
                     <span class="rounded px-1.5 py-0.5 text-2xs font-bold" :class="sceneCell(s).cls" :title="sceneCell(s).title">{{ sceneCell(s).label }}</span>
                   </td>
-                  <td>
-                    <input v-model.number="s.dur" type="number" step="0.5" min="1" max="15"
-                      class="cell-input w-14 text-center tabular-nums text-slate-200"
-                      @input="markDirty" />
-                  </td>
+                  <td class="text-center tabular-nums text-slate-200">{{ s.dur ?? 4 }}s</td>
                   <td class="whitespace-nowrap text-slate-400" :title="`${JSON.stringify(s.pos)} → ${JSON.stringify(s.look)}`">{{ viewOf(s) }}</td>
-                  <td><input v-model="s.rig" class="cell-input w-20 text-slate-300" @input="markDirty" /></td>
-                  <td><input v-model="s.lens" class="cell-input w-16 text-slate-300" @input="markDirty" /></td>
+                  <td class="whitespace-nowrap text-slate-300">{{ s.rig || '—' }}</td>
+                  <td class="whitespace-nowrap text-slate-300">{{ s.lens || '—' }}</td>
                   <td class="whitespace-nowrap text-slate-400">{{ s.camera_move }}</td>
                   <td><textarea v-model="s.content" rows="2" class="cell-input text-slate-300" @input="markDirty"></textarea></td>
                   <td><textarea v-model="s.action" rows="2" class="cell-input text-slate-200" @input="markDirty"></textarea></td>
@@ -552,25 +549,36 @@ useBoardSelection(board, boards, 'shots')
                 </div>
               </details>
               <div class="space-y-3 text-xs">
+                <!-- 字段与汇总表格同列：场景/时长(头)/机位/器械/镜头/运镜/内容/动作/声音/光影/台词/三提示词 -->
                 <div class="grid grid-cols-2 gap-2">
+                  <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">场景</b>
+                    <p class="mt-1"><span class="rounded px-1.5 py-0.5 text-2xs font-bold" :class="sceneCell(detail).cls" :title="sceneCell(detail).title">{{ sceneCell(detail).label }}</span></p></div>
+                  <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">机位(视角)</b>
+                    <p class="mt-1 text-slate-200" :title="`${JSON.stringify(detail.pos)} → ${JSON.stringify(detail.look)}`">{{ viewOf(detail) }}</p></div>
+                  <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">器械</b><p class="mt-1 text-slate-200">{{ detail.rig || '—' }}</p></div>
+                  <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">镜头</b><p class="mt-1 text-slate-200">{{ detail.lens || '—' }}</p></div>
                   <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">景别/角度</b><p class="mt-1 text-slate-200">{{ detail.shot_size }} · {{ detail.angle }}</p></div>
                   <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">运镜/转场</b><p class="mt-1 text-slate-200">{{ detail.camera_move }} · {{ detail.transition }}</p></div>
                   <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">机位 pos</b><p class="mt-1 font-mono text-slate-200">{{ JSON.stringify(detail.pos) }}</p></div>
                   <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">视点 look</b><p class="mt-1 font-mono text-slate-200">{{ JSON.stringify(detail.look) }}</p></div>
                 </div>
-                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-emerald-300">动作</b><p class="mt-1 text-slate-300">{{ detail.action || '—' }}</p></div>
-                <div class="rounded-lg bg-violet-400/5 p-2.5"><b class="text-violet-300">静态参考图提示词</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.prompt_image || detail.prompt || '—' }}</p></div>
-                <div class="rounded-lg bg-sky-400/5 p-2.5"><b class="text-sky-300">生视频提示词</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.prompt_video || '尚未重建' }}</p></div><div class="rounded-lg bg-violet-400/5 p-2.5"><b class="text-violet-300">宫格布局提示词</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.prompt_grid || '待 LLM 补全' }}</p></div>
-                <div v-if="detail.asset_refs?.length" class="rounded-lg bg-cyan-400/5 p-2.5"><b class="text-cyan-300">关联资产</b><p class="mt-1 break-all text-slate-300">{{ detail.asset_refs.join('、') }}</p></div>
-                <div v-if="detail.asset_revisions" class="rounded-lg bg-amber-400/5 p-2.5"><b class="text-amber-300">资产修订</b><p class="mt-1 break-all text-slate-300">{{ Object.entries(detail.asset_revisions).map(([ref, rev]) => `${ref} v${rev}`).join(' · ') }}</p></div>
-                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">本镜产出</b><img v-if="shotOutput(detail)?.image" :src="mediaUrl(shotOutput(detail)!.image!)" class="mt-2 aspect-video w-full rounded-md border border-line bg-black object-contain" loading="lazy" :alt="`${detail.id} 参考图`" /></div>
-                <div v-if="actingPrompt" class="rounded-lg bg-emerald-400/10 p-2.5"><b class="text-emerald-300">演员层编译结果</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ actingPrompt }}</p></div>
+                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">内容</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.content || '—' }}</p></div>
+                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-emerald-300">动作</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.action || '—' }}</p></div>
+                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">声音</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.sound || '—' }}</p></div>
+                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">光影</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.lighting || '—' }}</p></div>
                 <div class="rounded-lg bg-white/5 p-2.5"><b class="text-amber-300">台词轨</b>
                   <div v-for="(L, i) in detail.lines || []" :key="i" class="mt-1 text-slate-300">
                     <span class="text-slate-500">at {{ L.at }}s</span> 【{{ spk(L.speaker) }}】{{ L.line }}
                   </div>
                   <div v-if="!detail.lines?.length" class="mt-1 text-slate-500">无台词</div>
                 </div>
+                <div class="rounded-lg bg-violet-400/5 p-2.5"><b class="text-violet-300">参考帧提示词</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.prompt_image || detail.prompt || '—' }}</p></div>
+                <div class="rounded-lg bg-sky-400/5 p-2.5"><b class="text-sky-300">视频提示词</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.prompt_video || '尚未重建' }}</p></div>
+                <div class="rounded-lg bg-violet-400/5 p-2.5"><b class="text-violet-300">宫格提示词</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ detail.prompt_grid || '待 LLM 补全' }}</p></div>
+                <div v-if="detail.asset_refs?.length" class="rounded-lg bg-cyan-400/5 p-2.5"><b class="text-cyan-300">关联资产</b><p class="mt-1 break-all text-slate-300">{{ detail.asset_refs.join('、') }}</p></div>
+                <div v-if="detail.asset_revisions" class="rounded-lg bg-amber-400/5 p-2.5"><b class="text-amber-300">资产修订</b><p class="mt-1 break-all text-slate-300">{{ Object.entries(detail.asset_revisions).map(([ref, rev]) => `${ref} v${rev}`).join(' · ') }}</p></div>
+                <div class="rounded-lg bg-white/5 p-2.5"><b class="text-slate-400">本镜产出</b><img v-if="shotOutput(detail)?.image" :src="mediaUrl(shotOutput(detail)!.image!)" class="mt-2 aspect-video w-full rounded-md border border-line bg-black object-contain" loading="lazy" :alt="`${detail.id} 参考图`" /></div>
+                <div v-if="actingPrompt" class="rounded-lg bg-emerald-400/10 p-2.5"><b class="text-emerald-300">演员层编译结果</b><p class="mt-1 whitespace-pre-wrap text-slate-300">{{ actingPrompt }}</p></div>
               </div>
             </div>
             <div v-else class="modal-h-lg flex-1 rounded-lg border border-dashed border-line p-6 text-center text-sm text-slate-500">从左侧选择一个镜头查看详情</div>
