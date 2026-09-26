@@ -775,6 +775,21 @@ class DialogueTrackTests(unittest.TestCase):
         # origin.fields.lines 维持 evidence
         self.assertEqual(out[1]["origin"]["fields"]["lines"], "evidence")
 
+    def test_speakers_beyond_actor_id_pool_keep_ids(self):
+        """超过预设 id 池（10 位）的说话人不得被丢掉：曾截断 → 第 11+ 位台词 speaker=None。"""
+        lines = [{"t_in": float(i), "t_out": float(i) + 1.0, "speaker": f"角色{i+1}", "text": f"词{i+1}"}
+                 for i in range(13)]
+        actors, id_of = a2s.build_actors(lines, "stand")
+        self.assertEqual(len(actors), 13)
+        self.assertEqual({L["speaker"] for L in lines} - set(id_of), set(), "每位说话人都要有 id")
+        self.assertEqual(len(set(actors)), len(actors), "actor id 不得互相冲突")
+        self.assertEqual(list(actors)[:len(a2s.ACTOR_IDS)], list(a2s.ACTOR_IDS),
+                         "前 10 位仍沿用预设 id 池（不改变既有产物口径）")
+        out = a2s.convert({"shots": self._board_shots()}, lines, id_of, actors, "stand")
+        speakers = [L.get("speaker") for sh in out for L in sh.get("lines", [])]
+        self.assertTrue(speakers, "应有台词落进分镜")
+        self.assertNotIn(None, speakers, "speaker 为 None 会让 ④ 音色与 ⑤ 演员层永久认不到")
+
     def test_storyboard_without_track_keeps_single_assignment(self):
         lines = [{"t_in": 2.0, "t_out": 10.0, "speaker": "曹操", "text": "跨镜"}]
         actors, id_of = a2s.build_actors(lines, "stand")

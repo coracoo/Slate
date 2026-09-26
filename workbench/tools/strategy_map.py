@@ -74,7 +74,7 @@ HTML = """<!DOCTYPE html>
   #legend { padding:6px 18px; font-size:11px; color:#94a3b8; display:flex; gap:14px; flex-wrap:wrap; }
 </style></head><body>
 <header><h1>战略图（场景平面 + 镜头推演）</h1><span class="tag" id="cnt"></span>
-<span id="sceneName" class="tag" style="background:#34d39922;color:#6ee7b7"></span>
+<span id="sceneName" class="tag" style="background:#34d39922;color:#6ee7b7"></span>__PLAN_NOTE__
 <span style="color:#94a3b8;font-size:12px">底图=场景平面(layout) · 圆点=在场角色 · ▲=机位+视场 · 橙箭头=运动 · 虚线=走位轨迹</span></header>
 <div id="stage"><canvas id="cv"></canvas></div>
 <div id="legend"><span>▭ 大件陈设</span><span>━ 出入口(方位)</span><span>◆ 点位</span><span>N=北(远景)</span></div>
@@ -305,6 +305,26 @@ draw();
 </script></body></html>"""
 
 
+def render_strategy_html(data):
+    """把数据填进自包含模板。
+
+    产物经 /media 以 text/html 同源回吐，且在推演页 iframe 里自动加载：
+    json.dumps 不转义 `<`，任何角色名/台词/场景名里出现 `</script>` 就能跳出自定义脚本，
+    以管理员同源身份调全部 /api（HttpOnly cookie 拦不住）。故对 < > 做 \\u 转义，
+    title 另做 HTML 文本转义防 </title> 跳出。先填 DATA 再填 TITLE，避免互相污染。
+    """
+    payload = json.dumps(data, ensure_ascii=False).replace("<", "\\u003c").replace(">", "\\u003e")
+    title = str(data.get("title") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    # 底图来源标记：零匹配回退不能只在任务日志里响一声——产物本身（/media 直开、推演页 iframe）
+    # 也要看得见，否则操作者拿着一张"别的场景的平面"当本场景用。文本同 title 一样转义。
+    note = str(data.get("plan_note") or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    warn = bool(data.get("plan_note_warn"))
+    badge = (f'<span class="tag" style="background:{"#f59e0b22" if warn else "#38bdf822"};'
+             f'color:{"#fbbf24" if warn else "#7dd3fc"}">{note}</span>') if note else ""
+    return (HTML.replace("__DATA__", payload).replace("__TITLE__", title)
+                .replace("__PLAN_NOTE__", badge))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("storyboard", nargs="?", default=None)
@@ -366,9 +386,24 @@ def main():
         title = f"平面图_{plan.get('name') or 'plan'}"
         out = a.out or os.path.join(os.path.dirname(os.path.abspath(a.plan)), f"战略图_{title}.html")
 
-    data = {"title": title, "actors": actors, "scenes": scenes, "shots": shots}
+    # 底图来源标记（零匹配回退必须在产物上看得见，不能只留任务日志里那句 [警告]）
+    plan_note, plan_warn = "", False
+    if plan is not None and a.storyboard:
+        from plan_adapt import shot_scene_ref
+        name = str(plan.get("name") or os.path.basename(str(a.plan)))
+        ref = str(plan.get("scene_ref") or "")
+        hit = sum(1 for s in shots if ref and shot_scene_ref(s) == ref)
+        if not ref:
+            plan_note, plan_warn = f"底图「{name}」未关联场景资产（无 scene_ref），空间一致性未经校验", True
+        elif not hit:
+            plan_note, plan_warn = f"底图「{name}」与 {len(shots)} 镜 scene_ref 零匹配（回退用图），空间一致性未经校验", True
+        else:
+            plan_note = f"底图「{name}」匹配 {hit}/{len(shots)} 镜"
+
+    data = {"title": title, "actors": actors, "scenes": scenes, "shots": shots,
+            "plan_note": plan_note, "plan_note_warn": plan_warn}
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    html = HTML.replace("__TITLE__", data["title"]).replace("__DATA__", json.dumps(data, ensure_ascii=False))
+    html = render_strategy_html(data)
     from versions import snapshot
     snapshot(out)
     open(out, "w", encoding="utf-8").write(html)

@@ -176,8 +176,11 @@ export function trackJob(id: number, label: string): Promise<TrackedJob> {
 // 页面未显式 trackJob 的入口、其他页面启动的任务也统一接管。
 // 首次载入不重放历史结果；本次打开后的快速结束任务同样通知。
 const openedAt = Date.now() / 1000
+// 3s 发现链是自排 setTimeout：没有幂等守卫时，authReady 与 LoginView 各起一条，
+// 每次在 SPA 内登录都再多一条，且登出后无人清理 → 轮询量按登录次数翻倍。
+let discoveryRunning = false
 async function discoverJobs() {
-  if (isGuest()) return   // 未登录：静默停止，不再打网络；登录成功由 LoginView 调 startJobDiscovery() 恢复
+  if (isGuest()) { discoveryRunning = false; return }   // 未登录：静默停止；登录成功后由 startJobDiscovery 恢复
   try {
     for (const job of (await fetchJobs()).jobs) {
       if (!tracked.has(job.id) && (job.status === 'running' || job.status === 'queued' || (job.finished_at || 0) >= openedAt)) {
@@ -190,7 +193,8 @@ async function discoverJobs() {
 
 /** 启动任务接管（恢复刷新前未完成任务 + 3s 发现轮询）。登录是 SPA 内跳转不刷新模块，故登录后需显式调用。 */
 export function startJobDiscovery() {
-  if (isGuest()) return
+  if (isGuest() || discoveryRunning) return
+  discoveryRunning = true
   restoreInflight()
   void discoverJobs()
 }

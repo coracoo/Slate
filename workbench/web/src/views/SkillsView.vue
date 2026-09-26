@@ -25,8 +25,18 @@ const newTarget = ref('storyboard')
 const newDesc = ref('')
 const newText = ref('')
 
-const CATS = ['全部', '导演风格', '生图风格', '拆剧本', '系统提示词', '经验卡片']
-const list = computed(() => skills.value.filter((s) => cat.value === '全部' || s.category === cat.value))
+// 类别 slug→中文标签：内置库里 3 类落中文、acting 落 slug，直接比字符串会让该类永远筛不出、
+// 徽标也显示成英文；环节徽标的三元式曾把 acting/assets/… 一律兜成「剧本」。
+const CAT_LABELS:Record<string,string> = { directing:'导演风格', 'image-style':'生图风格', script:'拆剧本', acting:'演员表演' }
+const CAT_SLUGS:Record<string,string> = { '导演风格':'directing', '生图风格':'image-style', '拆剧本':'script', '演员表演':'acting' }
+const TARGET_LABELS:Record<string,string> = { storyboard:'分镜', image:'生图', script:'剧本', acting:'表演' }
+const catLabel=(c?:string)=>CAT_LABELS[String(c||'')] || String(c||'')
+const targetLabel=(t?:string)=>TARGET_LABELS[String(t||'')] || String(t||'')
+const targetClass=(t?:string)=> t==='storyboard' ? 'bg-sky-400/15 text-sky-300'
+  : t==='image' ? 'bg-fuchsia-400/15 text-fuchsia-300'
+  : t==='acting' ? 'bg-teal-400/15 text-teal-300' : 'bg-amber-400/15 text-amber-300'
+const CATS = ['全部', '导演风格', '生图风格', '拆剧本', '演员表演', '系统提示词', '经验卡片']
+const list = computed(() => skills.value.filter((s) => cat.value === '全部' || catLabel(s.category) === cat.value))
 
 async function load() {
   loading.value = true
@@ -130,8 +140,7 @@ async function create() {
   if (!newName.value.trim() || !newText.value.trim()) { toast('名称与正文必填', 'err'); return }
   try {
     await postJSON('/api/skills/create', {
-      category: newCat.value === '导演风格' ? 'directing' : newCat.value === '生图风格' ? 'image-style' : 'script',
-      name: newName.value.trim(), target: newTarget.value,
+      category: CAT_SLUGS[newCat.value] || 'script', name: newName.value.trim(), target: newTarget.value,
       description: newDesc.value.trim(), text: newText.value
     })
     toast('已创建（自定义，可直接拷入网上 SKILL.md 内容）', 'ok')
@@ -166,10 +175,10 @@ async function create() {
         @click="openDetail(s)" @keydown.enter="openDetail(s)" @keydown.space.prevent="openDetail(s)">
         <div class="flex flex-wrap items-center gap-2">
           <b class="text-sm text-slate-100">{{ s.name }}</b>
-          <span class="rounded bg-white/10 px-1.5 text-2xs text-slate-400">{{ s.category }}</span>
+          <span class="rounded bg-white/10 px-1.5 text-2xs text-slate-400">{{ catLabel(s.category) }}</span>
           <span class="rounded px-1.5 text-2xs"
-            :class="s.target === 'storyboard' ? 'bg-sky-400/15 text-sky-300' : s.target === 'image' ? 'bg-fuchsia-400/15 text-fuchsia-300' : 'bg-amber-400/15 text-amber-300'">
-            {{ s.target === 'storyboard' ? '分镜' : s.target === 'image' ? '生图' : '剧本' }}
+            :class="targetClass(s.target)">
+            {{ targetLabel(s.target) }}
           </span>
           <span v-if="s.category === '系统提示词'" class="rounded bg-cyan-400/15 px-1.5 text-2xs text-cyan-300">系统提示词</span>
           <span v-if="(s as AnyItem).overridden" class="rounded bg-amber-400/15 px-1.5 text-2xs text-amber-300">已覆盖</span>
@@ -280,7 +289,7 @@ async function create() {
               <input v-model="newName" class="input mt-1" placeholder="如：诺兰式时间结构" />
             </label>
             <label class="text-xs text-slate-400">类别
-              <StyledSelect v-model="newCat" class="mt-1" :options="['导演风格', '生图风格', '拆剧本']" storage-key="wb.skills.new.cat" />
+              <StyledSelect v-model="newCat" class="mt-1" :options="['导演风格', '生图风格', '拆剧本', '演员表演']" storage-key="wb.skills.new.cat" />
             </label>
             <label class="text-xs text-slate-400">注入目标
               <StyledSelect v-model="newTarget" class="mt-1" :options="['storyboard', 'image', 'script', 'acting']" storage-key="wb.skills.new.target" />

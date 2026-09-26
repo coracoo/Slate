@@ -2,7 +2,6 @@
 """分镜三类作者提示词；编译层不得反写或相互补齐。"""
 import hashlib
 import json
-import re
 
 FIELDS = ('prompt_image', 'prompt_video', 'prompt_grid')
 # LLM 生成面只覆盖前两类；宫格是确定性排版（make_grid 按固定行列排已采用关键帧），
@@ -25,10 +24,6 @@ def format_shot_prompt(shot, text, start=0):
     return f"【{shot['id']}镜（{start:.1f}—{end:.1f}s）：" + '；'.join(str(p) for p in parts if p) + '】'
 
 
-def retime_prompt(text, ident, start, end):
-    """只更新时间标签，不重写用户正文。"""
-    return re.sub(r'^【' + re.escape(ident) + r'镜（[^）]*）：',
-                  f'【{ident}镜（{start:.1f}—{end:.1f}s）：', str(text or ''))
 CONTRACT = '''
 【制作提示词契约 v3，必须随每个 S 转场镜头一起生成】
 同一次 JSON 输出的每个 shots 元素必须另外包含两个独立字符串：
@@ -40,7 +35,7 @@ prompt_video：本镜完整连续动作，写开始状态→动作发展→结�
 两个字段统一按【S镜号（起点—终点s）：景别；镜头/机位；运镜；画面内容、人物、动作、声音、台词；光影】组织。静帧中的时间、运镜和声音仅作上下文，不作为画面元素。
 旧 prompt 字段可省略，系统将以 prompt_image 提供兼容视图。
 保留 scene_ref、dur、动作和台词事实；narrator 仅存在台词轨。
-不要生成宫格/布局文案（prompt_grid）——宫格由已采用关键帧确定性排版，布局说明只在选择故事板宫格参考模式时人工配置。
+不要生成宫格/布局文案（prompt_grid）——宫格提示词=分格布局说明（格数布局如 3×3 + 每格关键瞬间），由人工按需填写，宫格图由生图模型一次调用生成。
 同时返回 video_units 数组：按实际 scene_ref 将相邻 S 组合为 V 分镜视频，不能跨场景或跳过/重复/调换镜头。
 格式 [{"shot_ids":["S1","S2"],"title":"场景段落","prompt_video":"承接动作与空间关系的整段视频描述","negative":"整段共用负面约束"}]。
 分组按原 S 顺序完整覆盖；总时长为成员 dur 之和，不能增删剧情或改写台词。
@@ -77,7 +72,13 @@ def source_hash(shots):
     fields = ('id', 'dur', 'scene_ref', 'actor_refs', 'prop_refs', 'action', 'content',
               'shot_size', 'camera_move', 'angle', 'lighting', 'lines', 'negative') + FIELDS
     value = [{k: s.get(k) for k in fields} for s in shots]
-    return fingerprint(value)
+    # transition 只在"这本分镜确实写了转场"时并入指纹（同本文件 media_source_hash 的 performance 先例）：
+    # 无条件加键会让全部存量 V 的 source_hash 一次性对不上、集体判过期，
+    # 而 09-25 实测 10 本分镜里只有 2 本用得到 transition（7 个 V 会被无端打回重写）。
+    trans = [[s.get('id'), s.get('transition')] for s in shots if s.get('transition')]
+    if not trans:
+        return fingerprint(value)
+    return fingerprint({'shots': value, 'transition': trans})
 
 
 def media_source_hash(shots, kind, unit=None):
@@ -85,6 +86,11 @@ def media_source_hash(shots, kind, unit=None):
     fields = ('id', 'scene_ref', 'actor_refs', 'prop_refs', 'action', 'content', 'shot_size', 'angle', 'lighting', 'negative')
     values = [{k: s.get(k) for k in fields + (('prompt_image',) if kind == 'image' else ('dur', 'prompt_video', 'lines', 'camera_move'))} for s in shots]
     payload = {'shots': values, 'kind': kind}
+    # 转场会改写 S 图提示词里的"本镜如何接上下镜"，所以它变了静帧就该重出；
+    # 同样只在真写了 transition 时并入，避免无端把存量产物判过期。
+    trans = [[s.get('id'), s.get('transition')] for s in shots if s.get('transition')]
+    if trans:
+        payload['transition'] = trans
     if kind == 'image': payload['shared_negative'] = (unit or {}).get('negative') or ''
     if kind == 'video':
         payload['keyframes'] = [(s.get('keyframe') or {}).get('sha256') for s in shots]

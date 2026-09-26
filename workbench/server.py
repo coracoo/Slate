@@ -287,6 +287,16 @@ def _deny_file(p):
     b=os.path.basename(p).lower()
     if b.endswith(DENY_EXT): return True
     return any(b==n or b.startswith(n+".") for n in DENY_BASENAMES)
+def _anon_asset_ok(path):
+    """免认证只放行前端产物目录内的 /assets/ 请求。
+
+    静态兜底按 ROOT（workbench/）解析路径，裸前缀判白会被 /assets/../x 的 ..
+    归一化退回 workbench 内，未认证即可读后端源码——故必须按解析结果判定。
+    Vite 的带 hash chunk 名不含点号序列，合法请求不受影响。
+    """
+    if not path.startswith("/assets/"): return False
+    if ".." in path or "%2e" in path.lower(): return False
+    return under(WEBDIST, os.path.normpath(os.path.join(WEBDIST, path.lstrip("/"))))
 def scan_projects():
     pj=os.path.join(VIDEO,"projects"); out=[]
     if not os.path.isdir(pj): return out
@@ -443,7 +453,7 @@ def asset_image_preflight(project_dir, kind="all", asset_id=None, vendor=None):
         plans = planner.collect_asset_image_plan(project_dir, kind, asset_id, vendor.get("id", ""))
     except Exception as exc:
         return {"ok": False, "plans": [], "needs_edit": False,
-                "err": "读取资产引用失败：" + str(exc)}
+                "err": "读取资产引用失败：" + scrub_err(exc)}
     result["plans"] = plans
     edit_plans = [p for p in plans if p.get("mode") == "edit"]
     result["needs_edit"] = bool(edit_plans)
@@ -464,7 +474,7 @@ def asset_image_preflight(project_dir, kind="all", asset_id=None, vendor=None):
             try:
                 comfy.load_workflow_template(workflow)
             except Exception as exc:
-                return {**result, "ok": False, "err": "改图工作流不可用：" + str(exc)}
+                return {**result, "ok": False, "err": "改图工作流不可用：" + scrub_err(exc)}
     # 缺图不再拦截：母图本就不依赖任何参考；derived_from 派生图的父图
     # 缺失时由生成器降级为无参考生成并告警。批量任务中已排队生成的父
     # 资产不算缺失；其余降级情况作为 note 透出，便于前端提示。
@@ -670,7 +680,7 @@ class H(BaseHTTPRequestHandler):
                         if j and (attempt_id is None or j.get("attempt_id")==attempt_id) and not j.get("write_revoked"):
                             j["out"]=((j.get("out") or "")+"".join(buf))[-8000:]; j["updated_at"]=time.time()
             except Exception as e:
-                ok=False; err=str(e)
+                ok=False; err=scrub_err(e)
             finally:
                 with self.JLOCK:
                     if self.PROCS.get(jid) is p:
@@ -877,8 +887,12 @@ class H(BaseHTTPRequestHandler):
         if p and not p.lower().endswith(MEDIA_EXT):
             return self._send(403,"text/plain; charset=utf-8","文件类型不在允许范围".encode())
         if p:
-            try: return self._send(200,"text/plain; charset=utf-8",open(p,encoding="utf-8",errors="replace").read().encode())
-            except Exception as e: return self._send(500,"text/plain; charset=utf-8",str(e).encode())
+            try:
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    return self._send(200,"text/plain; charset=utf-8",fh.read().encode())
+            except Exception as e:
+                # 不外传 str(e)：里面常带 Windows 绝对路径与 Errno 细节（N65 残留）
+                return self._send(500,"text/plain; charset=utf-8",("文件读取失败（"+type(e).__name__+"）").encode())
         return self._send(404,"text/plain",b"not found")
 
     @route('GET', '/media')
@@ -981,7 +995,7 @@ class H(BaseHTTPRequestHandler):
             wb.close()
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"sheets":sheets},ensure_ascii=False).encode())
         except Exception as e:
-            return self._send(500,"application/json",json.dumps({"err":"xlsx 解析失败:"+str(e)},ensure_ascii=False).encode())
+            return self._send(500,"application/json",json.dumps({"err":"xlsx 解析失败:"+scrub_err(e)},ensure_ascii=False).encode())
 
     @route('GET', '/api/frames')
     def route_get_api_frames(self, ctx):
@@ -1016,7 +1030,7 @@ class H(BaseHTTPRequestHandler):
             assets=registry.list(kind or None)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"assets":assets},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('GET', '/api/asset/prompt_layers')
     def route_get_api_asset_prompt_layers(self, ctx):
@@ -1031,13 +1045,19 @@ class H(BaseHTTPRequestHandler):
         if not d or not ident or kind not in ZONE:
             return self._send(400,"application/json",json.dumps({"ok":False,"err":"project/kind/id 参数不合法"},ensure_ascii=False).encode())
         item=None
+        read_err=""
         fp=os.path.join(d,"素材",ZONE[kind]+".json")
         if os.path.isfile(fp):
             try:
-                data=json.load(open(fp,encoding="utf-8"))
+                with open(fp,encoding="utf-8") as fh:
+                    data=json.load(fh)
                 for it in data.get(KEY[kind],[]):
                     if str(it.get("id"))==ident: item=it; break
-            except Exception: pass
+            except Exception as exc:
+                # 读不动档案 ≠ 资产不存在：报"资产不存在"会把用户支去重建档案
+                read_err=f"{os.path.basename(fp)} 读取失败：{exc}"
+        if read_err:
+            return self._send(500,"application/json; charset=utf-8",json.dumps({"ok":False,"err":read_err},ensure_ascii=False).encode())
         if not item:
             return self._send(404,"application/json",json.dumps({"ok":False,"err":"资产不存在"},ensure_ascii=False).encode())
         sl=tools_mod("skill_lib.py")
@@ -1099,6 +1119,7 @@ class H(BaseHTTPRequestHandler):
                 actor_names=[str((main_actors.get(actor_id) or {}).get("name") or actor_id) for actor_id in actor_ids]
                 performance=shot.get("performance") if isinstance(shot.get("performance"),dict) else None
                 status=str(acting_status.get(sid) or ("ready" if performance and performance.get("status")=="ready" else "pending"))
+                check_err=""
                 if performance and performance.get("status") == "invalid":
                     status="invalid"
                 if compiler and performance and performance.get("status") == "ready":
@@ -1106,21 +1127,24 @@ class H(BaseHTTPRequestHandler):
                         check=compiler.compile_shot(board, sid, mode="stateful", media_type="video")
                         if any(("过期" in str(warning) or "来源" in str(warning)) for warning in (check.get("warnings") or [])):
                             status="stale"
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # 探针跑不动时不能默默留在 ready：页面会显示"表演已就绪"而其实没核过。
+                        # 状态值不改（该报 stale 还是 unknown 属产品口径），先把原因带出去并留日志。
+                        check_err = f"{type(exc).__name__}: {exc}"
+                        print(f"[表演] {sid} 过期探针失败 -> 状态仍报 {status}；原因：{check_err}", flush=True)
                 if shot.get("performance_locked") or shot.get("acting_locked"):
                     status="locked"
                 shots.append({"id":sid,"dur":shot.get("dur"),"speaker":shot.get("speaker") or "",
                                "action":shot.get("action") or "","prompt":shot.get("prompt") or "",
                                "actor_ids":actor_ids,"actor_names":actor_names,
                                "performance_status":status,"performance_locked":bool(shot.get("performance_locked") or shot.get("acting_locked")),
-                               "performance":performance})
+                               "performance_check_error":check_err,"performance":performance})
             return self._send(200,"application/json; charset=utf-8",json.dumps(
                 {"ok":True,"board":nm,"revision":revision,"context":context,
                   "actors":main_actors, "shots":shots,"candidates":candidates},
                 ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('GET', '/api/script/brief')
     def route_get_api_script_brief(self, ctx):
@@ -1134,6 +1158,50 @@ class H(BaseHTTPRequestHandler):
             return self._send(500,"application/json",json.dumps({"ok":False,"err":"brief.py 缺失"},ensure_ascii=False).encode())
         return self._send(200,"application/json; charset=utf-8",json.dumps(
             {"ok":True,"brief":mod.load_brief(d),"exists":mod.has_brief(d)},ensure_ascii=False).encode())
+
+    @route('GET', '/api/units')
+    def route_get_api_units(self, ctx):
+        # ① 第一步「全剧最小单元」总览：锚定状态 + 各包摘要 + 体检报告 + 反查索引
+        u, q = ctx.url, ctx.query
+        d=proj_dir(q.get("project",[""])[0])
+        if not d:
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目不存在"},ensure_ascii=False).encode())
+        mod=tools_mod("story_units.py")
+        if mod is None:
+            return self._send(500,"application/json",json.dumps({"ok":False,"err":"story_units.py 缺失"},ensure_ascii=False).encode())
+        units=mod.load_units(d)
+        outline=dict(units["outline"] or {})
+        eps=[]
+        for e in units["episodes"]:
+            row={k:v for k,v in e.items() if k!="text"}
+            row["has_text"]=bool(str(e.get("text") or "").strip())
+            row["text_len"]=len(str(e.get("text") or ""))
+            eps.append(row)
+        bios=[]
+        for c in units["characters"][:200]:
+            bios.append({"ref":f"@character:{c.get('id')}","name":c.get("name"),
+                         **{k:c.get(k) for k in mod.CHAR_KEYS if c.get(k)},
+                         "states":[s.get("id") for s in (c.get("states") or []) if isinstance(s,dict)]})
+        limits=[{"ref":f"@scene:{s.get('id')}","name":s.get("name"),
+                 "spatial_limit":s.get("spatial_limit"),"action_slots":s.get("action_slots") or []}
+                for s in units["scenes"][:200]]
+        boundaries=[{"ref":f"@prop:{p.get('id')}","name":p.get("name"),"usage_boundary":p.get("usage_boundary")}
+                    for p in units["props"][:300]]
+        index=mod.build_index(d)
+        try:
+            boards=[n for n in sorted(os.listdir(os.path.join(d,"分镜"))) if n.lower().endswith(".json")]
+        except Exception:
+            boards=[]
+        for ref,row in index.items():
+            keys=set(row.get("key_eps") or [])
+            # 哪些分镜板会因这条素材改动而需要重做（分镜文件名带集号，与 _board_episode 同一口径）
+            row["used_by_boards"]=[n for n in boards if any(k in n for k in keys)]
+        return self._send(200,"application/json; charset=utf-8",json.dumps({
+            "ok":True,"anchored":mod.is_anchored(d),"anchor_rev":mod.anchor_rev(d),
+            "outline":outline,"episodes":eps,
+            "foreshadows":units["foreshadows"],"hooks":units["hooks"],
+            "bios":bios,"scene_limits":limits,"prop_boundaries":boundaries,
+            "index":index,"report":mod.check(d)},ensure_ascii=False).encode())
 
     @route('GET', '/api/script/data')
     def route_get_api_script_data(self, ctx):
@@ -1242,6 +1310,35 @@ class H(BaseHTTPRequestHandler):
         return self._send(200,"application/json; charset=utf-8",json.dumps(
             {"versions":m.list_versions(pth)},ensure_ascii=False).encode())
 
+    @route('POST', '/api/versions/batch')
+    def route_post_api_versions_batch(self, ctx):
+        # 批量版本清单：② 素材页每张资产图都挂一个版本徽标，逐个请求会一次打出 248 次目录扫描
+        # （实测中位数 203ms/条、切项目墙钟 7.6s）。前端同一窗口合并后走这里，一次拿全。
+        ln = ctx.content_length
+        body=json.loads(self.rfile.read(ln).decode("utf-8","replace") or b"{}")
+        paths=body.get("paths") if isinstance(body,dict) else None
+        if not isinstance(paths,list) or not paths:
+            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":"paths 须为非空数组"},ensure_ascii=False).encode())
+        vmod=tools_mod("versions.py")
+        if vmod is None:
+            import importlib.util as _iu
+            _sp=_iu.spec_from_file_location("versions",os.path.join(TOOLS,"versions.py"))
+            vmod=_iu.module_from_spec(_sp); _sp.loader.exec_module(vmod)
+        results={}
+        for raw in paths[:500]:
+            rel=str(raw or "").strip()
+            if not rel or rel in results:
+                continue                       # 重复路径复用已算好的那条，不能覆写成空
+            pth=os.path.normpath(os.path.join(VIDEO,rel))
+            if not under(VIDEO,pth):
+                results[rel]=[]                # 越界只回空清单，不解释原因也不 500 整批
+                continue
+            try:
+                results[rel]=vmod.list_versions(pth)
+            except Exception:
+                results[rel]=[]
+        return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"results":results},ensure_ascii=False).encode())
+
     @route('GET', '/api/watchdog')
     def route_get_api_watchdog(self, ctx):
         u, q = ctx.url, ctx.query
@@ -1284,7 +1381,7 @@ class H(BaseHTTPRequestHandler):
                         item["error"]=str(exc)
                     items.append(item)
         except Exception as exc:
-            return self._send(500,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(500,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"workflows":items},ensure_ascii=False).encode())
 
     @route('GET', '/api/env/config')
@@ -1356,7 +1453,7 @@ class H(BaseHTTPRequestHandler):
                    "vision_vendor":vision,"has_doc":has,
                    "doc_mtime":time.strftime("%Y-%m-%d %H:%M:%S",time.localtime(os.path.getmtime(md))) if has else ""}
             except Exception as e:
-                r={"ok":False,"err":str(e)}
+                r={"ok":False,"err":scrub_err(e)}
         return self._send(200,"application/json; charset=utf-8",json.dumps(r,ensure_ascii=False).encode())
 
     @route('GET', '/api/create')
@@ -1388,7 +1485,7 @@ class H(BaseHTTPRequestHandler):
             rows=chatgpt_queue.list_jobs(d, board=q.get("board",[None])[0], status=q.get("status",[None])[0], limit=limit)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"jobs":rows},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('GET', '/api/create/chatgpt/job')
     def route_get_api_create_chatgpt_job(self, ctx):
@@ -1401,7 +1498,7 @@ class H(BaseHTTPRequestHandler):
         try:
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"job":chatgpt_queue.get_job(d,iid)},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(404,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(404,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('GET', '/api/create/chatgpt/run')
     def route_get_api_create_chatgpt_run(self, ctx):
@@ -1449,7 +1546,7 @@ class H(BaseHTTPRequestHandler):
             result.update({"ok":True,"board":nm})
             return self._send(200,"application/json; charset=utf-8",json.dumps(result,ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     # ---- 账号体系（N85）：签名会话 cookie；白名单见 _auth_gate ----
     # public-reference 自带 URL 签名+限时校验（media_gateway.verify，安全自包含），
@@ -1467,7 +1564,7 @@ class H(BaseHTTPRequestHandler):
     def _auth_gate(self, method, path):
         if os.environ.get('SLATE_NO_AUTH') == '1': return None   # 仅测试进程使用，勿在生产设置
         import auth_service
-        allow = path in self.AUTH_EXACT_ALLOW or path.startswith('/assets/')
+        allow = path in self.AUTH_EXACT_ALLOW or _anon_asset_ok(path)
         if allow: return None
         token = self._cookie(auth_service.COOKIE)
         if auth_service.verify_not_revoked(token): return None
@@ -1604,13 +1701,13 @@ class H(BaseHTTPRequestHandler):
                 if "text/html" in (self.headers.get("Accept") or "") and os.path.isfile(idx):
                     return self._send(200,"text/html; charset=utf-8",open(idx,"rb").read(),
                         {"Cache-Control":"no-store, no-cache, must-revalidate","Pragma":"no-cache"})
-        # 其余静态
-        p=os.path.normpath(os.path.join(ROOT,u.path.lstrip("/")))
-        if under(ROOT,p) and os.path.isfile(p):
-            if _deny_file(p):
-                return self._send(403,"text/plain; charset=utf-8","禁止访问敏感文件".encode())
-            return self._send(200,"application/octet-stream",open(p,"rb").read())
-        self._send(404,"text/plain",b"404")
+        # ROOT 兜底已撤（09-25，业务审计「待你定 14」按用户口径「先盘点再收紧」）：
+        # 原来落不到 WEBDIST 的请求会退回按 URL 读 workbench/ 树内的任意文件——实测暴露
+        # 233 个 .py 源码 + 157 个可反编译的 .pyc，而 DENY 名单只挡配置与 .log/.env。
+        # 依赖盘点（previs_system/scratch/survey_static_fallback.py，只读可重跑）确认前端源码、
+        # 已构建产物、后端生成的自包含 HTML 都不引用这条口子，且 dist 缺失时 / 返回 503 而非旧单文件页，
+        # 所以直接 404；哪天盘点脚本报"有依赖"，就是这条要重新讨论的时候。
+        self._send(404, "text/plain", b"404")
 
     @route('POST', '/api/jobs/clear')
     def route_post_api_jobs_clear(self, ctx):
@@ -1684,7 +1781,7 @@ class H(BaseHTTPRequestHandler):
         except OSError:
             try: shutil.move(src,dst)   # rename 失败（占用/跨卷等）兜底，仍是移动不复制删除
             except Exception as e:
-                return self._send(500,"application/json",json.dumps({"ok":False,"err":"移入回收站失败:"+str(e)},ensure_ascii=False).encode())
+                return self._send(500,"application/json",json.dumps({"ok":False,"err":"移入回收站失败:"+scrub_err(e)},ensure_ascii=False).encode())
         rel=os.path.relpath(dst,VIDEO).replace(os.sep,"/")
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"recycled":rel,"msg":"项目「%s」已移入回收站（%s），可手动找回或清空"%(name,rel)},ensure_ascii=False).encode())
 
@@ -1808,7 +1905,7 @@ class H(BaseHTTPRequestHandler):
         fn=os.path.basename(sp); dst=os.path.join(d,fn)
         if os.path.exists(dst): return self._send(409,"application/json",json.dumps({"ok":False,"err":"同名文件已存在:"+fn}).encode())
         try: shutil.copyfile(sp,dst)
-        except Exception as e: return self._send(500,"application/json",json.dumps({"ok":False,"err":str(e)}).encode())
+        except Exception as e: return self._send(500,"application/json",json.dumps({"ok":False,"err":scrub_err(e)}).encode())
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"path":"projects/"+proj+"/拉片素材/"+fn},ensure_ascii=False).encode())
 
     @route('POST', '/api/openblend')
@@ -1825,7 +1922,7 @@ class H(BaseHTTPRequestHandler):
             os.startfile(p)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"opened":os.path.basename(p)},ensure_ascii=False).encode())
         except Exception as e:
-            return self._send(500,"application/json",json.dumps({"ok":False,"err":str(e)}).encode())
+            return self._send(500,"application/json",json.dumps({"ok":False,"err":scrub_err(e)}).encode())
 
     @route('POST', '/api/file/delete')
     def route_post_api_file_delete(self, ctx):
@@ -1862,7 +1959,7 @@ class H(BaseHTTPRequestHandler):
             return self._send(400,"application/json",json.dumps({"ok":False,"err":"文件不存在或类型不在产物范围"},ensure_ascii=False).encode())
         try: os.remove(p)
         except Exception as e:
-            return self._send(500,"application/json",json.dumps({"ok":False,"err":str(e)},ensure_ascii=False).encode())
+            return self._send(500,"application/json",json.dumps({"ok":False,"err":scrub_err(e)},ensure_ascii=False).encode())
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"deleted":rel_in,"kind":"file"},ensure_ascii=False).encode())
 
     @route('POST', '/api/job')
@@ -1881,7 +1978,7 @@ class H(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(ctx.content_length).decode("utf-8"))
             groups = tools_mod("install_environment.py").normalize_groups(body.get("groups") if isinstance(body, dict) else None)
         except (ValueError, UnicodeError) as exc:
-            return self._send(400, "application/json", json.dumps({"err": str(exc)}, ensure_ascii=False).encode())
+            return self._send(400, "application/json", json.dumps({"err": scrub_err(exc)}, ensure_ascii=False).encode())
         with self.ENV_INSTALL_LOCK:
             with self.JLOCK:
                 active = any(j.get("status") == "running" or j.get("process_alive") for j in self.JOBS.values())
@@ -2099,7 +2196,7 @@ class H(BaseHTTPRequestHandler):
         try:
             load_storyboard(d,board_name)
         except ValueError as exc:
-            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         cmd=[sys.executable,os.path.join(TOOLS,"regenerate_shot_prompt.py"),d,
              "--board",board_name,"--shot",shot_id,"--type",media_type]
         jid=self.spawn_job("prompt_regenerate",cmd)
@@ -2119,7 +2216,7 @@ class H(BaseHTTPRequestHandler):
             if not any(isinstance(x,dict) and x.get("id")==pid for x in board.get("panels",[])):
                 raise ValueError("画格不存在")
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         cmd=[sys.executable,os.path.join(TOOLS,"generate_panel_draft.py"),d,
              "--board",name,"--panel",pid]
         jid=self.spawn_job("panel_draft",cmd)
@@ -2139,7 +2236,7 @@ class H(BaseHTTPRequestHandler):
             board=mod.save_grid(d,name,grid)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"grids":board["grids"]},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/storyboard/panel/save')
     def route_post_api_storyboard_panel_save(self, ctx):
@@ -2155,7 +2252,7 @@ class H(BaseHTTPRequestHandler):
             board=mod.save_panel(d,name,panel)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"panel":next(x for x in board["panels"] if x.get("id")==panel["id"])},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/storyboard/panel/preview')
     def route_post_api_storyboard_panel_preview(self, ctx):
@@ -2175,7 +2272,7 @@ class H(BaseHTTPRequestHandler):
             request=mod.preview_panel(d,panel,draft,refs)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"compiled_request":request},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/create/assemble')
     def route_post_api_create_assemble(self, ctx):
@@ -2189,7 +2286,7 @@ class H(BaseHTTPRequestHandler):
             bundle=assemble_create_shot(d,board_name,shot_id,body.get("prompt_user"),body.get("type") or "image", body.get("vendor_id") or body.get("provider_id") or "", body.get("mode") or "generate")
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,**bundle},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/create/chatgpt/queue')
     def route_post_api_create_chatgpt_queue(self, ctx):
@@ -2208,9 +2305,9 @@ class H(BaseHTTPRequestHandler):
             jobs=chatgpt_queue.queue_shots(d,board_name,shot_ids,str(body.get("task_type") or "reference_image"))
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"jobs":jobs},ensure_ascii=False).encode())
         except (chatgpt_queue.QueueError, ValueError) as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(500,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(500,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/asset/chatgpt/queue')
     def route_post_api_asset_chatgpt_queue(self, ctx):
@@ -2226,9 +2323,9 @@ class H(BaseHTTPRequestHandler):
             jobs=chatgpt_queue.queue_assets(d, refs)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"jobs":jobs},ensure_ascii=False).encode())
         except (chatgpt_queue.QueueError, ValueError) as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(500,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(500,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/create/chatgpt/run/create', '/api/create/chatgpt/run/import', '/api/create/chatgpt/run/control')
     def route_post_api_create_chatgpt_run_create(self, ctx):
@@ -2308,9 +2405,9 @@ class H(BaseHTTPRequestHandler):
             result=chatgpt_import.import_package(d,manifest_or_zip,files)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,**result},ensure_ascii=False).encode())
         except chatgpt_import.ImportError as exc:
-            return self._send(422,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(422,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/create/batch')
     def route_post_api_create_batch(self, ctx):
@@ -2334,11 +2431,13 @@ class H(BaseHTTPRequestHandler):
                 return self._send_run_json(400, {"ok":False,"err":scrub_err(exc)})
         cmd=[sys.executable,os.path.join(TOOLS,"create_batch.py"),"--project",d,"--board",board_name,
              "--type",mtype,"--mode",image_mode,"--vendor",vendor_id,"--providers",PROV]
-        shot_ids=body.get("shot_ids") or []
-        if not isinstance(shot_ids,list) or len(shot_ids)>200:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":"shot_ids 须为数组且数量合理"},ensure_ascii=False).encode())
+        raw_ids=body.get("shot_ids")
+        shot_ids=[str(x).strip() for x in raw_ids if str(x).strip()] if isinstance(raw_ids,list) else []
+        if not shot_ids or len(shot_ids)>200:
+            # 空选择曾一路透传到 create_batch 的「未选=全板」兜底，等于整板付费生成
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"shot_ids 须为数组且至少选择一个镜头"},ensure_ascii=False).encode())
         for sid in shot_ids:
-            if str(sid).strip(): cmd += ["--shot-id",str(sid)]
+            cmd += ["--shot-id",sid]
         jid=self.spawn_job("create_batch",cmd)
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"id":jid,"job":True},ensure_ascii=False).encode())
 
@@ -2424,9 +2523,9 @@ class H(BaseHTTPRequestHandler):
                         board['video_units'] = units
                     elif body.get('shots') is None: raise ValueError('保存内容为空')
                     mod.sync_shot_durations(board, previous_shots)
-                mod.project_store.update_json(mod.board_path(d, body['board']), mutate,
+                _, board_rev = mod.project_store.update_json(mod.board_path(d, body['board']), mutate,
                     expected_revision=body.get('revision'), snapshot=mod.versions.snapshot)
-                result = {'ok': True}
+                result = {'ok': True, 'revision': board_rev}
             return self._send_run_json(200, result)
         except Exception as exc:
             return self._send_run_json(409 if exc.__class__.__name__ == 'RevisionConflict' else 400 if isinstance(exc, ValueError) else 500,
@@ -2469,13 +2568,13 @@ class H(BaseHTTPRequestHandler):
                 negative=compiled_request["negative_prompt"]
                 refs=compiled_request["image_refs"]
             except Exception as exc:
-                return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         if not compiled_request:
             try:
                 mention_mod=tools_mod("create_ref_mentions.py")
                 refs=mention_mod.select_mentioned_refs(prompt_user,refs)
             except ValueError as exc:
-                return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         bundle=None   # 无 board/shot_id 时跳过分镜装配，下游引用一律走 (bundle or {}) 兜底
         if d and board_name and shot_id and mtype in ("image", "video"):
             try:
@@ -2486,7 +2585,7 @@ class H(BaseHTTPRequestHandler):
                 if not compiled_request and not negative: negative=bundle.get("negative","")
                 if not compiled_request and not refs and not body.get("refs"): refs=[]
             except Exception as exc:
-                return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         # prompt 是本次实际发送的完整文本；prompt_user/prompt_assembled 仅作可追溯分层，
         # 避免用户编辑装配结果后被服务端重复拼接。
         prompt=prompt_user or prompt_assembled
@@ -2510,7 +2609,7 @@ class H(BaseHTTPRequestHandler):
             else:
                 model_name = ((vendor_cfg or {}).get("models") or {}).get(model_slot, "")
         except ValueError as exc:
-            return self._send_run_json(400, {"ok":False,"err":str(exc)})
+            return self._send_run_json(400, {"ok":False,"err":scrub_err(exc)})
         if not model_name:
             return self._send(400, "application/json",
                 json.dumps({"ok":False, "err":f"厂商未配置 {model_slot} 模型"}, ensure_ascii=False).encode())
@@ -2638,7 +2737,7 @@ class H(BaseHTTPRequestHandler):
                 snapshot = getattr(versions_mod, "snapshot", None) if versions_mod else None
                 project_store.update_json(mf, _append_manifest, create_default={"items": []}, snapshot=snapshot)
             except Exception as exc:
-                return self._send(500,"application/json",json.dumps({"ok":False,"err":"写入创作清单失败: "+str(exc)},ensure_ascii=False).encode())
+                return self._send(500,"application/json",json.dumps({"ok":False,"err":"写入创作清单失败: "+scrub_err(exc)},ensure_ascii=False).encode())
         else:
             data.setdefault("items",[]).append(item)
             json.dump(data,open(mf,"w",encoding="utf-8"),ensure_ascii=False,indent=1)
@@ -2693,7 +2792,7 @@ class H(BaseHTTPRequestHandler):
                 snapshot = getattr(versions_mod, "snapshot", None) if versions_mod else None
                 project_store.update_json(mf, _save_item, snapshot=snapshot)
             except Exception as exc:
-                return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         else:
             data=json.load(open(mf,encoding="utf-8")); _save_item(data)
             if found[0]: json.dump(data,open(mf,"w",encoding="utf-8"),ensure_ascii=False,indent=1)
@@ -2725,7 +2824,7 @@ class H(BaseHTTPRequestHandler):
                     snapshot=getattr(versions_mod,"snapshot",None) if versions_mod else None
                     project_store.update_json(mf,_remove_item,snapshot=snapshot)
                 except Exception as exc:
-                    return self._send(500,"application/json",json.dumps({"ok":False,"err":"更新创作清单失败: "+str(exc)},ensure_ascii=False).encode())
+                    return self._send(500,"application/json",json.dumps({"ok":False,"err":"更新创作清单失败: "+scrub_err(exc)},ensure_ascii=False).encode())
             else:
                 _versions_snapshot(mf)
                 try: data=json.load(open(mf,encoding="utf-8"))
@@ -3041,7 +3140,12 @@ class H(BaseHTTPRequestHandler):
         os.makedirs(os.path.join(d,"剧本"),exist_ok=True)
         _versions_snapshot(os.path.join(d,"剧本","剧本.txt"))
         open(os.path.join(d,"剧本","剧本.txt"),"w",encoding="utf-8").write(txt)
-        return self._send(200,"application/json",json.dumps({"ok":True,"chars":len(txt)},ensure_ascii=False).encode())
+        # 导入即切换权威源：过去只写 剧本.txt，load_script 会因"有分集即聚合"继续回读
+        # 旧分集正文（新稿被吞），且 分集.json 的 rev 不动 → 分镜页仍显示「未过期」。
+        rec = {"mode":"imported","rev":0}
+        if script_repository: rec = script_repository.record_script_import(d)
+        return self._send(200,"application/json",json.dumps({"ok":True,"chars":len(txt),
+            "script_mode":rec.get("mode"),"script_rev":rec.get("rev")},ensure_ascii=False).encode())
 
     @route('POST', '/api/acting/context')
     def route_post_api_acting_context(self, ctx):
@@ -3067,9 +3171,9 @@ class H(BaseHTTPRequestHandler):
             _,new_revision=project_store.update_json(p,mutate,expected_revision=expected or revision,snapshot=snapshot)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"revision":new_revision,"context":context},ensure_ascii=False).encode())
         except project_store.RevisionConflict as exc:
-            return self._send(409,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(409,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/acting/prepare')
     def route_post_api_acting_prepare(self, ctx):
@@ -3098,7 +3202,7 @@ class H(BaseHTTPRequestHandler):
             jid=self.spawn_job('acting',[sys.executable,os.path.join(TOOLS,'acting_prepare_job.py'),request_path])
             return self._send_run_json(200,{'ok':True,'id':jid,'job':True})
         except Exception as exc:
-            return self._send(422,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(422,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/acting/apply')
     def route_post_api_acting_apply(self, ctx):
@@ -3115,9 +3219,9 @@ class H(BaseHTTPRequestHandler):
             result=mod.apply_candidate(p,ref,expected_revision=body.get("revision"))
             return self._send(200,"application/json; charset=utf-8",json.dumps(result,ensure_ascii=False).encode())
         except project_store.RevisionConflict as exc:
-            return self._send(409,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(409,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(422,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(422,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/acting/lock')
     def route_post_api_acting_lock(self, ctx):
@@ -3134,9 +3238,9 @@ class H(BaseHTTPRequestHandler):
             result=mod.set_shot_lock(p,shot_ids,bool(body.get("locked")),expected_revision=body.get("revision"))
             return self._send(200,"application/json; charset=utf-8",json.dumps(result,ensure_ascii=False).encode())
         except project_store.RevisionConflict as exc:
-            return self._send(409,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(409,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(422,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(422,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/acting/compile')
     def route_post_api_acting_compile(self, ctx):
@@ -3159,7 +3263,7 @@ class H(BaseHTTPRequestHandler):
                                     supports_audio=bool(body.get("supports_audio")))
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,**result},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/acting/evaluate')
     def route_post_api_acting_evaluate(self, ctx):
@@ -3212,7 +3316,7 @@ class H(BaseHTTPRequestHandler):
             if not main_ids:
                 return self._send(422,"application/json",json.dumps({"ok":False,"err":"本镜没有主角演员，演员表现只支持主角；请在分镜中关联主角后再生成"},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(422,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(422,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         vendor=next((x for x in load_vendors() if x.get("id")==vendor_id and x.get("enabled") and (x.get("models") or {}).get("text")),None)
         if not vendor:
             return self._send(400,"application/json",json.dumps({"ok":False,"err":"厂商不存在、未启用或未配置 text 模型"},ensure_ascii=False).encode())
@@ -3294,7 +3398,7 @@ class H(BaseHTTPRequestHandler):
         try:
             brief_doc=mod.save_brief(d,patch)
         except ValueError as exc:
-            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
         return self._send(200,"application/json; charset=utf-8",json.dumps(
             {"ok":True,"brief":brief_doc,"exists":True},ensure_ascii=False).encode())
 
@@ -3314,7 +3418,7 @@ class H(BaseHTTPRequestHandler):
             result=mod.delete_episode(d,episode)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,**result},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/script/expand')
     def route_post_api_script_expand(self, ctx):
@@ -3448,7 +3552,7 @@ class H(BaseHTTPRequestHandler):
             rows=registry_mod.AssetRegistry(d).list() if registry_mod else []
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,**result,"assets":rows},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/assets/relations')
     def route_post_api_assets_relations(self, ctx):
@@ -3566,7 +3670,7 @@ class H(BaseHTTPRequestHandler):
                         json.dump(raw,fh,ensure_ascii=False,indent=1)
         except Exception as exc:
             if project_store and isinstance(exc,project_store.RevisionConflict):
-                return self._send(409,"application/json",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+                return self._send(409,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
             return self._send(500,"application/json",json.dumps({"ok":False,"err":f"关系写入失败：{exc}"},ensure_ascii=False).encode())
         try:
             registry_mod=tools_mod("asset_registry.py")
@@ -3668,6 +3772,21 @@ class H(BaseHTTPRequestHandler):
         return self._send_run_json(200,{'ok':True,'removed':os.path.relpath(removed,VIDEO)})
         return self._send(200,"application/json",json.dumps({"ok":True},ensure_ascii=False).encode())
 
+    @route('GET', '/api/storyboard/revision')
+    def route_get_api_storyboard_revision(self, ctx):
+        q = ctx.query
+        # ③ 汇总表格的乐观锁基线：只回当前 revision，不回内容（内容页面已另有 /api/white/board）。
+        # 单独一条轻路由，是为了不改动白模页/③ 共用的 /api/white/board 响应体形状。
+        d=proj_dir(q.get("project",[""])[0]); nm=safe_proj(q.get("name",[""])[0])
+        p=os.path.join(d,"分镜",nm) if d and nm else ""
+        if not d or not nm.lower().endswith(".json") or not under(d,p) or not os.path.isfile(p):
+            return self._send(404,"application/json",json.dumps({"ok":False,"err":"分镜不存在"},ensure_ascii=False).encode())
+        try:
+            rev=project_store.current_revision(p)
+        except Exception as exc:
+            return self._send_run_error(exc)
+        return self._send_run_json(200,{"ok":True,"revision":rev})
+
     @route('POST', '/api/storyboard/save')
     def route_post_api_storyboard_save(self, ctx):
         u, q = ctx.url, ctx.query
@@ -3679,8 +3798,11 @@ class H(BaseHTTPRequestHandler):
         shots=body.get("shots")
         if not d or not nm.lower().endswith(".json") or not under(d,p) or not os.path.isfile(p) or not isinstance(shots,list) or not shots:
             return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目/分镜/shots 不合法"},ensure_ascii=False).encode())
-        # 字段级校验+清洗：dur 必须可转数值并夹取到 [1,60]；文本字段裁剪防超大；id 必填去重。
+        # 字段级校验+清洗：dur 必须可转数值并夹取到单镜权威档；文本字段裁剪防超大；id 必填去重。
         # 坏行拒收（不让空串/非数字进分镜把下游 float() 打崩），版本快照兜底回滚。
+        # 时长档不再在这里写数字：09-25 定版后由 production_studio 的常量单点持有（原来三处 2~12/1.5~15/1~60 各说各话）。
+        _PS = tools_mod('production_studio.py')
+        DMIN, DMAX = _PS.SHOT_DURATION_MIN, _PS.SHOT_DURATION_MAX
         seen_ids=set(); cleaned=[]
         for idx,shot in enumerate(shots):
             if not isinstance(shot,dict) or not shot.get("id"):
@@ -3693,19 +3815,34 @@ class H(BaseHTTPRequestHandler):
                 dur=float(shot.get("dur") if shot.get("dur") not in ("",None) else 4.0)
             except (TypeError,ValueError):
                 return self._send(400,"application/json",json.dumps({"ok":False,"err":f"{sid} 时长不是数字: {shot.get('dur')!r}"},ensure_ascii=False).encode())
-            if not (1.0<=dur<=60.0):
-                return self._send(400,"application/json",json.dumps({"ok":False,"err":f"{sid} 时长超出 1~60s: {dur}"},ensure_ascii=False).encode())
+            if not (DMIN<=dur<=DMAX):
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":f"{sid} 时长超出单镜权威档 {DMIN:g}~{DMAX:g}s: {dur}（台词更长就该拆镜，不是把镜拉长）"},ensure_ascii=False).encode())
             shot["dur"]=round(dur,2)
             for k in ("action","prompt","content","sound","lighting","rig","lens"):
                 v=shot.get(k)
                 if isinstance(v,str) and len(v)>2000:
                     shot[k]=v[:2000]
             cleaned.append(shot)
+        # 乐观锁基线必传：③ 是整组回写，缺基线就等于允许静默盖掉 ⑦/⑤ 期间写好的提示词。
+        base_rev=str(body.get("revision") or "")
+        if not base_rev:
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"缺少分镜基线 revision：请先 GET /api/storyboard/revision 再保存（避免整组回写盖掉 ⑦/⑤ 的改动）"},ensure_ascii=False).encode())
         try:
-            tools_mod('production_studio.py').save_shots(d, nm, cleaned, body.get('revision'))
+            _, rev = tools_mod('production_studio.py').save_shots(d, nm, cleaned, base_rev)
         except Exception as exc:
             return self._send_run_error(exc)
-        return self._send(200,"application/json",json.dumps({"ok":True,"shots":len(shots)},ensure_ascii=False).encode())
+        # ① 锚定的创作禁区：人工行内改也可能写出违规镜头，保存后同样扫一遍并回传（只告警不阻断）
+        unit_warnings=[]
+        su=tools_mod('story_units.py')
+        if su is not None:
+            try:
+                unit_warnings=su.taboo_scan(d, cleaned)
+            except Exception as exc:
+                unit_warnings=[]
+                print(f"[禁区扫描跳过] {exc}", flush=True)
+        # 回写成功即返回新 revision：前端据此更新基线，连续两次保存不必整页重载
+        return self._send(200,"application/json",json.dumps({"ok":True,"shots":len(shots),"revision":rev,
+                                                            "unit_warnings":unit_warnings},ensure_ascii=False).encode())
 
     @route('POST', '/api/storyboard/delete')
     def route_post_api_storyboard_delete(self, ctx):
@@ -3932,12 +4069,13 @@ class H(BaseHTTPRequestHandler):
                 report=rebuild.rebuild_prompts(d,episode=episode,shot_ids=shot_ids)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,**report},ensure_ascii=False).encode())
         except Exception as exc:
-            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":str(exc)},ensure_ascii=False).encode())
+            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
 
     @route('POST', '/api/production/redo_segment')
     def route_post_api_production_redo_segment(self, ctx):
         # 视频局部修补（重做片段）：抽已采用 V 视频的 t0/t1 锚点帧 → 首尾帧模式生成中段
         # → 自动拼回原片 → 登记为该 V 的新候选（不自动采用，人工审核流程不变）。长任务走 job 体系。
+        # defer_merge=true（片段重拍页）时只生成中段，合并由 /api/production/redo_merge 显式完成。
         body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8', 'replace') or b'{}')
         d = proj_dir(body.get("project"))
         try:
@@ -3948,6 +4086,61 @@ class H(BaseHTTPRequestHandler):
         except Exception as exc:
             return self._send_run_json(409 if exc.__class__.__name__ == 'RevisionConflict' else 400 if isinstance(exc, ValueError) else 500,
                                        {'ok': False, 'err': scrub_err(exc)})
+
+    @route('GET', '/api/production/redo_frames')
+    def route_get_api_production_redo_frames(self, ctx):
+        # 片段重拍·拉片：把指定候选版本抽成帧条（≤48 帧，结果缓存复用）。
+        try:
+            d = proj_dir(ctx.query.get('project', [''])[0])
+            if not d: raise ValueError('项目不存在')
+            result = tools_mod('production_jobs.py').redo_frames(d, ctx.query.get('item_id', [''])[0])
+            return self._send_run_json(200, result)
+        except Exception as exc:
+            return self._send_run_json(400 if isinstance(exc, ValueError) else 500, {'ok': False, 'err': scrub_err(exc)})
+
+    @route('POST', '/api/production/redo_merge')
+    def route_post_api_production_redo_merge(self, ctx):
+        # 片段重拍·一键合并：把重拍片段三段拼回源版本，落库为 V标签_首_尾_vN 新候选。
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8', 'replace') or b'{}')
+        d = proj_dir(body.get("project"))
+        try:
+            if not d: raise ValueError("项目不存在")
+            result = tools_mod('production_jobs.py').redo_merge(d, body)
+            return self._send_run_json(200, result)
+        except Exception as exc:
+            return self._send_run_json(400 if isinstance(exc, ValueError) else 500, {'ok': False, 'err': scrub_err(exc)})
+
+    @route('GET', '/api/production/confirm')
+    def route_get_api_production_confirm(self, ctx):
+        # 幂等对账：按 nonce 查询提交是否已在后端落地（前端自动接管用，替代人工点按钮）。
+        try:
+            d = proj_dir(ctx.query.get('project', [''])[0])
+            nonce = ctx.query.get('nonce', [''])[0]
+            if not d: raise ValueError('项目不存在')
+            if not re.fullmatch(r'[\w-]{12,100}', nonce or ''): raise ValueError('nonce 不合法')
+            found, item_id, status = False, '', ''
+            mf = os.path.join(d, '创作', 'creation.json')
+            if os.path.isfile(mf):
+                for it in json.loads(open(mf, encoding='utf-8').read()).get('items', []):
+                    if it.get('nonce') == nonce:
+                        found, item_id, status = True, it.get('id', ''), it.get('status', '')
+                        break
+            return self._send(200, 'application/json; charset=utf-8',
+                              json.dumps({'found': found, 'item_id': item_id, 'status': status}, ensure_ascii=False).encode())
+        except Exception as exc:
+            return self._send(400, 'application/json', json.dumps({'found': False, 'err': scrub_err(exc)}, ensure_ascii=False).encode())
+
+    @route('POST', '/api/production/item/delete')
+    def route_post_api_production_item_delete(self, ctx):
+        # 删除「当前目标产出」候选：移除条目与产物文件；已被采用/被重拍引用的拒绝删除。
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8', 'replace') or b'{}')
+        d = proj_dir(body.get("project"))
+        try:
+            if not d: raise ValueError("项目不存在")
+            result = tools_mod('production_jobs.py').delete_item(d, body)
+            return self._send_run_json(200, result)
+        except Exception as exc:
+            return self._send_run_json(400 if isinstance(exc, ValueError) else 500, {'ok': False, 'err': scrub_err(exc)})
 
     @route('POST', '/api/knowledge/card', '/api/knowledge/card/delete')
     def route_post_api_knowledge_card(self, ctx):
@@ -3993,6 +4186,88 @@ class H(BaseHTTPRequestHandler):
         jid=self.spawn_job("creation",cmd)
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"id":jid,"job":True},ensure_ascii=False).encode())
 
+    @route('POST', '/api/units/build', '/api/units/anchor', '/api/units/check', '/api/units/edit')
+    def route_post_api_units(self, ctx):
+        # ① 第一步：build=LLM 生成全剧最小单元（走 job）；anchor/check=确定性；edit=人工修订（含字段锁定）
+        u=ctx.url
+        body=json.loads(self.rfile.read(ctx.content_length).decode("utf-8","replace") or b"{}")
+        d=proj_dir(body.get("project"))
+        if not d:
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目不存在"},ensure_ascii=False).encode())
+        if u.path=="/api/units/build":
+            cmd=[sys.executable,os.path.join(TOOLS,"creation_pipeline.py"),"units",d]
+            try:
+                eps_n=int(body.get("eps") or 0)
+            except (TypeError,ValueError):
+                eps_n=0
+            if eps_n>0:
+                cmd+=["--eps",str(eps_n)]
+            try:
+                arc_size=int(body.get("arc_size") or 0)
+            except (TypeError,ValueError):
+                arc_size=0
+            if arc_size>0:
+                cmd+=["--arc-size",str(arc_size)]
+            if body.get("anchor"):
+                cmd+=["--anchor"]
+            stage=str(body.get("stage") or "").strip()
+            if stage in ("story","entity","all"):
+                cmd+=["--stage",stage]
+            jid=self.spawn_job("creation",cmd)
+            return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"id":jid,"job":True},ensure_ascii=False).encode())
+        mod=tools_mod("story_units.py")
+        if mod is None:
+            return self._send(500,"application/json",json.dumps({"ok":False,"err":"story_units.py 缺失"},ensure_ascii=False).encode())
+        if u.path=="/api/units/check":
+            return self._send(200,"application/json; charset=utf-8",json.dumps(mod.check(d),ensure_ascii=False).encode())
+        if u.path=="/api/units/anchor":
+            res=mod.anchor(d,force=bool(body.get("force")))
+            rep=res.get("report") or {}
+            payload={"ok":bool(res.get("ok")),"anchor_rev":res.get("anchor_rev"),
+                     "errors":rep.get("errors") or [],"warnings":rep.get("warnings") or []}
+            if res.get("reason"):
+                payload["err"]=res["reason"]
+            return self._send(200 if payload["ok"] else 409,"application/json; charset=utf-8",
+                              json.dumps(payload,ensure_ascii=False).encode())
+        kind=str(body.get("kind") or "")
+        if kind=="episode":
+            res=mod.edit_episode(d,str(body.get("id") or ""),body.get("fields") or {})
+        elif kind=="asset":
+            res=mod.edit_asset(d,str(body.get("zone") or ""),str(body.get("id") or ""),
+                               body.get("fields") or {},body.get("lock") or [])
+        elif kind=="outline":
+            res=mod.edit_outline(d,body.get("fields") or {})
+        elif kind=="threads":
+            res=mod.edit_threads(d,body.get("foreshadows"),body.get("hooks"))
+        else:
+            res={"ok":False,"err":"kind 须为 episode|asset|outline|threads"}
+        return self._send(200 if res.get("ok") else 400,"application/json; charset=utf-8",
+                          json.dumps(res,ensure_ascii=False).encode())
+
+    @route('POST', '/api/script/extract/one', '/api/asset/regen-prompt')
+    def route_post_api_script_extract_one(self, ctx):
+        # 最小单元化：单类资产提炼（人物|场景|道具，一次 LLM 调用独立跑）/ 单资产提示词重生成。
+        body=json.loads(self.rfile.read(ctx.content_length).decode("utf-8","replace") or b"{}")
+        d=proj_dir(body.get("project"))
+        if not d:
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目不存在"},ensure_ascii=False).encode())
+        tool_path=os.path.join(TOOLS,"creation_pipeline.py")
+        if ctx.url.path == "/api/asset/regen-prompt":
+            kind=str(body.get("kind") or "").strip(); ident=str(body.get("id") or "").strip()
+            if kind not in ("character","scene","prop") or not re.fullmatch(r"[\w\-]{1,64}", ident or ""):
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":"kind/id 不合法"},ensure_ascii=False).encode())
+            cmd=[sys.executable,tool_path,"regen-prompt",d,"--kind",kind,"--id",ident]
+        else:
+            kind=str(body.get("kind") or "").strip()
+            if kind not in ("人物","场景","道具"):
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":"kind 须为 人物|场景|道具"},ensure_ascii=False).encode())
+            ep=str(body.get("episode") or "").strip()
+            if not ep:
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":"缺少集号 episode"},ensure_ascii=False).encode())
+            cmd=[sys.executable,tool_path,"extract-one",d,"--kind",kind,"--episode",ep]
+        jid=self.spawn_job("creation",cmd)
+        return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"id":jid,"job":True},ensure_ascii=False).encode())
+
     @route('POST', '/api/run')
     def route_post_api_run(self, ctx):
         u, q = ctx.url, ctx.query
@@ -4014,7 +4289,7 @@ class H(BaseHTTPRequestHandler):
                 _env=dict(os.environ); _env["PYTHONIOENCODING"]="utf-8"
                 r=subprocess.run([sys.executable,gen,jsp],capture_output=True,text=True,encoding="utf-8",errors="replace",timeout=120,env=_env)
             except Exception as e:
-                return self._send(500,"application/json",json.dumps({"ok":False,"err":"生成器异常:"+str(e)},ensure_ascii=False).encode())
+                return self._send(500,"application/json",json.dumps({"ok":False,"err":"生成器异常:"+scrub_err(e)},ensure_ascii=False).encode())
             if r.returncode!=0:
                 return self._send(500,"application/json",json.dumps({"ok":False,"err":"生成失败:"+(r.stderr or r.stdout or "")[-800:]},ensure_ascii=False).encode())
             line=[l for l in (r.stdout or "").splitlines() if l.startswith("GEN_SCRIPT:")]
@@ -4053,7 +4328,7 @@ class H(BaseHTTPRequestHandler):
                 except Exception as e:
                     with self.JLOCK:
                         self.JOBS[jid].update(status="failed",ok=False,
-                            err="MCP 发送失败（脚本已生成，可在 ⑥ 页签点「发送构建脚本」重试；Blender 是否开着 9876？）: "+str(e),
+                            err="MCP 发送失败（脚本已生成，可在 ⑥ 页签点「发送构建脚本」重试；Blender 是否开着 9876？）: "+scrub_err(e),
                             updated_at=time.time())
                     self._persist_job(jid)
             threading.Thread(target=_mcp2,daemon=True).start()
@@ -4066,7 +4341,7 @@ class H(BaseHTTPRequestHandler):
                 os.startfile(p)
                 return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"opened":os.path.basename(p)},ensure_ascii=False).encode())
             except Exception as e:
-                return self._send(500,"application/json",json.dumps({"ok":False,"err":str(e)}).encode())
+                return self._send(500,"application/json",json.dumps({"ok":False,"err":scrub_err(e)}).encode())
         if step=="blender_render":
             blend=os.path.normpath(os.path.join(VIDEO,raw[0] if raw else ""))
             if not under(VIDEO,blend) or not os.path.isfile(blend):
@@ -4111,7 +4386,7 @@ class H(BaseHTTPRequestHandler):
                     self._persist_job(jid)
                 except Exception as e:
                     with self.JLOCK:
-                        self.JOBS[jid].update(status="failed",ok=False,err="MCP 连接失败（Blender 是否开着 9876？）: "+str(e),
+                        self.JOBS[jid].update(status="failed",ok=False,err="MCP 连接失败（Blender 是否开着 9876？）: "+scrub_err(e),
                             updated_at=time.time())
                     self._persist_job(jid)
             threading.Thread(target=_mcp,daemon=True).start()
@@ -4216,8 +4491,10 @@ def heartbeat429(handler_cls):
                               or any(w in blob for w in ("超时","timeout","无输出","卡死"))))
                     stamp=j.get("updated_at", j.get("started_at", now))
                     # 生图请求等待期间可能长时间没有 stdout；只要子进程仍存活就不要按“卡死”杀掉重跑。
+                    # production worker（H3 视频 326 帧可 >1h）同理：进程存活且有自带轮询超时，不按卡死强杀。
+                    prod_worker = 'production_jobs.py' in cmd_blob
                     stale=(j.get("status")=="running" and now-float(stamp or 0)>3600
-                           and not (image_create and j.get("process_alive")))
+                           and not ((image_create or prod_worker) and j.get("process_alive")))
                     if not hit and not stale and j.get("status")!="cancelling":
                         continue
                     jj=None; full=None; retry=False

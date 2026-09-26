@@ -14,11 +14,44 @@ except Exception:
     pass
 
 
+def asset_names(src, fname, plural):
+    """素材/<fname> → {id 或 name 或别名: 名字}。表里所有"名字"列都走这份档案，
+    与 ③ 网页显示口径一致（不再输出 room/field 原值，也不在板内 actors 缺失时退回 id）。"""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(src))), "素材", fname)
+    try:
+        rows = json.load(open(path, encoding="utf-8")).get(plural) or []
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for r in rows:
+        name = str(r.get("name") or r.get("id") or "")
+        if not name:
+            continue
+        for key in (r.get("id"), r.get("name"), *(r.get("aliases") or [])):
+            if key and str(key) not in out:
+                out[str(key)] = name
+    return out
+
+
+def scene_cell(s, names):
+    ref = str(s.get("scene_ref") or "").replace("@scene:", "").strip()
+    if ref:
+        return names.get(ref, ref)
+    return {"room": "室内", "field": "外景"}.get(str(s.get("scene") or "").strip(), "")
+
+
+def speaker_name(speaker, actors, chars):
+    """优先板内 actors（分镜自带的名字表），其次 ② 提炼出的人物档案，最后才退回 id。"""
+    return ((actors.get(speaker) or {}).get("name")) or chars.get(speaker) or (speaker or "")
+
+
 def main():
     src = sys.argv[1]
     cfg = json.load(open(src, encoding="utf-8"))
     shots = cfg.get("shots") or []
     actors = cfg.get("actors") or {}
+    scene_names = asset_names(src, "场景.json", "scenes")
+    char_names = asset_names(src, "人物.json", "characters")
     out = sys.argv[2] if len(sys.argv) > 2 else \
         os.path.join(os.path.dirname(src),
                      os.path.splitext(os.path.basename(src))[0] + "_分镜脚本.xlsx")
@@ -46,10 +79,10 @@ def main():
         return ang
     for s in shots:
         lines = s.get("lines") or []
-        dlg = " / ".join(f"【{(actors.get(l.get('speaker'), {}) or {}).get('name', l.get('speaker'))}】{l.get('line','')}"
+        dlg = " / ".join(f"【{speaker_name(l.get('speaker'), actors, char_names)}】{l.get('line','')}"
                          for l in lines)
         ws.append([
-            s.get("id", ""), s.get("scene", ""), s.get("shot_size", ""),
+            s.get("id", ""), scene_cell(s, scene_names), s.get("shot_size", ""),
             round(float(s.get("dur") or 0), 1),
             s.get("content", ""), s.get("action", ""), s.get("sound", ""),
             view_of(s), s.get("camera_move", ""), s.get("lighting", ""),
@@ -70,7 +103,7 @@ def main():
     for s in shots:
         for l in s.get("lines") or []:
             ws2.append([s.get("id", ""), l.get("at", 0),
-                        (actors.get(l.get("speaker"), {}) or {}).get("name", l.get("speaker")),
+                        speaker_name(l.get("speaker"), actors, char_names),
                         l.get("line", "")])
     for i, w in enumerate([7, 10, 10, 70], 1):
         ws2.column_dimensions[chr(64 + i)].width = w

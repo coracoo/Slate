@@ -42,6 +42,22 @@ class ValidBaselineTests(unittest.TestCase):
         # 样例路径 6,6→4,4 确实斜穿长案（3x1 @6,4.5）：警告是正确判定
         self.assertIn("PATH_THROUGH_PROP", codes(r, "warnings"))
 
+    def test_top_level_scene_ref_must_be_asset_id(self):
+        """顶层 scene_ref 规范定为场景资产 id（平面图规范 :35/:104）；zones 允许写 name，两套集合不能混用。"""
+        ids, only_ids = {"loc_tent", "军帐"}, {"loc_tent"}
+        ok = valid_plan(); ok["scene_ref"] = "loc_tent"
+        self.assertNotIn("SCENE_REF_DANGLING",
+                         codes(vp.validate_document(ok, scene_ids=ids, scene_id_set=only_ids)))
+        named = valid_plan(); named["scene_ref"] = "军帐"      # 对 zones 合法、对顶层非法
+        self.assertIn("SCENE_REF_DANGLING",
+                      codes(vp.validate_document(named, scene_ids=ids, scene_id_set=only_ids)))
+        renamed = valid_plan(); renamed["scene_ref"] = "loc_renamed"   # ② 重编号后的悬空引用
+        self.assertIn("SCENE_REF_DANGLING",
+                      codes(vp.validate_document(renamed, scene_ids=ids, scene_id_set=only_ids)))
+        # 老调用方不传仅 id 集合时退回宽集合；完全不传场景清单则跳过该项，避免误报
+        self.assertNotIn("SCENE_REF_DANGLING", codes(vp.validate_document(named, scene_ids=ids)))
+        self.assertNotIn("SCENE_REF_DANGLING", codes(vp.validate_document(named)))
+
     def test_scene_ref_skipped_without_scene_ids(self):
         plan = valid_plan()
         plan["zones"][0]["scene_ref"] = "不存在"

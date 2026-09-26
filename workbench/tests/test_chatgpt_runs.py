@@ -33,8 +33,8 @@ class ChatGPTRunTests(unittest.TestCase):
         os.makedirs(os.path.join(self.project, "创作"), exist_ok=True)
         with open(os.path.join(self.project, "素材", "人物.json"), "w", encoding="utf-8") as fh:
             json.dump({"characters": [
-                {"id": "hero", "name": "主角", "sheet_prompt": "黑发制服人物三视图"},
-                {"id": "friend", "name": "同伴", "sheet_prompt": "银发制服人物三视图"},
+                {"id": "hero", "name": "主角", "sheet_prompt": "黑发制服，五视图设定图：脸部正面特写、45度左侧脸特写、不带头部正面全身、不带头部侧面全身、严格背面全身"},
+                {"id": "friend", "name": "同伴", "sheet_prompt": "银发制服，五视图设定图：脸部正面特写、45度左侧脸特写、不带头部正面全身、不带头部侧面全身、严格背面全身"},
             ]}, fh, ensure_ascii=False)
         self.first = chatgpt_queue.queue_assets(self.project, ["@character:hero"])[0]
 
@@ -282,8 +282,8 @@ class ChatGPTRunTests(unittest.TestCase):
             _png(), "result.png", {},
         )
         Path(self.project, "素材", "人物.json").write_text(json.dumps({"characters": [
-            {"id": "hero", "name": "主角", "sheet_prompt": "已经修改为红发战甲人物三视图"},
-            {"id": "friend", "name": "同伴", "sheet_prompt": "银发制服人物三视图"},
+            {"id": "hero", "name": "主角", "sheet_prompt": "已经修改为红发战甲，五视图设定图：脸部正面特写、45度左侧脸特写、不带头部正面全身、不带头部侧面全身、严格背面全身"},
+            {"id": "friend", "name": "同伴", "sheet_prompt": "银发制服，五视图设定图：脸部正面特写、45度左侧脸特写、不带头部正面全身、不带头部侧面全身、严格背面全身"},
         ]}, ensure_ascii=False), encoding="utf-8")
 
         result = chatgpt_runs.import_staged_result(

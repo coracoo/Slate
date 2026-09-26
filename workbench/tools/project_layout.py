@@ -32,6 +32,8 @@
 改写只在对应迁移动作发生的那一轮执行（避免把新"素材/"资产路径误改成拉片素材）；
 老项目若是早期版本迁移过的，可手动补跑：
   python workbench/tools/project_layout.py <项目目录> --fix-strings
+--fix-strings 补改除 素材/→拉片素材/ 以外的全部规则：裸 `素材/` 在目录已迁移的项目里
+就是资产路径，无法靠字面量区分，强制改写只会把可用路径打断。源视频路径请人工核对。
 
 调用点：server.proj_dir（每次 API 访问惰性迁移）；CLI 直接跑旧项目前可先执行
   python workbench/tools/project_layout.py <项目目录>
@@ -233,9 +235,12 @@ def migrate_project(proj: str, fix_strings: bool = False) -> list:
                     did_actor = True
                 else:
                     did_deduce = True
-        # 6) 字符串引用改写（本轮发生过对应迁移才改；--fix-strings 强制全量补改）
+        # 6) 字符串引用改写（本轮发生过对应迁移才改；--fix-strings 强制补改其余规则）
         if fix_strings:
-            did_src = did_asset = did_frames = did_actor = did_deduce = True
+            # did_src 故意不强制：裸 `素材/`→`拉片素材/` 有歧义。目录早已迁移的项目里
+            # 素材/ 就是资产目录，强制改写会把正确的资产路径打断（09_蜘女 实测 380 条），
+            # 还会顺带改到指向别的项目的绝对路径。源视频路径只在本轮真发生重命名时改。
+            did_asset = did_frames = did_actor = did_deduce = True
         if any((did_src, did_asset, did_frames, did_actor, did_deduce)):
             _rewrite_strings(proj, did_src, did_asset, did_frames, did_actor, did_deduce, log)
     except OSError as exc:

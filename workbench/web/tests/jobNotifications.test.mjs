@@ -6,9 +6,9 @@ import ts from 'typescript'
 
 test('成功、失败、中断、丢失均通知一次，排队不提前完成', async () => {
   const notices = [], timers = [], responses = new Map()
-  const api = fs.readFileSync('src/api.ts', 'utf8')
+  const api = fs.readFileSync(new URL('../src/api.ts', import.meta.url), 'utf8')
   const helpers = api.slice(api.indexOf('export function jobDone'), api.indexOf('export function fmtT'))
-  const source = fs.readFileSync('src/stores/jobs.ts', 'utf8').replace(/^import .*$/mg, '')
+  const source = fs.readFileSync(new URL('../src/stores/jobs.ts', import.meta.url), 'utf8').replace(/^import .*$/mg, '')
   const js = ts.transpile(helpers + source, {target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.CommonJS})
   const context = {exports:{}, reactive:x=>x, toast:(...x)=>notices.push(x),
     fetchJob:async id=>responses.get(id), fetchJobs:async()=>({jobs:[]}),

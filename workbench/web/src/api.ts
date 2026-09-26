@@ -2,6 +2,7 @@
 /** 统一 API 访问层：类型定义 + fetch 封装 + 后台任务轮询。 */
 import type { ChatGPTRun } from './utils/chatgptRun'
 import { visibleVendors } from './utils/providerVisibility'
+import { createVersionBatcher } from './utils/versionBatch'
 
 export interface Project {
   name: string
@@ -178,9 +179,22 @@ export async function getJSON<T>(url: string): Promise<T> {
 }
 
 // ---- 账号体系（N85）----
-export const fetchAuthStatus = () =>
-  getJSON<{ ok: boolean; configured: boolean; authed: boolean }>('/api/auth/status')
-    .then((s) => { if (s.authed) markAuthed(); else { guest = true; resolveAuth(false) } return s })
+// 首次认证结论是一次性 Promise（authReady）：请求抛错（服务重启中/网络抖动/5xx）时
+// 必须也 settle，否则 jobs 轮询等模块级订阅者永久悬挂——项目树空白、任务抽屉整会话不接管。
+// 失败先短重试；重试仍失败按「未知」放行订阅者（不置 guest，真 401 时再走登录跳转）。
+export async function fetchAuthStatus(retries?: number) {
+  const attempts = retries ?? (location.pathname === '/login' ? 0 : 2)
+  for (let i = 0; ; i++) {
+    try {
+      const s = await getJSON<{ ok: boolean; configured: boolean; authed: boolean }>('/api/auth/status')
+      if (s.authed) markAuthed(); else { guest = true; resolveAuth(false) }
+      return s
+    } catch (e) {
+      if (i >= attempts) { resolveAuth(false); throw e }
+      await new Promise((r) => setTimeout(r, 1500 * (i + 1)))
+    }
+  }
+}
 export const authSetup = (password: string) => postJSON<{ ok: boolean }>('/api/auth/setup', { password })
 export const authLogin = (password: string) => postJSON<{ ok: boolean }>('/api/auth/login', { password })
 export const authLogout = () => postJSON<{ ok: boolean }>('/api/auth/logout', {})
@@ -277,6 +291,8 @@ export interface AssetRegistryItem {
   /** 资产级画风自由文本（最高优先级，直接作为画风层）；空 = 用 style skill / 项目默认。 */
   style_prompt?: string
   states?: AssetStateItem[]
+  /** 人物设定图提示词（五视图构图）；场景/道具用 prompt 字段。 */
+  sheet_prompt?: string
 }
 export interface AssetPromptLayers {
   subject: string; style: string; style_source: "asset_text" | "asset_skill" | "project" | "none"
@@ -881,7 +897,112 @@ export const fetchBrief = (project: string) =>
   getJSON<{ ok: boolean; brief: ProductionBrief; exists: boolean }>(`/api/script/brief?project=${encodeURIComponent(project)}`)
 export const saveBrief = (project: string, patch: Partial<ProductionBrief>) =>
   postJSON<{ ok: boolean; brief: ProductionBrief }>('/api/script/brief', { project, patch })
-/** 资产设定图生图：人物三视图/场景/道具（kind: character|scene|prop|all）。 */
+
+/* ---------- 全剧最小单元（① 第一步）：剧本/大纲.json 加厚 + 埋线.json + 素材设定层 ---------- */
+export interface UnitArc {
+  id: string
+  title?: string
+  ep_from: string
+  ep_to: string
+  goal?: string
+  release?: string[]
+  why_distinct?: string
+}
+export interface UnitRule { id: string; text: string; check_hint?: string }
+export interface UnitTaboo { id: string; rule: string; detect?: string[]; source?: string; level?: string }
+export interface UnitForeshadow {
+  id: string
+  plant: string
+  set_in: string
+  form?: string
+  pay_in: string
+  payoff?: string
+  refs?: string[]
+  status?: string
+}
+export interface UnitHook { id: string; beat: string; question?: string; ep: string }
+export interface UnitEpisode {
+  id: string
+  title?: string
+  summary?: string
+  hook?: string
+  cliff?: string
+  duration_min?: number
+  arc_id?: string
+  beats?: string[]
+  fs_plant?: string[]
+  fs_pay?: string[]
+  cast_refs?: string[]
+  scene_refs?: string[]
+  key_asset_refs?: string[]
+  state_derive?: { ref: string; state_id?: string; label?: string; look_diff?: string }[]
+  relation_shift?: string[]
+  has_text?: boolean
+  text_len?: number
+}
+export interface UnitIndexRow {
+  ref: string
+  episodes: string[]
+  arcs?: string[]
+  first_ep?: string | null
+  key_eps?: string[]
+  foreshadows?: string[]
+  state_eps?: Record<string, string[]>
+  used_by_boards?: string[]
+}
+export interface UnitsReport {
+  ok: boolean
+  errors: { code: string; path: string; message: string }[]
+  warnings: { code: string; path: string; message: string }[]
+  counts?: Record<string, number>
+}
+export interface UnitsBundle {
+  ok: boolean
+  anchored: boolean
+  anchor_rev: number
+  outline: {
+    premise?: string
+    highlights?: string[]
+    sources?: { item: string; origin: string }[]
+    rules?: UnitRule[]
+    taboos?: UnitTaboo[]
+    pressure?: Record<string, string>
+    arcs?: UnitArc[]
+    throughline?: { stage: string; text: string }[]
+    causality?: { from: string; to: string; because?: string }[]
+  }
+  episodes: UnitEpisode[]
+  foreshadows: UnitForeshadow[]
+  hooks: UnitHook[]
+  bios: { ref: string; name: string; bio_language?: string; bio_crack?: string; bio_pressure?: string; bio_address?: string; bio_arc?: string; states?: string[] }[]
+  scene_limits: { ref: string; name: string; spatial_limit?: string; action_slots?: string[] }[]
+  prop_boundaries: { ref: string; name: string; usage_boundary?: string }[]
+  index: Record<string, UnitIndexRow>
+  report: UnitsReport
+}
+export const fetchUnits = (project: string) =>
+  getJSON<UnitsBundle>(`/api/units?project=${encodeURIComponent(project)}`)
+/** 第一步 LLM 生成（走 job）：anchor=true 表示生成完直接锚定 */
+export const buildUnits = (body: { project: string; eps?: number; arc_size?: number; anchor?: boolean;
+                                   stage?: 'all' | 'story' | 'entity' }) =>
+  postJSON<{ ok: boolean; id: number; job: boolean }>('/api/units/build', body)
+export const anchorUnits = (project: string, force = false) =>
+  postJSON<{ ok: boolean; anchor_rev?: number; errors?: UnitsReport['errors']; err?: string }>(
+    '/api/units/anchor', { project, force })
+export const checkUnits = (project: string) => postJSON<UnitsReport>('/api/units/check', { project })
+/** 人工修订：kind=episode|asset|outline|threads；asset 带 lock 即写 locked_fields（之后生成流程不得覆盖） */
+export const editUnits = (body: {
+  project: string
+  kind: 'episode' | 'asset' | 'outline' | 'threads'
+  id?: string
+  zone?: string
+  fields?: Record<string, unknown>
+  lock?: string[]
+  foreshadows?: UnitForeshadow[]
+  hooks?: UnitHook[]
+}) => postJSON<{ ok: boolean; applied?: string[]; rejected?: string[]; err?: string; report?: UnitsReport }>(
+  '/api/units/edit', body)
+/** 资产设定图生图：人物五视图/场景/道具（kind: character|scene|prop|all）。 */
 export const genAssetImage = (body: { project: string; kind: string; id?: string; vendor_id?: string; force?: boolean; states?: 'include' | 'only' | 'skip'; state_id?: string }) =>
   postJSON<RunResult>('/api/asset/image', body)
 /** 剧情战略图（2D 俯视走位/相机/运镜交互 HTML）。 */
@@ -958,6 +1079,8 @@ export interface ActingShot {
   /** 演员层只允许生成的主角；空数组表示本镜没有可生成主角。 */
   actor_ids?: string[]; actor_names?: string[]
   performance_status: 'ready' | 'pending' | 'locked' | 'invalid' | string
+  /** ⑤ 过期探针（compile_shot）跑不动时的原因；状态值不变，仅用于提示"就绪"未经核验。 */
+  performance_check_error?: string
   performance_locked: boolean; performance?: Record<string, unknown> | null
 }
 export interface ActingCandidate {
@@ -987,8 +1110,13 @@ export const setActingLock = (body: { project: string; storyboard: string; shot_
 
 /* ---------- 产出版本管理（最新原位 + .versions 历史） ---------- */
 export interface FileVersion { ts: string; rel: string; current: boolean }
-export const fetchVersions = (p: string) =>
-  getJSON<{ versions: FileVersion[] }>(`/api/versions?p=${encodeURIComponent(p)}`)
+/** 走批量端点：同窗口内多个组件的版本徽标合成一次请求（见 utils/versionBatch.ts） */
+const requestVersions = createVersionBatcher<FileVersion>(async (paths) => {
+  const r = await postJSON<{ ok: boolean; results: Record<string, FileVersion[]> }>(
+    '/api/versions/batch', { paths })
+  return r.results || {}
+})
+export const fetchVersions = (p: string) => requestVersions(p)
 export const restoreVersion = (p: string, ts: string) =>
   postJSON<{ ok: boolean }>('/api/versions/restore', { p, ts })
 
@@ -1013,8 +1141,15 @@ export const fetchProjectFile = <T = unknown>(project: string, p: string) =>
   getJSON<T>(`/api/file?project=${encodeURIComponent(project)}&p=${encodeURIComponent(p)}`)
 
 /* ---------- 分镜汇总表格：行内编辑回写 + xlsx 导出 ---------- */
-export const saveStoryboardShots = (project: string, name: string, shots: unknown[]) =>
-  postJSON<{ ok: boolean; shots: number }>('/api/storyboard/save', { project, name, shots })
+/** 分镜文件的乐观锁基线：③ 是整组回写，回写前必须拿到当前 revision，
+ *  否则会把 ⑦ 创作生成 / ⑤ 演员表现 期间写好的提示词静默盖掉。 */
+export const fetchStoryboardRevision = (project: string, name: string) =>
+  getJSON<{ ok: boolean; revision: string }>(
+    `/api/storyboard/revision?project=${encodeURIComponent(project)}&name=${encodeURIComponent(name)}`)
+export const saveStoryboardShots = (project: string, name: string, shots: unknown[], revision: string) =>
+  postJSON<{ ok: boolean; shots: number; revision: string;
+    unit_warnings?: { code: string; shot_id: string; taboo_id: string; rule: string;
+                      hits: { field: string; word: string; snippet: string }[] }[] }>('/api/storyboard/save', { project, name, shots, revision })
 export const exportStoryboardXlsx = (project: string, name: string) =>
   postJSON<{ ok: boolean; file: string }>('/api/storyboard/xlsx', { project, name })
 /** 删除分镜文件（及同名单镜 xlsx）；.versions 历史快照保留。 */

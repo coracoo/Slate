@@ -7,9 +7,11 @@ import { useRouter } from 'vue-router'
 import {
   fetchScriptData, fetchWhiteBoard, fetchCreate, scriptStoryboard,
   previewKnowledge, saveStoryboardShots, exportStoryboardXlsx, deleteStoryboard, compileActingPrompt, runActing, fetchEnvConfig,
-  rebuildProductionPrompts, rebuildProductionEpisode,
+  rebuildProductionPrompts, rebuildProductionEpisode, fetchStoryboardRevision,
   mediaUrl, type ScriptBundle, type WhiteBoard, type KnowledgeSkill, type CreateItem
 } from '../api'
+import { conflictNotice, isRevisionConflict, overwriteAllowed } from '../utils/boardRevision'
+import { sceneLabel, speakerName } from '../utils/assetNames'
 import { app, projectFiles, toast, currentProject } from '../stores/app'
 import { trackJob } from '../stores/jobs'
 import StyledSelect from '../components/StyledSelect.vue'
@@ -54,6 +56,14 @@ const boardRev = ref<number | null>(null)
 /** 剧本修订号（①剧本分集每次变更 +1）；分镜低于它说明是旧剧本生成的。 */
 const scriptRev = computed(() => Number(data.value?.script_rev || 0))
 const boardStale = computed(() => boardRev.value !== null && scriptRev.value > boardRev.value)
+/** 分镜文件自身的 revision：③ 是整组回写，回写必须带它，否则会把 ⑦/⑤ 期间的改动静默盖掉。
+ *  与上面的 boardRev（= 剧本 script_rev）不是一回事，别混用。 */
+const boardFileRev = ref('')
+/** 分镜自带的名字表（板内 actors）：台词列显示名字时优先用它，与 xlsx 导出同源。 */
+const boardActors = ref<Record<string, { name?: string }>>({})
+/** 非空 = 上一次保存被服务端判为过期基线拒掉；表格内容仍留在页面上，等用户决策。 */
+const boardConflict = ref('')
+const overwriteConfirmed = ref(false)
 let boardLoadSeq = 0
 const shots = ref<Shot[]>([])
 const shotOutputs = ref<Record<string, { status: CreateItem['status']; count: number; image?: string }>>({})
@@ -70,10 +80,11 @@ const scenesMap = computed<Record<string, string>>(() => {
 const scenesAssets = computed(() => (data.value as any)?.scenes?.scenes || [])
 /** 场景列：scene_ref 场景名优先；room/field 是对话契约的预设地形（军帐室内/野外战场），翻译成中文展示 */
 function sceneCell(s: Shot): { label: string; cls: string; title: string } {
+  const label = sceneLabel(s, scenesMap.value)   // 取值规则与 xlsx 的 scene_cell() 同源
   const ref = String(s.scene_ref || '').replace(/^@scene:/, '')
-  if (ref) return { label: scenesMap.value[ref] || ref, cls: 'bg-violet-400/15 text-violet-300', title: `场景资产：@scene:${ref}` }
-  if (s.scene === 'field') return { label: '外景', cls: 'bg-amber-400/15 text-amber-300', title: 'field＝野外/战场预设地形（未关联场景资产）' }
-  if (s.scene === 'room') return { label: '室内', cls: 'bg-white/10 text-slate-400', title: 'room＝室内预设地形（未关联场景资产）' }
+  if (ref) return { label, cls: 'bg-violet-400/15 text-violet-300', title: `场景资产：@scene:${ref}` }
+  if (s.scene === 'field') return { label, cls: 'bg-amber-400/15 text-amber-300', title: 'field＝野外/战场预设地形（未关联场景资产）' }
+  if (s.scene === 'room') return { label, cls: 'bg-white/10 text-slate-400', title: 'room＝室内预设地形（未关联场景资产）' }
   return { label: '—', cls: 'bg-white/5 text-slate-500', title: '未设置场景' }
 }
 
@@ -92,15 +103,28 @@ async function loadBoard() {
   shots.value = []
   shotOutputs.value = {}
   boardRev.value = null
+  boardFileRev.value = ''
+  boardActors.value = {}
+  boardConflict.value = ''
+  overwriteConfirmed.value = false
   detail.value = null
   if (!project || !name) return
   try {
     const b: WhiteBoard = await fetchWhiteBoard(project, name)
     if (seq !== boardLoadSeq) return
+    boardActors.value = (b.actors || {}) as Record<string, { name?: string }>
     shots.value = ((b.shots || []) as unknown as Shot[]).map(s => ({...s, prompt_image: s.prompt_image || s.prompt || '', dur: Number(s.dur) > 0 ? Number(s.dur) : 4}))
     boardRev.value = typeof b.script_rev === 'number' ? b.script_rev : null
   } catch {
     if (seq === boardLoadSeq) shots.value = []
+  }
+  // 乐观锁基线单独取：/api/white/board 是白模页共用的「原文件直出」，不能往里塞元信息；
+  // 取不到基线时宁可让保存被 400 挡下，也不能退化成无锁整组覆盖。
+  try {
+    const r = await fetchStoryboardRevision(project, name)
+    if (seq === boardLoadSeq) boardFileRev.value = r.revision || ''
+  } catch {
+    if (seq === boardLoadSeq) boardFileRev.value = ''
   }
   try {
     const created = await fetchCreate(project)
@@ -161,19 +185,59 @@ watch(viewTab, (tab) => {
 })
 const gridDirty = ref(false)
 const savingGrid = ref(false)
+// 编辑计数：用于识别「保存请求在途期间用户又改了格子」——那时不得用服务端回读覆盖在途编辑
+let gridEdits = 0
+// 切分镜表必须复位脏标记：否则仍显示「有未保存修改」，点保存会把新表整组回写并生成多余 .versions 快照
+watch(board, () => { gridDirty.value = false; gridEdits++; boardConflict.value = ''; overwriteConfirmed.value = false })
 
 /** 汇总表格：行内编辑 内容/动作/声音/光影/三提示词（时长/器械/镜头只读，调整在⑦创作生成），整组回写（版本快照保护） */
-function markDirty() { gridDirty.value = true }
+function markDirty() { gridEdits++; gridDirty.value = true }
 async function saveGrid() {
   if (!app.current || !board.value || !shots.value.length) return
+  // 拿不到基线就不发写请求：整组回写一旦失去基线就退化成"最后写入者赢"，正是这次要堵的洞
+  if (!boardFileRev.value) {
+    boardConflict.value = '没拿到这份分镜的基线版本（服务在重启、或文件刚被换过），已拦住保存。点「重新载入最新版」后再试。'
+    return
+  }
   savingGrid.value = true
+  const editsAtSave = gridEdits
   try {
-    const r = await saveStoryboardShots(app.current, board.value, shots.value)
+    const r = await saveStoryboardShots(app.current, board.value, shots.value, boardFileRev.value)
+    if (r.revision) boardFileRev.value = r.revision
+    boardConflict.value = ''
+    overwriteConfirmed.value = false
     toast(`已保存 ${r.shots} 镜（旧版自动进 .versions）`, 'ok')
-    gridDirty.value = false
-    loadBoard()
-  } catch (e) { toast(e instanceof Error ? e.message : '保存失败', 'err') }
+    if (r.unit_warnings?.length) {
+      // ① 锚定的创作禁区命中：只提醒不拦保存（分镜是给人改的工作件，拦了等于抽奖）
+      const first = r.unit_warnings[0]
+      toast(`创作禁区告警 ${r.unit_warnings.length} 镜：${first.shot_id} 违反 ${first.taboo_id}（${first.rule}）`, 'info', 8000)
+    }
+    if (editsAtSave === gridEdits) { gridDirty.value = false; loadBoard() }
+    else { gridDirty.value = true; toast('保存期间你又改了内容：已保留你的编辑，暂不重载服务端版本', 'info') }
+  } catch (e) {
+    if (isRevisionConflict(e)) { boardConflict.value = conflictNotice(e); toast('分镜已被别处改动：本次保存没有写下去', 'err') }
+    else toast(e instanceof Error ? e.message : '保存失败', 'err')
+  }
   finally { savingGrid.value = false }
+}
+/** 冲突后先看再决定：重载会丢页面未保存的编辑，所以只在用户显式点击时做。 */
+async function reloadLatest() {
+  boardConflict.value = ''
+  overwriteConfirmed.value = false
+  await loadBoard()
+  toast('已重载服务端最新版，你的表格编辑被替换', 'info')
+}
+/** 「仍用我的版本覆盖」= 重取基线后立刻把页面这份整组写回（旧版仍进 .versions，可回滚）。 */
+async function overwriteLatest() {
+  if (!app.current || !board.value) return
+  try {
+    const r = await fetchStoryboardRevision(app.current, board.value)
+    if (!overwriteAllowed(overwriteConfirmed.value, r.revision || '')) {
+      toast('请先勾选「确认以我这版为准」再点覆盖', 'err'); return
+    }
+    boardFileRev.value = r.revision
+    await saveGrid()
+  } catch (e) { toast(e instanceof Error ? e.message : '取基线失败，未覆盖', 'err') }
 }
 async function doXlsx() {
   if (!app.current || !board.value) return
@@ -188,7 +252,8 @@ async function doXlsx() {
   } catch (e) { toast(e instanceof Error ? e.message : '导出失败', 'err') }
 }
 function linesOf(s: Shot): string {
-  return (s.lines || []).map((l) => `【${l.speaker}】${l.line}`).join(' / ')
+  // 与 Excel 导出同口径：台词显示**名字**不是 id（板内 actors 优先，其次 ② 人物档案）
+  return (s.lines || []).map((l) => `【${spk(l.speaker)}】${l.line}`).join(' / ')
 }
 /** 删除当前分镜（同名单镜 xlsx 一并删除；.versions 历史快照保留可恢复） */
 async function removeBoard() {
@@ -286,8 +351,10 @@ async function doSb() {
   sbRunning.value = []
   load()
 }
+/** 说话人显示名：板内 actors（分镜自带的名字表）优先，其次 ② 提炼的人物档案，最后才退回 id。
+ *  与 `export_storyboard_xlsx.speaker_name` 同一条链（共用 utils/assetNames）。 */
 function spk(id?: string) {
-  return chars.value.find((c) => c.id === id)?.name || id || ''
+  return speakerName(id, boardActors.value, chars.value)
 }
 
 function goPackage() { router.push('/package') }
@@ -456,7 +523,20 @@ useBoardSelection(board, boards, 'shots')
           </template>
         </div>
 
-        <!-- 汇总表格（Excel 式）：镜号/场景/时长/机位视角/器械/镜头/运镜/内容/动作/声音/光影/台词/三提示词。
+        <!-- 乐观锁冲突：服务端判基线过期时，页面这份内容仍然留着，由用户对照或显式覆盖——绝不静默盖掉 ⑦/⑤ 的改动 -->
+        <div v-if="boardConflict" class="mb-3 rounded-lg border border-amber-400/30 bg-amber-400/10 p-3 text-xs text-amber-200">
+          <b class="font-bold">这份分镜被别处改动过，本次保存没有写下去</b>
+          <p class="mt-1 leading-relaxed">{{ boardConflict }}</p>
+          <div class="mt-2 flex flex-wrap items-center gap-3">
+            <label class="flex items-center gap-1.5 text-2xs">
+              <input v-model="overwriteConfirmed" type="checkbox" /> 确认以我这版为准（会覆盖 ⑦/⑤ 改的提示词）
+            </label>
+            <button class="btn btn-ghost" @click="reloadLatest">重新载入最新版</button>
+            <button class="btn" :disabled="!overwriteConfirmed || savingGrid" @click="overwriteLatest">仍用我的版本覆盖</button>
+          </div>
+        </div>
+
+        <!-- 汇总表格（Excel 式）：镜号/场景/景别/时长/机位视角/器械/镜头/运镜/内容/动作/声音/光影/台词/三提示词。
              时长/器械/镜头为只读——初稿由 LLM 生成，实际调整在⑦创作生成；其余列行内编辑，整组回写（版本快照保护）。 -->
         <div v-if="viewTab === 'grid'">
           <div v-if="!shots.length" class="py-10 text-center text-sm text-slate-500">选择或生成一个剧本分镜</div>
@@ -466,6 +546,7 @@ useBoardSelection(board, boards, 'shots')
                 <tr>
                   <th class="sticky-col">镜号</th>
                   <th class="min-w-24">场景</th>
+                  <th class="w-20">景别</th>
                   <th class="w-16">时长s</th>
                   <th>机位(视角)</th>
                   <th>器械</th>
@@ -485,6 +566,8 @@ useBoardSelection(board, boards, 'shots')
                   <td class="whitespace-nowrap">
                     <span class="rounded px-1.5 py-0.5 text-2xs font-bold" :class="sceneCell(s).cls" :title="sceneCell(s).title">{{ sceneCell(s).label }}</span>
                   </td>
+                  <!-- 景别：与 Excel 导出同列（原来只有 xlsx 有，两边口径对不上）；调整在逐镜明细/JSON -->
+                  <td class="whitespace-nowrap text-slate-300">{{ s.shot_size || '—' }}</td>
                   <td class="text-center tabular-nums text-slate-200">{{ s.dur ?? 4 }}s</td>
                   <td class="whitespace-nowrap text-slate-400" :title="`${JSON.stringify(s.pos)} → ${JSON.stringify(s.look)}`">{{ viewOf(s) }}</td>
                   <td class="whitespace-nowrap text-slate-300">{{ s.rig || '—' }}</td>

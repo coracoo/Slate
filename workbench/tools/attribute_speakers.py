@@ -30,17 +30,20 @@ ATTR_PROMPT = """你是台词归属标注员。以下是同一镜头的关键帧
 只输出一个 JSON 对象，不要输出任何其他文字:
 {{"lines":[{{"i":0,"speaker":"角色名"}},...]}}
 speaker 必须优先取自已知角色表；表中无人能对上时才用新名字（用最有辨识度的称呼，如诸葛亮/王朗/老者，禁止用 unknown）。"""
+
+NORM_PROMPT = """以下是对同一部影片做台词归属时收集到的角色名列表，可能包含同一人的不同叫法：
+{names}
+请做别名归一：把指向同一人物的名字映射到最规范的一个（如 "左侧老者"/"老者" -> "王朗"）。
+只输出一个 JSON 对象: {{"map":{{"原名1":"规范名","原名2":"规范名"}}}}；无需合并的名字不要出现在 map 里。"""
+
+# 覆盖层必须在两份内置提示词都定义之后再套：曾把 sys_for 调用放在 NORM_PROMPT
+# 定义之前，NameError 被下面的 except 吞掉，attribute_norm 覆盖层从此永久失效。
 try:
     import prompt_modules as _PM
     ATTR_PROMPT = _PM.sys_for("attribute", ATTR_PROMPT)
     NORM_PROMPT = _PM.sys_for("attribute_norm", NORM_PROMPT)
 except Exception:
     pass
-
-NORM_PROMPT = """以下是对同一部影片做台词归属时收集到的角色名列表，可能包含同一人的不同叫法：
-{names}
-请做别名归一：把指向同一人物的名字映射到最规范的一个（如 "左侧老者"/"老者" -> "王朗"）。
-只输出一个 JSON 对象: {{"map":{{"原名1":"规范名","原名2":"规范名"}}}}；无需合并的名字不要出现在 map 里。"""
 
 
 def ts(s):
@@ -231,6 +234,11 @@ def main():
                          for l in raw if l.get("speaker")]}
     sc_out = os.path.join(root, "台词", "AI归属_台词角色.json")
     os.makedirs(os.path.dirname(sc_out), exist_ok=True)
+    try:
+        import versions as _V
+        _V.snapshot(sc_out)
+    except Exception:
+        pass
     json.dump(sidecar, open(sc_out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     print(f"[信息] sidecar -> {sc_out}（{len(sidecar['lines'])} 条，{len(final_names)} 人）", flush=True)
 
@@ -254,6 +262,12 @@ def main():
             bak = os.path.join(root, "台词", "台词脚本.bak.json")
             if not os.path.isfile(bak):
                 shutil.copy2(scr_p, bak)
+        except Exception:
+            pass
+        # .bak.json 只留第一次的原始副本；每轮写回都要另存当轮被覆盖的版本
+        try:
+            import versions as _V
+            _V.snapshot(scr_p)
         except Exception:
             pass
         json.dump(script, open(scr_p, "w", encoding="utf-8"), ensure_ascii=False, indent=1)

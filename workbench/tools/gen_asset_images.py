@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
-"""资产设定图生图：人物三视图 / 场景概念图 / 道具设定图（跨镜头一致性参考图）
+"""资产设定图生图：人物五视图设定图 / 场景概念图 / 道具设定图（跨镜头一致性参考图）
 
 提炼（LLM）→ 生图（image 厂商）。
-- 人物：characters[].sheet_prompt（三视图：正面/侧面/背面全身立绘，纯白背景）→ 素材/人物/<id>.png
+- 人物：characters[].sheet_prompt（五视图设定图：脸部正面/45度侧特写 + 不带头部正面/侧面全身 + 背面全身，纯白背景）→ 素材/人物/<id>.png
 - 场景：scenes[].image_prompt → 素材/场景/<id>.png
 - 道具：props[].image_prompt → 素材/道具/<id>.png
 索引：素材/素材图.json {人物:{id:{path,prompt}},场景:{...},道具:{...}} —— 供前端展示与
 模拟创作/图生视频把资产图作为参考图（角色一致性的关键）。
 
 参考图规则：
-- 母素材（无 parent_ref/derived_from）：母图零参考文生图直出（人物三视图
+- 母素材（无 parent_ref/derived_from）：母图零参考文生图直出（人物五视图
   纯白底、纯场景无人物、纯道具），不因任何引用缺失而拦截。
 - 子素材（parent_ref，如道具 component_of 角色）：以父资产母图为参考改图；
   父图缺失时降级为无参考生成并打印告警。
@@ -21,13 +21,13 @@
 用法: python gen_asset_images.py <项目目录> [--kind character|scene|prop|all] [--id 资产id] [--vendor 厂商id] [--force]
 stdout 末行 OUTPUT:<素材根目录>；退出码 0=全部成功 1=部分/全部失败（部分成功也写出已完成的索引）
 """
-import sys, os, json, argparse
+import sys, os, json, argparse, re
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
     pass
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from llm_openai import VendorClient, load_vendors, VendorError
+from llm_openai import VendorClient, load_vendors, VendorError, set_billing_project
 from reference_limits import reference_limit
 import skill_lib
 
@@ -36,6 +36,25 @@ _MALE_MARKERS = ("少年", "男性", "男孩", "男生", "男子", "man", "boy",
 _GENDER_SWAP_F2M = {"少女": "少年", "女性": "男性", "女孩": "男孩", "女生": "男生", "女子": "男子",
                     "女高中生": "男高中生", "woman": "man", "girl": "boy", "female": "male"}
 _GENDER_SWAP_M2F = {v: k for k, v in _GENDER_SWAP_F2M.items()}
+
+
+# "性别不明/性别未提及"这类空信息词在生图里没有价值，要剔；但剔的时候必须把它带的
+# "的/，/、"一起带走，否则档案里会留下"的成年人"这种主语残缺的句子
+# （09_仙 沈砚 的母图提示词就是这么坏的：状态图写"性别不明的成年人"，母图只剩"的成年人"）。
+GENDER_PLACEHOLDERS = ("性别不明的", "性别不明，", "性别不明、", "性别不明",
+                       "性别未提及的", "性别未提及，", "性别未提及")
+
+
+def drop_gender_placeholder(text, replacement=""):
+    """删掉或替换性别占位词；replacement 为空时连连接词一起剥净，保证句子不残缺。"""
+    out = str(text or "")
+    for marker in GENDER_PLACEHOLDERS:
+        tail = (replacement + "的") if (replacement and marker.endswith("的")) else \
+               (replacement + "，") if (replacement and marker.endswith("，")) else \
+               (replacement + "、") if (replacement and marker.endswith("、")) else replacement
+        out = out.replace(marker, tail)
+    out = re.sub(r"[，、；;]{2,}", "；", out)
+    return out.strip("；;、， \n")
 
 
 def _gender_guard(item, prompt):
@@ -103,6 +122,60 @@ def load_asset_index(project):
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
+
+
+def archive_ids(project, kind):
+    """资产档案里的 id 集合（读不到或没这栏时返回 None = 无法判断，不误报）。"""
+    fname, key = KINDS[kind][0], KINDS[kind][1]
+    path = os.path.join(os.path.abspath(str(project)), "素材", fname)
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            doc = json.load(fh)
+    except (OSError, ValueError):
+        return None
+    rows = doc.get(key) if isinstance(doc, dict) else doc
+    if not isinstance(rows, list):
+        return None
+    return {str(r.get("id")) for r in rows if isinstance(r, dict) and r.get("id")}
+
+
+def find_orphan_index_rows(project):
+    """索引里有图、资产档案里已无该记录的条目。
+
+    重跑 ② 提炼时 LLM 会换 id（如 quantongban → xueshenga），而 素材图.json 只增不删，
+    于是留下"图还在、档案已无此人"的孤儿行；分镜继续 @character:旧id 引用时，
+    身份锚点在 prompt_assembler 那层就已静默失效。返回 [{kind, id, path}]。
+    """
+    zone_of = {v[3]: k for k, v in KINDS.items()}
+    index = load_asset_index(project)
+    out = []
+    for zone, kind in zone_of.items():
+        ids = archive_ids(project, kind)
+        if ids is None:
+            continue
+        for key, ent in (index.get(zone) or {}).items():
+            base = str(key).split("__", 1)[0]        # 状态图/派生图/平面图按母 id 归位
+            if base in ids:
+                continue
+            path = ent.get("path") if isinstance(ent, dict) else None
+            if path:
+                out.append({"kind": kind, "zone": zone, "id": str(key), "path": str(path)})
+    return out
+
+
+def report_orphan_index_rows(project):
+    """提炼收尾的确定性体检：只报不改（删图/补档都归用户判断）。"""
+    orphans = find_orphan_index_rows(project)
+    orphans = find_orphan_index_rows(project)
+    for row in orphans:
+        print(f"[警告] 素材图索引孤儿：{row['path']} 对应的{row['zone']}档案已不存在"
+              f"（重跑提炼换过 id？分镜若仍引用 @{row['kind']}:{row['id']} 将拿不到身份锚点）")
+    if orphans:
+        print(f"[提示] 共 {len(orphans)} 条索引行在档案里已无对应资产；确认后可在 ② 删除对应素材图，"
+              f"或把分镜引用改指新 id")
+    return orphans
 
 
 def delete_asset_image(project, kind, asset_id):
@@ -353,7 +426,12 @@ def main():
     proj = os.path.abspath(a.project)
     if not os.path.isdir(proj):
         print(f"[错误] 项目不存在: {proj}"); sys.exit(1)
+    set_billing_project(os.path.basename(proj))
     out_root = os.path.join(proj, "素材")
+    # 画幅统一走项目规格（brief.aspect_ratio，缺省 16:9）：母图与状态图共用，提前解析
+    from brief import aspect_ratio_of
+    from create_media import image_size_for_aspect, image_ratio_for_aspect
+    _aspect = aspect_ratio_of(proj)
     os.makedirs(out_root, exist_ok=True)
     idx_path = os.path.join(out_root, "素材图.json")
     index = load_asset_index(proj)
@@ -407,7 +485,7 @@ def main():
         for note in guard_notes:
             print(f"[告警] {zone}/{aid} {note}")
         # 剔空值废词："性别不明"对生图无信息量（异兽/无实体角色本就不需要性别）
-        prompt = prompt.replace("性别不明，", "").replace("性别不明", "")
+        prompt = drop_gender_placeholder(prompt)
         # 资产级画风覆盖（资产档案 style 字段）优先于项目生图风格
         asset_style = str(it.get("style") or "").strip() or None
         # E10 冻结：记录本资产实际注入的 image skill 快照（id/name/正文 sha 前12位）。
@@ -438,6 +516,10 @@ def main():
         # --states only：只补状态图，母图已存在就不重生成；母图缺失仍先生成
         # （状态图要拿母图当参考）。补缺/only 跳过时不再 continue——状态图分支
         # 在母图之后统一执行，是否跳过由 plan["skip_states"] 决定。
+        # 索引条目整块重写会连带丢掉已归档的 states 子表（图还在盘上，但分镜再也选不到
+        # 「反派期/盟友期」这类状态图）——先摘出来，两处写入都带回去。
+        _kept_states = (index.get(zone, {}).get(aid) or {}).get("states")
+        _kept_states = _kept_states if isinstance(_kept_states, dict) and _kept_states else None
         mother_needed = asset_image_needs_generation(out, a.force)
         if (a.states == "only" or a.state_id) and os.path.isfile(out):
             mother_needed = False
@@ -450,6 +532,7 @@ def main():
                                 "derived_from": it.get("derived_from"),
                                 "related_refs": it.get("related_refs") or [],
                                 "reference_refs": reference_tokens,
+                                **({"states": _kept_states} if _kept_states else {}),
                                 # E10：实际注入的 skill 快照随索引归档（未注入则不写该键）
                                 **({"skill_snapshot": asset_skill_snap} if asset_skill_snap else {})}
             print(f"[跳过] {zone}/{aid} 已存在（补缺模式）")
@@ -469,7 +552,8 @@ def main():
                 print(f"[{m_label}] {zone}/{aid}（参考图 {len(image_refs)} 张）...", flush=True)
                 cli.generate_image(prompt, out, timeout=a.timeout, negative_prompt=negative,
                                     image_refs=image_refs,
-                                    mode=image_mode)
+                                    mode=image_mode,
+                                    extra={"size": image_size_for_aspect(_aspect), "ratio": image_ratio_for_aspect(_aspect)})
                 index[zone][aid] = {"path": f"素材/{zone}/{aid}.png", "prompt": prompt,
                                     "name": it.get("name", aid),
                                     "parent_ref": it.get("parent_ref"),
@@ -477,6 +561,7 @@ def main():
                                     "derived_from": it.get("derived_from"),
                                     "related_refs": it.get("related_refs") or [],
                                     "reference_refs": reference_tokens,
+                                    **({"states": _kept_states} if _kept_states else {}),
                                     **({"skill_snapshot": asset_skill_snap} if asset_skill_snap else {})}
                 print(f"[完成] {zone}/{aid} -> 素材/{zone}/{aid}.png")
             except Exception as e:
@@ -512,8 +597,12 @@ def main():
                 proj, s_prompt, skill_id=asset_style, kind=kind, style_prompt=it.get("style_prompt"))
             s_out = os.path.join(out_dir, f"{aid}__{sid}.png")
             if not asset_image_needs_generation(s_out, a.force):
+                # 补缺跳过也要带时间锚定字段，否则一次「补齐全素材图」就把
+                # episodes/camp 清零，分镜再也选不到对应阶段的形象。
                 states_entry[sid] = {"path": f"素材/{zone}/{aid}__{sid}.png",
                                      "prompt": s_prompt, "label": st_item.get("label", sid),
+                                     "episodes": st_item.get("episodes") or [],
+                                     "camp": st_item.get("camp", ""),
                                      **({"skill_snapshot": asset_skill_snap} if asset_skill_snap else {})}
                 continue
             import versions as _V2; _V2.snapshot(s_out)
@@ -523,7 +612,8 @@ def main():
                 s_label = mode_label(cli.id, s_mode, bool(s_refs))
                 print(f"[{s_label}-状态] {zone}/{aid}#{sid}（{st_item.get('label','')}）...", flush=True)
                 cli.generate_image(s_prompt, s_out, timeout=a.timeout, negative_prompt=negative,
-                                   image_refs=s_refs, mode=s_mode)
+                                   image_refs=s_refs, mode=s_mode,
+                                   extra={"size": image_size_for_aspect(_aspect), "ratio": image_ratio_for_aspect(_aspect)})
                 states_entry[sid] = {"path": f"素材/{zone}/{aid}__{sid}.png",
                                      "prompt": s_prompt, "label": st_item.get("label", sid),
                                      "episodes": st_item.get("episodes") or [],
@@ -534,7 +624,16 @@ def main():
                 ok_all = False; fail.append(f"{zone}/{aid}#{sid}: {e}")
                 print(f"[失败] {zone}/{aid}#{sid}: {e}")
         if states_entry and aid in index.get(zone, {}):
-            index[zone][aid]["states"] = states_entry
+            # 按状态 id 并集写回：单状态重生成不得抹掉同角色其它状态的索引
+            _prev_states = index[zone][aid].get("states")
+            _merged = dict(_prev_states) if isinstance(_prev_states, dict) else {}
+            _merged.update(states_entry)
+            index[zone][aid]["states"] = _merged
+    try:
+        import versions as _V
+        _V.snapshot(idx_path)
+    except Exception:
+        pass
     json.dump(index, open(idx_path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     if fail:
         print("[部分失败] " + "；".join(fail[:5]))

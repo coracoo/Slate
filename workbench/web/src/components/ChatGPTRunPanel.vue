@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, onBeforeUnmount, ref, watch } from 'vue'
 import { createChatGPTRun, fetchChatGPTRun, controlChatGPTRun } from '../api'
+import { toast } from '../stores/app'
 import { toChatGPTRunView, type ChatGPTRun } from '../utils/chatgptRun'
 const props=withDefaults(defineProps<{project:string;jobIds:string[];disabled?:boolean;compact?:boolean}>(),{disabled:false,compact:false})
 const emit=defineEmits<{completed:[];changed:[run:ChatGPTRun]}>()
@@ -10,6 +11,9 @@ const view=computed(()=>run.value?toChatGPTRunView(run.value):null)
 const key=()=>`previs.image-use.${props.project}`
 let timer:ReturnType<typeof setInterval>|undefined
 let refreshing=false
+const TERMINAL=['done','cancelled','failed']
+function stopPolling(){if(timer){clearInterval(timer);timer=undefined}}
+function ensurePolling(){if(!timer)timer=setInterval(refresh,2000)}
 async function refresh(){
  if(!run.value || refreshing)return
  const project=props.project,id=run.value.run_id
@@ -17,8 +21,20 @@ async function refresh(){
  try{
   const current=(await fetchChatGPTRun(project,id)).run
   if(project!==props.project || run.value?.run_id!==id)return
-  const done=current.status==='done' && run.value.status!=='done'
+  const prev=run.value.status
+  const done=current.status==='done' && prev!=='done'
   run.value=current;emit('changed',current);if(done)emit('completed')
+  // 终态汇入统一任务通知（右下角 toast，与后端 job 通知同一通道），不再只在面板里静默变化
+  if(TERMINAL.includes(current.status) && !TERMINAL.includes(prev)){
+    const imported=(current as unknown as {imported_count?:number}).imported_count
+    const total=(current as unknown as {total_count?:number}).total_count
+    const scope=(current as unknown as {job_count?:number}).job_count ?? total ?? ''
+    if(current.status==='done') toast(`ChatGPT 串行｜已完成${scope!==''?`（${imported ?? '?'}/${scope} 已导入）`:''}`,'ok')
+    else if(current.status==='failed') toast(`ChatGPT 串行｜失败：${current.pause_reason || '请查看面板与保留的会话'}`,'err',8000)
+    else if(current.status==='cancelled') toast('ChatGPT 串行｜已取消；未完成的任务保留在队列中','info',6000)
+  }
+  // 队列跑完/取消/失败后再每 2s 打一次 /api 是纯浪费（且会话过期时静默失败、页面看着像坏了）
+  if(TERMINAL.includes(current.status))stopPolling()
  }catch(e){message.value=String(e)}finally{refreshing=false}
 }
 async function start(ids?:string[]){
@@ -30,13 +46,14 @@ async function start(ids?:string[]){
   const current=(await createChatGPTRun({project:props.project,job_ids:selected,options:{vision_validation:false,auto_import:true}})).run
   run.value=current;token.value=current.run_token || ''
   localStorage.setItem(key(),JSON.stringify({id:current.run_id,token:token.value}))
-  emit('changed',current);return true
+  ensurePolling();emit('changed',current);return true
  }catch(e){message.value=String(e);return false}finally{busy.value=false}
 }
 async function control(action:'pause'|'resume'|'cancel'){
  if(!run.value || !token.value)return
  try{
   run.value=(await controlChatGPTRun(props.project,run.value.run_id,token.value,action)).run
+  ensurePolling()
   message.value=action==='resume'?'正在恢复；已有发送记录不会重新绘制。':'已请求停止，当前图片保存后生效。'
  }catch(e){message.value=String(e)}
 }
@@ -55,7 +72,7 @@ watch(()=>props.project,async()=>{
   }
  }catch{}
 },{immediate:true})
-onMounted(()=>{timer=setInterval(refresh,2000)})
+onMounted(()=>{ensurePolling()})
 onBeforeUnmount(()=>{if(timer)clearInterval(timer)})
 defineExpose({start,refresh})
 </script>

@@ -230,29 +230,59 @@ def ensure_plan_frames(project_dir, board_path, plan_path, member_ids=None, v_la
         p = os.path.join(outdir, sid + ".png")
         return os.path.isfile(p) and os.path.getsize(p) > 0
 
-    fresh = (meta.get("plan_sig") == _sig(plan_path)
+    # 规范口径：同场景的镜共用一张底图，跨场景必须换图（平面图规范-2D-plan-v1.md）。
+    # 曾整板只喂一张 plan：实测 09_仙 剧本_E1 的 15 镜分属 3 个场景，即使按多数镜匹配底图
+    # 仍有 8 镜画在他场墙纸上——而这些图正是 ⑦ 编译 V 时喂给视频模型的空间参考帧。
+    groups, order = {}, []
+    for sh in board.get("shots") or []:
+        if not str(sh.get("id") or ""):
+            continue
+        key = plan_adapt.shot_scene_ref(sh)
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(sh)
+    own_scene = str(plan.get("scene_ref") or "")
+    plan_for = {}
+    for key in order:
+        pth = plan_path
+        if key and key != own_scene:
+            _, cand = choose_board_plan(project_dir, groups[key])
+            pth = cand or plan_path
+        plan_for[key] = pth
+    sigs = ";".join(sorted({f"{os.path.basename(p)}:{_sig(p)}" for p in plan_for.values()}))
+
+    fresh = (meta.get("plan_sigs") == sigs
              and meta.get("board_sig") == _sig(board_path)
              and all(frame_ok(s) for s in keep))
     if not fresh:
         os.makedirs(outdir, exist_ok=True)
-        for s in keep:
+        for s in all_ids:
             p = os.path.join(outdir, s + ".png")
             if os.path.isfile(p):
                 _V.snapshot(p)
-        cmd = [sys.executable, SHOT_DIAGRAM, os.path.abspath(board_path),
-               "--plan", os.path.abspath(plan_path), "--outdir", os.path.abspath(outdir)]
-        proc = subprocess.run(cmd, capture_output=True, text=True,
-                              encoding="utf-8", errors="replace")
-        if proc.returncode != 0:
-            log("  [plan] 平面图帧渲染失败: " + (proc.stderr or proc.stdout or "").strip()[-200:])
-            return {}
+        for key in order:
+            ids = [str(sh.get("id")) for sh in groups[key]]
+            cmd = [sys.executable, SHOT_DIAGRAM, os.path.abspath(board_path),
+                   "--plan", os.path.abspath(plan_for[key]), "--outdir", os.path.abspath(outdir),
+                   "--shots", ",".join(ids)]
+            proc = subprocess.run(cmd, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace")
+            if proc.returncode != 0:
+                log("  [plan] 平面图帧渲染失败（%s）: %s"
+                    % (key or "未绑定场景", (proc.stderr or proc.stdout or "").strip()[-200:]))
+                return {}
+            for line in (proc.stdout or "").splitlines():   # 底图不符等告警抬到任务日志
+                if "[警告]" in line:
+                    log("  " + line.strip())
         with open(meta_p, "w", encoding="utf-8") as fh:
-            json.dump({"plan": os.path.basename(plan_path),
+            json.dump({"plans": sorted({os.path.basename(p) for p in plan_for.values()}),
                        "board": os.path.basename(board_path),
-                       "plan_sig": _sig(plan_path), "board_sig": _sig(board_path),
+                       "plan_sigs": sigs, "board_sig": _sig(board_path),
                        "shots": keep, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")},
                       fh, ensure_ascii=False, indent=1)
-        log("  [plan] 平面图帧 %d 张 -> %s" % (len(all_ids), os.path.relpath(outdir, project_dir)))
+        log("  [plan] 平面图帧 %d 张（按 %d 张场景底图分组）-> %s"
+            % (len(all_ids), len(set(plan_for.values())), os.path.relpath(outdir, project_dir)))
     out = {}
     for s in keep:
         src = os.path.join(outdir, s + ".png")

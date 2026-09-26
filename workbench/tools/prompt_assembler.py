@@ -72,11 +72,12 @@ def _skill_negative(style_id):
         return ""
 
 
-def _skill_positive(project_dir):
+def skill_positive(project_dir):
     """读取画风 skill 的正向追加词，过滤只适用于资产设定图的指令。
 
     人物三视图、角色设定图和场景概念图是资产生成阶段的约束，混进单镜
     生图会把横构图拉成白底设定图，因此不能随镜头提示词下发。
+    单镜生图与 ⑦ 制作线（S 图/V 视频）共用本函数，避免两条出口口径分叉。
     """
     try:
         import skill_lib
@@ -322,12 +323,20 @@ def _match_assets(shot, project_dir, actors=None, board=None):
     board_set = board.get("set")
     if isinstance(board_set, dict):
         scene_values += _explicit_values(board_set, ("id", "name", "scene", "location"))
+    # 镜头显式 scene_ref（@scene:xxx）是场景归属的权威信号：必须读它，
+    # 且命中时 +1000 压过正文文本猜测——否则跨场景 V 会解析出别的场景图。
+    scene_ref = str(shot.get("scene_ref") or "").strip()
+    scene_ref_bare = scene_ref.split(":")[-1] if scene_ref else ""
+    if scene_ref:
+        scene_values += [scene_ref, scene_ref_bare]
     matched_scene = None
     best_score = 0
     for rec in scenes:
         score = 0
         if any(_record_match(value, [rec]) is rec for value in scene_values):
             score += 100
+        if scene_ref and scene_ref_bare and _canon(scene_ref_bare) == _canon(rec.get("id") or ""):
+            score += 1000
         if _record_in_text(rec, text):
             score += 80
         if raw_scene.lower() == "room" and rec.get("interior") is True:
@@ -450,7 +459,7 @@ def assemble_shot_prompt(shot, project):
     image_skill = str(style.get("image") or "").strip()
     if image_skill == "auto":
         image_skill = ""
-    image_style_text = _skill_positive(project_dir)
+    image_style_text = skill_positive(project_dir)
     board = project.get("board") if isinstance(project, dict) else None
     actors = (board or {}).get("actors") if isinstance(board, dict) else {}
     actors = actors if isinstance(actors, dict) else {}
@@ -792,9 +801,17 @@ def resolve_shot_refs(shot, project_dir, actors=None, board_name=None, max_refs=
                     row = registry.resolve(raw)
                     if kind == "character" and is_narrator(raw, row):
                         continue
-                    add(_existing(project_dir, row.get("path")), purpose)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    # 曾经整段被 except: pass 吞掉：悬空引用的身份锚点无声消失，
+                    # 模型只按文字画角色 → 长相漂移且没人知道少了哪一镜。
+                    print(f"[警告] {shot.get('id') or '?'} 资产引用未解析 {raw}：{exc}"
+                          f"（该锚点不会进入提示词）", flush=True)
+                    continue
+                resolved = _existing(project_dir, row.get("path"))
+                if not resolved:
+                    print(f"[警告] {shot.get('id') or '?'} 引用 {raw} 的素材图不存在："
+                          f"{row.get('path')}（该锚点不会进入提示词；到 ② 重新生成该资产图）", flush=True)
+                add(resolved, purpose)
         except Exception:
             pass
 

@@ -12,11 +12,20 @@ VIDEO_VAE = 'minimax_h3_video_vae_fp16.safetensors'
 AUDIO_VAE = 'minimax_h3_audio_vae_fp32.safetensors'
 
 
-def build_h3_workflow(prompt, uploaded_refs=(), *, width=672, height=384, seconds=5, seed=1):
-    """按 Comfy-Org H3 模板的原生节点连接，生成带同步音频的 MP4。"""
+def build_h3_workflow(prompt, uploaded_refs=(), *, video_refs=(), audio_refs=(), width=672, height=384, seconds=5, seed=1):
+    """按 Comfy-Org H3 模板的原生节点连接，生成带同步音频的 MP4。
+
+    参考输入按节点真实容量：ref_images ≤9、ref_videos ≤3、ref_video_audios ≤3
+    （COMFY_AUTOGROW_V3 动态槽，来自 192.168.0.134:8188 object_info 实测）。
+    """
     refs = list(uploaded_refs)
-    if len(refs) > 3:
-        raise ComfyUIError('当前 local-comfyui 视频适配器使用 MiniMax H3 内置工作流，最多支持 3 张参考图；请减少 @ref，或改用支持更多参考图的云端视频模型')
+    videos = list(video_refs); audios = list(audio_refs)
+    if len(refs) > 9:
+        raise ComfyUIError('MiniMax H3 工作流参考图最多 9 张；请减少 @ref 数量后重试')
+    if len(videos) > 3:
+        raise ComfyUIError('MiniMax H3 工作流参考视频最多 3 段（2–15s）')
+    if len(audios) > 3:
+        raise ComfyUIError('MiniMax H3 工作流参考音频最多 3 条')
     if seconds < 4 or seconds > 15:
         raise ComfyUIError('MiniMax H3 时长须为 4–15 秒')
     frames = max(5, round(seconds * 24))
@@ -49,13 +58,26 @@ def build_h3_workflow(prompt, uploaded_refs=(), *, width=672, height=384, second
         node_id = str(20+i)
         graph[node_id] = {'class_type':'LoadImage','inputs':{'image':name}}
         graph['5']['inputs'][f'ref_images.ref_image_{i}'] = [node_id,0]
+    for i, name in enumerate(videos):
+        node_id = str(30+i)
+        graph[node_id] = {'class_type':'LoadVideo','inputs':{'video':name}}
+        graph['5']['inputs'][f'ref_videos.ref_video_{i}'] = [node_id,0]
+    for i, name in enumerate(audios):
+        node_id = str(40+i)
+        graph[node_id] = {'class_type':'LoadAudio','inputs':{'audio':name}}
+        graph['5']['inputs'][f'ref_video_audios.ref_video_audio_{i}'] = [node_id,0]
     return graph
 
 
-def generate_h3(client: ComfyUIClient, prompt, refs, out_path, *, seconds=5, timeout=3600):
+def generate_h3(client: ComfyUIClient, prompt, refs, out_path, *, seconds=5, timeout=3600, video_refs=(), audio_refs=()):
+    # 帧数感知的轮询预算：H3 本地 326 帧（13.5s）常见 >1h，按 30s/帧兜底并至少 2h；
+    # 超时只放弃轮询，ComfyUI 侧任务不会被取消，仍可从 history 回收。
+    timeout = max(int(timeout), int(float(seconds) * 24 * 30), 7200)
     uploaded = [client.upload_image(path) for path in refs]
+    uploaded_videos = [client.upload_media(path) for path in video_refs]
+    uploaded_audios = [client.upload_media(path) for path in audio_refs]
     seed = int.from_bytes(os.urandom(4),'big')
-    graph = build_h3_workflow(prompt, uploaded, seconds=seconds, seed=seed)
+    graph = build_h3_workflow(prompt, uploaded, video_refs=uploaded_videos, audio_refs=uploaded_audios, seconds=seconds, seed=seed)
     client.last_request = {'workflow':graph,'model':REF_MODEL if refs else FL_MODEL,
                            'seed':seed,'reference_count':len(refs),'seconds':seconds}
     return client.run_video_workflow(graph, out_path, timeout=timeout)

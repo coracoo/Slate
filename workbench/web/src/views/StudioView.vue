@@ -11,6 +11,7 @@ import { app, toast } from '../stores/app'
 import { trackJob } from '../stores/jobs'
 import { pendingEpisodeIds } from '../utils/scriptEpisodes'
 import EmptyState from '../components/EmptyState.vue'
+import StoryUnitsCard from '../components/StoryUnitsCard.vue'
 import StyleSelect from '../components/StyleSelect.vue'
 import StyledSelect from '../components/StyledSelect.vue'
 
@@ -98,19 +99,26 @@ const episodes = computed(() => data.value?.episodes || [])
 const scriptMode = computed(() => (data.value as any)?.script_mode || (episodes.value.some((e) => e.text) ? 'generated' : 'imported'))
 const scriptReadonly = computed(() => scriptMode.value === 'generated')
 
+let loadSeq = 0
 async function load() {
   if (!app.current) return
+  const seq = ++loadSeq
   loading.value = true
   try {
-    data.value = await fetchScriptData(app.current)
-    scriptText.value = data.value.script || ''
+    const next = await fetchScriptData(app.current)
+    // 连切项目时旧响应不得覆盖新项目：曾出现"编辑器显示 A 剧本、保存写进 B 项目"
+    if (seq !== loadSeq) return
+    data.value = next
+    scriptText.value = next.script || ''
     try {
       // 制作规格接口不可用时（旧后端/缺 brief.py）不影响剧本页其余功能
-      fillBriefForm((await fetchBrief(app.current)).brief)
+      const b = await fetchBrief(app.current)
+      if (seq !== loadSeq) return
+      fillBriefForm(b.brief)
     } catch { /* 保持表单默认值 */ }
   } catch (e) {
-    toast(e instanceof Error ? e.message : '加载失败', 'err')
-  } finally { loading.value = false }
+    if (seq === loadSeq) toast(e instanceof Error ? e.message : '加载失败', 'err')
+  } finally { if (seq === loadSeq) loading.value = false }
 }
 watch(() => app.current, load, { immediate: true })
 
@@ -322,6 +330,9 @@ async function doExpandAll() {
           </div>
         </div>
       </section>
+
+      <!-- ① 第一步：先出全剧最小单元并锚定，第二步逐集扩写才吃它（未锚定=行为与改造前一致） -->
+      <StoryUnitsCard :project="app.current || ''" @changed="load" />
 
       <!-- 分集列表（多集剧本） -->
       <section class="glass p-4">

@@ -154,18 +154,24 @@ def build_actors(lines, style, assign_pos=True):
         if not sp or sp == "unknown":
             continue
         dur[sp] = dur.get(sp, 0.0) + max(0.3, L["t_out"] - L["t_in"])
-    names = sorted(dur, key=lambda k: -dur[k])[:len(ACTOR_IDS)]
+    names = sorted(dur, key=lambda k: -dur[k])
     if not names:
         names = ["角色A"]
+    if len(names) > len(ACTOR_IDS):
+        # 曾直接截断到 len(ACTOR_IDS)：第 11+ 位说话人既没有 actor 也没有 id，
+        # 台词落为 speaker=None，④ 音色与 ⑤ 演员层永久认不到这句是谁说的。
+        print(f"[提示] 说话人 {len(names)} 位超过预设 id 池 {len(ACTOR_IDS)} 位，"
+              f"其余按 x11… 续编号（服色与站位循环复用，白模里可能重叠）")
     actors = {}
     for i, nm in enumerate(names):
+        aid = ACTOR_IDS[i] if i < len(ACTOR_IDS) else f"x{i + 1}"
         ac = {"name": nm, "shirt": list(PALETTE[i % len(PALETTE)]), "static": True}
         if assign_pos:
             ac["pos"] = list(POSITIONS[i % len(POSITIONS)])
         if style == "stand":
             ac["style"] = "stand"
-        actors[ACTOR_IDS[i]] = ac
-    id_of = {nm: ACTOR_IDS[i] for i, nm in enumerate(names)}
+        actors[aid] = ac
+    id_of = {nm: (ACTOR_IDS[i] if i < len(ACTOR_IDS) else f"x{i + 1}") for i, nm in enumerate(names)}
     return actors, id_of
 
 

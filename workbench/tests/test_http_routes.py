@@ -117,8 +117,78 @@ class HttpRouteTests(unittest.TestCase):
                 self.assertEqual(self.request('/media?p=workbench/auth.json')[0], 403)
                 self.assertEqual(self.request('/api/file?p=workbench/auth.json')[0], 403)
             with patch.object(server, 'ROOT', folder), patch.object(server, 'WEBDIST', tempfile.mkdtemp()):
-                self.assertEqual(self.request('/auth.json')[0], 403)
+                # 09-25 撤掉 ROOT 静态兜底后，这条从 403 变成 404（连"这文件存在"都不再说）；
+                # 两种都算守住，_deny_file 本身的 403 语义仍由上面 /media 与 /api/file 两条覆盖。
+                code, _, body = self.request('/auth.json')
+                self.assertIn(code, (403, 404), 'workbench/ 树内的凭证文件不得按 URL 被读走')
+                self.assertNotIn(b'password_hash', body)
             self.assertTrue(server._deny_file(str(cred.parent/'auth.json.bak')))
+
+    def test_anonymous_asset_allowlist_cannot_escape_dist(self):
+        """免认证只准拿前端产物：/assets/../x 会被静态兜底按 workbench/ 解析读走后端源码。"""
+        with tempfile.TemporaryDirectory() as folder:
+            (Path(folder)/'assets').mkdir()
+            (Path(folder)/'assets'/'app-1a2b3c.js').write_text('chunk')
+            with patch.object(server, 'WEBDIST', folder):
+                self.assertTrue(server._anon_asset_ok('/assets/app-1a2b3c.js'))
+                for probe in ('/assets/../server.py', '/assets/%2e%2e/server.py',
+                              '/assets/..%2fserver.py', '/media?p=x', '/workbench/server.py'):
+                    with self.subTest(probe=probe):
+                        self.assertFalse(server._anon_asset_ok(probe))
+
+    def test_create_batch_requires_explicit_shot_selection(self):
+        """空镜头选择曾一路透传给 create_batch 的「未选=全板」兜底 = 整板付费生成。"""
+        vendor = {"id": "v1", "enabled": True, "label": "V1", "models": {"image": "m"}}
+        def body(ids):
+            return json.dumps({"project": "p", "board": "b", "type": "image",
+                               "vendor_id": "v1", **({} if ids is None else {"shot_ids": ids})}).encode()
+        with tempfile.TemporaryDirectory() as folder, \
+             patch.object(server, 'proj_dir', return_value=folder), \
+             patch.object(server, 'load_vendors', return_value=[vendor]), \
+             patch.object(server.H, 'spawn_job', return_value=9) as spawn:
+            for ids in (None, [], [""], ["  "]):
+                with self.subTest(ids=ids):
+                    code, _, payload = self.request('/api/create/batch', 'POST', body(ids),
+                                                    {'Content-Type': 'application/json'})
+                    self.assertEqual(code, 400)
+                    self.assertIn('至少选择一个镜头'.encode(), payload)
+            self.assertEqual(spawn.call_count, 0)
+            code, _, payload = self.request('/api/create/batch', 'POST', body(["S2"]),
+                                            {'Content-Type': 'application/json'})
+            self.assertEqual(code, 200)
+            cmd = spawn.call_args.args[1]
+            self.assertEqual(cmd[cmd.index('--shot-id')+1], 'S2')
+
+    def test_versions_batch_returns_map_and_blocks_traversal(self):
+        """② 素材页一次要 248 个版本清单；批量端点必须一次回全，且越界路径不得带出任何真实路径。"""
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            target = root / 'projects' / 'P' / '素材' / '人物'
+            (target / '.versions').mkdir(parents=True)
+            (target / 'a.png').write_bytes(b'current')
+            (target / '.versions' / 'a.20260920_101010.png').write_bytes(b'old')
+            secret = root.parent / 'outside-should-never-leak.txt'
+            secret.write_text('secret', encoding='utf-8')
+            rel = 'projects/P/素材/人物/a.png'
+            body = json.dumps({'paths': [rel, rel, '../outside-should-never-leak.txt', '']}).encode()
+            with patch.object(server, 'VIDEO', _os.path.realpath(str(root))):
+                code, _, payload = self.request('/api/versions/batch', 'POST', body,
+                                                {'Content-Type': 'application/json'})
+                self.assertEqual(code, 200)
+                results = json.loads(payload)['results']
+                self.assertEqual(sorted(results), ['../outside-should-never-leak.txt', rel],
+                                 '重复与空路径应各自折叠成一条')
+                ts = [v['ts'] for v in results[rel]]
+                self.assertEqual(len(ts), 2, '最新 + 一条历史都应在（含 current 标记）')
+                self.assertTrue(any(v.get('current') for v in results[rel]))
+                self.assertEqual(results['../outside-should-never-leak.txt'], [],
+                                 '越界路径只能回空，不能泄露根外内容')
+                self.assertNotIn(str(secret).replace('\\', '/'), payload.decode('utf-8', 'replace'))
+                self.assertNotIn('should-never-leak.png', payload.decode('utf-8', 'replace'),
+                                 '越界条目不得被解析成根外真实文件回给客户端')
+            code, _, payload = self.request('/api/versions/batch', 'POST', b'{"paths":[]}',
+                                            {'Content-Type': 'application/json'})
+            self.assertEqual(code, 400)
 
     def test_json_parse_error_returns_400(self):
         self.assertEqual(self.request('/api/project/new', 'POST', b'{', {'Content-Type': 'application/json'})[0], 400)

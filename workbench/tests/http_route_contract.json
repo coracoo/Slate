@@ -137,6 +137,14 @@
  ],
  [
   "GET",
+  "/api/production/confirm"
+ ],
+ [
+  "GET",
+  "/api/production/redo_frames"
+ ],
+ [
+  "GET",
   "/api/projects"
  ],
  [
@@ -173,6 +181,10 @@
  ],
  [
   "GET",
+  "/api/storyboard/revision"
+ ],
+ [
+  "GET",
   "/api/studio/data"
  ],
  [
@@ -182,6 +194,10 @@
  [
   "GET",
   "/api/studio/voices"
+ ],
+ [
+  "GET",
+  "/api/units"
  ],
  [
   "GET",
@@ -282,6 +298,10 @@
  [
   "POST",
   "/api/asset/image/delete"
+ ],
+ [
+  "POST",
+  "/api/asset/regen-prompt"
  ],
  [
   "POST",
@@ -461,7 +481,15 @@
  ],
  [
   "POST",
+  "/api/production/item/delete"
+ ],
+ [
+  "POST",
   "/api/production/prompts"
+ ],
+ [
+  "POST",
+  "/api/production/redo_merge"
  ],
  [
   "POST",
@@ -482,10 +510,6 @@
  [
   "POST",
   "/api/reference-media/upload"
- ],
- [
-  "POST",
-  "/api/voice/upload"
  ],
  [
   "POST",
@@ -510,6 +534,10 @@
  [
   "POST",
   "/api/script/extract"
+ ],
+ [
+  "POST",
+  "/api/script/extract/one"
  ],
  [
   "POST",
@@ -601,6 +629,22 @@
  ],
  [
   "POST",
+  "/api/units/anchor"
+ ],
+ [
+  "POST",
+  "/api/units/build"
+ ],
+ [
+  "POST",
+  "/api/units/check"
+ ],
+ [
+  "POST",
+  "/api/units/edit"
+ ],
+ [
+  "POST",
   "/api/update/apply"
  ],
  [
@@ -613,11 +657,19 @@
  ],
  [
   "POST",
+  "/api/versions/batch"
+ ],
+ [
+  "POST",
   "/api/versions/delete"
  ],
  [
   "POST",
   "/api/versions/restore"
+ ],
+ [
+  "POST",
+  "/api/voice/upload"
  ],
  [
   "POST",

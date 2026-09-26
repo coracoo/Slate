@@ -18,6 +18,10 @@ from production_prompts import FIELDS, normalize_prompts, source_hash, media_sou
 SETTINGS_PATH = Path(__file__).resolve().parents[1] / 'studio_settings.json'
 DURATION_CHOICES = (8, 15, 30)
 SPEECH_RATE = 4.0   # 中文自然语速（字/秒）：时间轴对白下限与判官共用同一常数
+# 单镜时长的唯一权威档（09-25 用户定版）：③ 落盘夹取与 ③ 表格保存都以此为准。
+# ③ 生成提示词里写的"每镜 2~12 秒"是给 LLM 的偏好档，不是硬闸；模型能力上限另有 V 上限（8/15/30）。
+SHOT_DURATION_MIN = 1.5
+SHOT_DURATION_MAX = 15.0
 
 
 def load_settings():
@@ -137,6 +141,17 @@ def speech_floor(shot):
     """对白按自然语速估算的最小时长（N84）：台词字数 ÷ SPEECH_RATE。"""
     chars = sum(len(str(line.get('line') or line.get('text') or '')) for line in shot.get('lines') or [])
     return chars / SPEECH_RATE if chars else 0.0
+
+
+def fit_speech_budget(shot, authored):
+    """把"叙事时长"与"台词预算"对齐（09-25 用户定版：① 扩写档封顶 + ③ 分镜落盘顶高）。
+
+    对白镜不得短于"字数 ÷ SPEECH_RATE"——用的就是判官与时间轴那个常数，不再另立一套数；
+    超过单镜硬顶就**不再自动加**，把"这句太长"交回给人（拆镜或删词），避免把 15s 撑成 40s。
+    返回 ``(新时长, 语速需要的秒数)``，调用方据此决定是否打提示/警告。
+    """
+    need = round(speech_floor(shot), 2)
+    return round(max(authored, min(SHOT_DURATION_MAX, need)), 2), need
 
 
 def timeline(board, unit):
@@ -279,7 +294,10 @@ def retain_production(previous, generated):
     """重新分镜不抹去旧绑定；事实改变的单元显式变旧。"""
     old = {s['id']: s for s in previous.get('shots', [])}
     for s in generated.get('shots', []):
-        for key in ('keyframe', 'video_binding', 'video_duration', 'continuity', 'generation_options'):
+        # performance/acting_status 必须在列：⑤ 演员层采用后写进 shot.performance，
+        # 不保留会让「重新生成分镜」把花钱做出来并采用的表演整块抹掉（审计报告 §二.C）。
+        for key in ('keyframe', 'video_binding', 'video_duration', 'continuity', 'generation_options',
+                    'performance', 'acting_status'):
             if key in old.get(s['id'], {}): s[key] = copy.deepcopy(old[s['id']][key])
     if previous.get('video_units'):
         try:

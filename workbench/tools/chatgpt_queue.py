@@ -203,7 +203,11 @@ def _read_json(path, default=None):
 
 
 def _asset_source(project_dir, row, state_id=""):
-    """读取资产档案中的设定图提示词，保持 ChatGPT 与本地生图共用资产语料。"""
+    """读取资产档案中的设定图提示词，保持 ChatGPT 与本地生图共用资产语料。
+
+    人物设定图过时校验：sheet_prompt 仍是旧三视图文本（含"三视图"且无 45 度侧脸/五视图特征）
+    时直接打回，提示重新提炼——旧构图提示词生成的图会与新版素材链不一致。
+    """
     kind = str(row.get("kind") or "")
     ident = str(row.get("id") or "")
     files = {"character": ("人物.json", "characters", "sheet_prompt"),
@@ -216,6 +220,12 @@ def _asset_source(project_dir, row, state_id=""):
         rows = [dict(value, id=rid) for rid, value in rows.items() if isinstance(value, dict)]
     for item in rows or []:
         if isinstance(item, dict) and str(item.get("id")) == ident:
+            if kind == "character":
+                raw_prompt = str(item.get(prompt_key) or "").strip()
+                if raw_prompt and "三视图" in raw_prompt and "45度" not in raw_prompt and "45 度" not in raw_prompt:
+                    raise QueueError(
+                        f"@character:{ident} 的设定图提示词仍是旧版三视图构图。"
+                        f"请在「② 素材生成」重新提炼（或重新生成提示词）为五视图构图后，再重新提交本任务")
             if state_id:
                 state = next((value for value in item.get("states") or []
                               if isinstance(value, dict) and str(value.get("id")) == str(state_id)), None)

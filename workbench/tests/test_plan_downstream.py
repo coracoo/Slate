@@ -88,6 +88,26 @@ class ChoosePlanTests(unittest.TestCase):
     def test_empty_plans_returns_none(self):
         self.assertIsNone(plan_adapt.choose_plan([], self.SHOTS))
 
+    def test_choice_stamp_distinguishes_match_from_fallback(self):
+        """零匹配回退保留（老项目 scene_ref 填充率 0，硬拦会当场出不了图），但必须可判定。"""
+        self.assertEqual(plan_adapt.choose_plan(self.PLANS, self.SHOTS)["choice"],
+                         {"mode": "matched", "score": 2, "total": 3})
+        loose = [{"name": "唯一一张", "scene_ref": "loc_a"}]
+        got = plan_adapt.choose_plan(loose, [{"id": "S1", "scene_ref": "@scene:other"}])
+        self.assertEqual(got["choice"], {"mode": "fallback", "score": 0, "total": 1})
+
+    def test_fallback_stamp_survives_when_no_shot_has_scene_ref(self):
+        """整本没有 scene_ref 是最常见形态（老项目/纯手写分镜），也要落 fallback 而不是缺键。"""
+        loose = [{"name": "无关联图", "scene_ref": None}]
+        got = plan_adapt.choose_plan(loose, [{"id": "S1"}, {"id": "S2"}])
+        self.assertEqual(got["choice"], {"mode": "fallback", "score": 0, "total": 2})
+
+    def test_returns_the_same_object_not_a_copy(self):
+        # plan_frames.choose_board_plan 用 `pl is plan` 把选中项映射回文件路径：
+        # 返回副本会让它恒定取不到路径，平面图参考帧整批静默消失（本轮初版就踩过这个）
+        got = plan_adapt.choose_plan(self.PLANS, self.SHOTS)
+        self.assertIs(got, self.PLANS[2])
+
 
 class StrategyMapPlanTests(unittest.TestCase):
     def setUp(self):
@@ -126,6 +146,35 @@ class StrategyMapPlanTests(unittest.TestCase):
         html = out.read_text(encoding="utf-8")
         self.assertIn("平面图_军帐", html)
         self.assertIn("cam1", html)
+
+    def test_plan_badge_warns_when_unbound(self):
+        """PLAN 没有顶层 scene_ref（自由生成的平面图）→ 产物上必须出琥珀降级标记，
+        不能只靠任务日志那句 [警告]：这文件是 /media 直开 + ⑥ iframe 里看的。"""
+        self._run(str(self.board), "--plan", str(self.plan))
+        html = (self.proj / "推演" / "战略图_test.html").read_text(encoding="utf-8")
+        self.assertIn("未关联场景资产", html)
+        self.assertIn("空间一致性未经校验", html)
+        # 判色要用徽标自己的底色：#fbbf24 单独查是假的——模板里"正在说话的角色"描边就是它
+        self.assertIn("#f59e0b22", html, "降级徽标必须是琥珀底，与匹配上的蓝绿底可分辨")
+
+    def test_plan_badge_reports_match_ratio(self):
+        plan = dict(PLAN, scene_ref="军帐")
+        (self.proj / "推演" / "平面图_军帐.plan.json").write_text(json.dumps(plan, ensure_ascii=False), encoding="utf-8")
+        board = dict(BOARD, shots=[dict(BOARD["shots"][0], scene_ref="@scene:军帐"),
+                                   dict(BOARD["shots"][1], scene_ref="@scene:军帐")])
+        self.board.write_text(json.dumps(board, ensure_ascii=False), encoding="utf-8")
+        self._run(str(self.board), "--plan", str(self.plan))
+        html = (self.proj / "推演" / "战略图_test.html").read_text(encoding="utf-8")
+        self.assertIn("匹配 2/2 镜", html)
+        self.assertNotIn("未经校验", html)
+        self.assertNotIn("#f59e0b22", html, "匹配上了就不该出琥珀底徽标")
+        self.assertIn("#38bdf822", html, "正常匹配给蓝绿底信息徽标")
+
+    def test_standalone_plan_has_no_badge(self):
+        """独立渲染一张平面图时底图就是主体，不存在"回退用图"，不该挂任何降级标记。"""
+        self._run("--plan", str(self.plan))
+        html = (self.proj / "推演" / "战略图_平面图_军帐.html").read_text(encoding="utf-8")
+        self.assertNotIn("未经校验", html)
 
 
 class ShotDiagramPlanTests(unittest.TestCase):

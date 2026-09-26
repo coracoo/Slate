@@ -2,6 +2,8 @@
 """将 S/V 作者内容编译为一次生成的不可变请求，并在提交前检查能力。"""
 import copy
 import math
+import os
+import sys
 from pathlib import Path
 from production_studio import read_board, shot_list, shot_unit, timeline, inside
 from production_prompts import source_hash, media_source_hash
@@ -18,7 +20,12 @@ PERFORMANCE_NOTE = '表演指导（只补充可见表演，不改变机位/走�
 
 # 关键帧时间角色受控词表（update.md E07）：start=开始状态 / beat=动作关键点 / end=结束状态 / compose=构图参考。
 # 标注在分镜已采用关键帧 shot['keyframe']['time_role'] 上；旧数据无该字段=未分类，兜底放行并打警告日志。
-TIME_ROLES = ('start', 'beat', 'end', 'compose')
+# 词表以 previs_system/tools/actor_contract.py 为唯一来源：曾在此另定义一份，
+# ⑤ 演员层与 ⑦ 提交侧各自演进会让节拍标签与槽位校验口径分叉。
+_CORE = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "previs_system", "tools"))
+if _CORE not in sys.path:
+    sys.path.insert(0, _CORE)
+from actor_contract import TIME_ROLES
 TIME_ROLE_LABELS = {'start': '开始状态', 'beat': '动作关键点', 'end': '结束状态', 'compose': '构图参考'}
 # 首帧槽位只接受「开始状态」图、尾帧槽位只接受「结束状态」图——把结束图当首帧会让模型倒推动作。
 _FRAME_SLOT_NEED = {'first_frame': 'start', 'last_frame': 'end'}
@@ -127,7 +134,20 @@ def compile_request(project, body, cfg):
             asset = assets.get(r['path'], {})
             r['asset_ref'] = asset.get('ref', ''); r['name'] = asset.get('name', '')
     else:
-        frame_shots = shots if video_mode == 'reference' else []
+        # 宫格模式：参考图 = 已采用的故事板宫格（产物经人工「采用」闸进入参考链，
+        # 绝不隐式抓取最新候选/关键帧排版）；未采用时明确报错指引。
+        frame_shots = shots if video_mode == 'reference' and (body.get('ref_mode') or 'keyframes') != 'grid' else []
+        if (body.get('ref_mode') or 'keyframes') == 'grid':
+            gb = unit.get('grid_binding')
+            if not isinstance(gb, dict) or not gb.get('path'):
+                raise ValueError('本 V 尚未采用故事板宫格：请先在①整 V 直出生成宫格图并点「采用为宫格参考」')
+            r = copy.deepcopy(gb); bound_path(project, r)
+            if r.get('source_hash') and r['source_hash'] != media_source_hash(shots, 'image', unit):
+                # 必须与 adopt_grid 写入侧同公式（都是 shot_list(board, unit)）；此处原写 members，
+                # 该名字在本函数从未定义——走到"已过期"这一支会抛 NameError，友好提示永远出不来。
+                raise ValueError('宫格参考已过期（成员 S 素材变动），请重新生成宫格图并采用')
+            r['purpose'] = '故事板宫格参考图'; r['frame_role'] = 'reference_image'
+            refs.append(r)
         if video_mode in ('first_frame','first_last') and (body.get('continuity') or {}).get('mode') != 'tail_first_frame':
             sid = body.get('first_shot_id') or shots[0]['id']
             frame_shots += [next((s for s in shots if s['id'] == sid), None)]
@@ -151,8 +171,10 @@ def compile_request(project, body, cfg):
         prompt += '\n时间轴（秒）：\n' + '\n'.join(f"{b['start']:g}–{b['end']:g}｜{b['shot_id']}：{b['prompt']}" for b in beats)
     negative = str(unit.get('negative') or '')
     # 风格仍由项目/资产 Skill 提供，避免从旧分镜自由文本带入过期画风。
-    from skill_lib import image_skill_text
-    style = image_skill_text(str(project))
+    # 必须走镜头侧过滤：整篇 skill 正文含「三视图/纯白背景/表情中性」，
+    # 会把单镜关键帧与 V 视频拉成白底设定图。
+    from prompt_assembler import skill_positive
+    style = skill_positive(str(project))
     if style: prompt += '\n画风：' + style
     if kind == 'image':
         prompt += f'\n只绘制一张独立关键帧，画幅 {aspect}。'
@@ -197,7 +219,7 @@ def compile_request(project, body, cfg):
         if mode == 'tail_context' and not continuity['vision_vendor']: raise ValueError('尾帧画面参考需要选择 Vision 模型')
     ref_mode = body.get('ref_mode') or 'keyframes'
     if ref_mode not in ('keyframes', 'grid'): raise ValueError('参考模式不合法')
-    if kind == 'video' and ref_mode == 'grid' and not description.strip(): raise ValueError('使用故事板宫格前请补全宫格提示词')
+    # 宫格提示词留空 = 默认九宫格 3×3 按剧情时间顺序，不再强制填写
     cap = capabilities(cfg)
     if kind == 'video' and ref_mode == 'grid' and video_mode != 'reference': raise ValueError('故事板宫格只用于全能参考')
     voices = []

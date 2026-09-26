@@ -61,7 +61,14 @@ def shot_scene_ref(shot):
 def choose_plan(plans, shots):
     """从候选 plans（mtime 降序）为分镜选底图：按 scene_ref 匹配镜数最多者胜
     （plans 已按 mtime 降序，同分自然取新）；全部无匹配/无 scene_ref 回退 plans[0]。
-    plans 为空返回 None。"""
+    plans 为空返回 None。
+
+    返回值上盖 `choice`={mode, score, total}：零匹配回退是**有意保留的行为**（老项目 scene_ref
+    填充率为 0，硬拦会让一批项目当场出不了图），但"这是回退"必须能传到产物与页面上，
+    不能只活在任务日志里。**必须原地盖、返回同一个对象**：`plan_frames.choose_board_plan`
+    靠身份比较（`pl is plan`）把选中的 plan 映射回文件路径，返回副本会让它恒定取不到路径、
+    平面图参考帧整批静默消失（本轮改初版就踩过，靠既有 plan_frames 用例逼出来）。
+    """
     if not plans:
         return None
     best, best_score = plans[0], 0
@@ -72,6 +79,8 @@ def choose_plan(plans, shots):
         score = sum(1 for s in (shots or []) if shot_scene_ref(s) == ref)
         if score > best_score:
             best, best_score = p, score
+    best["choice"] = {"mode": "matched" if best_score else "fallback",
+                      "score": best_score, "total": len(shots or [])}
     return best
 
 

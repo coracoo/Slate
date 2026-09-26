@@ -4,7 +4,7 @@
 import { ref, computed, watch, onMounted, onBeforeUnmount, reactive, nextTick } from 'vue'
 import { useRouter } from 'vue-router'
 import {
-  deleteAssetImage,
+  deleteAssetImage, postJSON,
   fetchScriptData, scriptExtract, genAssetImage, fetchEnvConfig, fetchAssets, fetchAssetPromptLayers, createAsset, editAsset, saveAssetRelations, rebuildProductionPrompts, queueChatGPTAssets, fetchChatGPTJobs, importChatGPTPackage, importChatGPTImages, mediaUrl, getJSON,
   type ScriptBundle, type CharacterItem, type SceneItem, type PropItem, type Vendor, type AssetRegistryItem, type AssetStateItem, type ChatGPTJobSummary, type SkillItem, type AssetPromptLayers
 } from '../api'
@@ -47,7 +47,7 @@ const createParentRef = ref('')
 const createSaving = ref(false)
 const childGenVisible = ref(false)
 const childGenAsset = ref<AssetRegistryItem | null>(null)
-const detailAsset = ref<AssetRegistryItem | null>(null)
+const detailAsset = ref<AssetRegistryItem | null>(null), regenBusy = ref(false)
 const detailEditing = ref(false)
 const detailSaving = ref(false)
 const detailName = ref('')
@@ -506,6 +506,42 @@ onMounted(() => {
     .catch(() => { imageSkills.value = [] })
 })
 
+async function doExtractOne(kind: '人物' | '场景' | '道具') {
+  if (!app.current) return
+  busy.value = true
+  try {
+    const r = await postJSON<{ok: boolean; id?: number; err?: string}>('/api/script/extract/one',
+      {project: app.current, kind, episode: episode.value})
+    if (!r.ok || !r.id) throw new Error(r.err || '任务未启动')
+    const j = await trackJob(r.id, '提炼·' + kind)
+    if (!j.success) throw new Error(j.err || '提炼失败')
+    toast(kind + '提炼完成', 'ok'); await load()
+  } catch (e) {
+    toast(e instanceof Error ? e.message : '提炼失败', 'err', 6000)
+  } finally {
+    busy.value = false
+  }
+}
+async function regenPrompt() {
+  if (!app.current || !detailAsset.value) return
+  const kind = detailAsset.value.kind
+  if (kind !== 'character') { toast('场景/道具的提示词随外观事实生成，请在完整提炼中更新', 'info', 5000); return }
+  regenBusy.value = true
+  try {
+    const r = await postJSON<{ok: boolean; id?: number; err?: string}>('/api/asset/regen-prompt',
+      {project: app.current, kind, id: detailAsset.value.id})
+    if (!r.ok || !r.id) throw new Error(r.err || '任务未启动')
+    const j = await trackJob(r.id, '重生成提示词 ' + detailAsset.value.name)
+    if (!j.success) throw new Error(j.err || '重生成失败')
+    toast('提示词已更新为五视图构图', 'ok'); await load()
+    const fresh = assets.value.find((item) => item.ref === detailAsset.value?.ref)
+    if (fresh) detailAsset.value = fresh
+  } catch (e) {
+    toast(e instanceof Error ? e.message : '重生成失败', 'err', 6000)
+  } finally {
+    regenBusy.value = false
+  }
+}
 async function doExtract() {
   if (!app.current) return
   busy.value = true
@@ -714,7 +750,12 @@ function parentAsset(row?: AssetRegistryItem | null) {
             <StyledSelect v-model="episode" class="mt-1 w-48" :options="['', ...episodes.map(e => e.id)]" :labels="epLabels" placeholder="全部" />
           </label>
         </div>
-        <button class="btn" :disabled="busy" @click="doExtract" title="按当前分集提炼；已有同 ID 资产自动复用">{{ busy ? '提炼中…' : '提炼三件套' }}</button>
+        <div class="flex flex-wrap gap-1.5">
+          <button class="btn btn-sm" :disabled="busy || !episode" title="只提炼人物（一次 LLM 调用），按当前分集" @click="doExtractOne('人物')">{{ busy ? '…' : '提炼·人物' }}</button>
+          <button class="btn btn-sm" :disabled="busy || !episode" title="只提炼场景（一次 LLM 调用），按当前分集" @click="doExtractOne('场景')">{{ busy ? '…' : '提炼·场景' }}</button>
+          <button class="btn btn-sm" :disabled="busy || !episode" title="只提炼道具（依赖人物/场景的 @ 目录，建议在两者之后跑）" @click="doExtractOne('道具')">{{ busy ? '…' : '提炼·道具' }}</button>
+          <button class="btn btn-ghost btn-sm" :disabled="busy" @click="doExtract" title="三件套按序完整提炼；已有同 ID 资产自动复用">{{ busy ? '提炼中…' : '完整提炼' }}</button>
+        </div>
         <StyleSelect target="image" label="生图风格" :hint="styleHint" @changed="load" />
         <label class="text-xs text-slate-400">设定图模型
           <StyledSelect v-model="vendorId" class="mt-1 w-60" :options="vendorOptions" :labels="vendorOptionLabels" :storage-key="`wb.${app.current}.assets.vendor`" placeholder="选择生图模型" />
@@ -889,7 +930,8 @@ function parentAsset(row?: AssetRegistryItem | null) {
     </div>
     <div v-if="detailAsset" class="overlay p-4" @click.self="closeAssetDetails">
       <section class="glass modal-h-lg w-full max-w-3xl overflow-y-auto p-5">
-        <div class="mb-4 flex items-center justify-between gap-3"><div><h2 class="text-lg font-bold text-slate-100">{{ detailEditing ? '编辑资产设定' : detailAsset.name }}</h2><p class="mt-1 text-2xs text-slate-500">{{ detailAsset.ref }} · {{ detailAsset.parent_ref ? '子素材' : '母素材' }} · v{{ detailAsset.asset_revision || 1 }}</p></div><div class="flex gap-2"><button v-if="!detailEditing" class="btn btn-ghost btn-sm" @click="detailEditing = true">编辑设定</button><button class="btn btn-ghost btn-sm" @click="closeAssetDetails">关闭</button></div></div>
+        <div class="mb-4 flex items-center justify-between gap-3"><div><h2 class="text-lg font-bold text-slate-100">{{ detailEditing ? '编辑资产设定' : detailAsset.name }}</h2><p class="mt-1 text-2xs text-slate-500">{{ detailAsset.ref }} · {{ detailAsset.parent_ref ? '子素材' : '母素材' }} · v{{ detailAsset.asset_revision || 1 }}</p></div><div class="flex gap-2"><button v-if="!detailEditing && detailAsset.kind === 'character'" class="btn btn-sm" :disabled="regenBusy" title="按五视图构图重写该角色的生图提示词（不动外观事实）；旧三视图提示词的图会与素材链不一致" @click="regenPrompt">{{ regenBusy ? '重生成中…' : '重新生成提示词' }}</button><button v-if="!detailEditing" class="btn btn-ghost btn-sm" @click="detailEditing = true">编辑设定</button><button class="btn btn-ghost btn-sm" @click="closeAssetDetails">关闭</button></div></div>
+        <p v-if="detailAsset.kind === 'character' && (detailAsset.sheet_prompt || '').includes('三视图') && !(detailAsset.sheet_prompt || '').includes('45度')" class="mb-3 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-200">！该角色的设定图提示词仍是旧版三视图构图，建议点「重新生成提示词」更新为五视图，再重新生成设定图。</p>
         <button v-if="imageUrl(detailAsset)" class="mb-4 block max-h-[45vh] w-full overflow-hidden rounded-xl border border-line bg-black/20" title="点击查看大图" @click="showAsset(detailAsset)"><img :src="imageUrl(detailAsset)" class="max-h-[45vh] w-full object-contain" :alt="detailAsset.name" /></button>
         <div v-else class="mb-4 flex h-32 items-center justify-center rounded-xl border border-dashed border-line text-xs text-slate-500">尚未生成图片</div>
         <div class="mb-4 flex flex-wrap items-center gap-2"><span class="rounded bg-white/5 px-2 py-1 text-2xs text-slate-400">{{ detailAsset.usage || detailAsset.kind }}</span><span v-if="detailAsset.relation" class="rounded bg-cyan-400/10 px-2 py-1 text-2xs text-cyan-200">{{ relationLabel(detailAsset) }}</span><span v-if="detailAsset.style" class="rounded bg-violet-400/10 px-2 py-1 text-2xs text-violet-200" title="该资产生图使用自己的画风，不跟随项目生图风格">画风：{{ detailStyleLabels[detailAsset.style] || detailAsset.style }}</span><Versions v-if="assetFilePath(detailAsset)" :path="assetFilePath(detailAsset)" kind="image" @restored="load" /></div>

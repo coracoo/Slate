@@ -2,12 +2,12 @@
 // -*- coding: utf-8 -*-
 /** 产出版本切换器：徽标显示历史数，展开看各版本（图片带缩略图），可预览/回滚（最新文件原位不动） */
 import { ref, computed, watch, onMounted, onBeforeUnmount } from 'vue'
-import { getJSON, postJSON, mediaUrl, deleteVersion } from '../api'
+import { mediaUrl, deleteVersion, fetchVersions, restoreVersion, type FileVersion } from '../api'
 import { toast } from '../stores/app'
 import OverlayViewer from './OverlayViewer.vue'
 import StoryboardGrid from './StoryboardGrid.vue'
 
-interface Ver { ts: string; rel: string; current: boolean }
+type Ver = FileVersion
 const props = defineProps<{ path: string; kind?: 'image' | 'file' }>()
 const emit = defineEmits<{ (e: 'restored'): void }>()
 
@@ -41,7 +41,7 @@ async function load() {
   if (!props.path) { vers.value = []; return }
   loading.value = true
   try {
-    vers.value = (await getJSON<{ versions: Ver[] }>(`/api/versions?p=${encodeURIComponent(props.path)}`)).versions || []
+    vers.value = await fetchVersions(props.path)
   } catch { vers.value = [] }
   finally { loading.value = false }
 }
@@ -75,7 +75,7 @@ async function removeVer(v: Ver) {
 async function restore(v: Ver) {
   if (!confirm(`回滚到 ${v.ts}？（当前版本会先自动快照，不会丢失）`)) return
   try {
-    await postJSON('/api/versions/restore', { p: props.path, ts: v.ts })
+    await restoreVersion(props.path, v.ts)
     toast('已回滚', 'ok')
     await load()
     open.value = false

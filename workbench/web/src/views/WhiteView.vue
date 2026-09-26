@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { useBoardSelection } from '../utils/useBoardSelection'
+import { shotRangeRows } from '../utils/shotRange'
 // -*- coding: utf-8 -*-
 /** ① 辅助·白模：选分镜 JSON + 镜头区间 + 引擎 → 渲染；产物视频卡片。 */
 import { ref, computed, watch } from 'vue'
@@ -76,7 +77,7 @@ function syncFrom(src: 'l' | 'r') {
 /* ---------- 分镜可视化：选中 JSON 后展示镜头表，点选两个镜头定区间 ---------- */
 const board = ref<WhiteBoard | null>(null)
 const boardLoading = ref(false)
-const anchor = ref<number | null>(null)   // 点选区间的锚点（镜头 index）
+const anchorId = ref<string | null>(null)   // 点选区间的锚点（镜头 id，重读分镜后仍对得上）
 
 const CAM_LABELS: Record<string, string> = {
   wide: '全景', two: '双人', cu: '特写', near: '近景背影', ots: '越肩', off: '自定义'
@@ -100,52 +101,39 @@ function actorColor(aid?: string | null): string {
   const s = board.value?.actors?.[aid]?.shirt
   return s ? `rgb(${s.join(',')})` : '#94a3b8'
 }
-function shotNum(id: string): number {
-  const m = id.match(/\d+/)
-  return m ? parseInt(m[0], 10) : 0
-}
-/** 当前区间文本 -> index 集合，用于高亮 */
-const rangeIdx = computed(() => {
-  const m = shots.value.replace(/\s/g, '').match(/^S?(\d+)-S?(\d+)$/i)
-  const set = new Set<number>()
-  if (!m) return set
-  const a = parseInt(m[1], 10)
-  const b = parseInt(m[2], 10)
-  boardShots.value.forEach((s, i) => {
-    const n = shotNum(s.id)
-    if (n >= Math.min(a, b) && n <= Math.max(a, b)) set.add(i)
-  })
-  return set
-})
+/** 当前区间文本 -> 命中的行下标，用于高亮（解析口径与后端渲染一致） */
+const rangeIdx = computed(() => new Set(shotRangeRows(shots.value, boardShots.value.map((s) => s.id))))
 
 function pickShot(i: number) {
   const id = boardShots.value[i]?.id
   if (!id) return
-  if (anchor.value === null) {
-    anchor.value = i
-    setShots(`${id}-${id}`)
+  const anchor = boardShots.value.findIndex((s) => s.id === anchorId.value)
+  if (anchorId.value === null || anchor < 0) {
+    anchorId.value = id
+    setShots(`${i + 1}-${i + 1}`)
   } else {
-    const lo = Math.min(anchor.value, i)
-    const hi = Math.max(anchor.value, i)
-    setShots(`${boardShots.value[lo].id}-${boardShots.value[hi].id}`)
-    anchor.value = null
+    // 写行号而不是 id 原文：描述式 id（"S01 楼顶登场·戴面具"）拼进区间串会被校验拒，
+    // 后端对这种分镜也只能按位置取镜
+    setShots(`${Math.min(anchor, i) + 1}-${Math.max(anchor, i) + 1}`)
+    anchorId.value = null
   }
 }
 
-/** 区间输入框更新；点选产生的更新不清锚点，手动编辑则清除 */
-let pickGuard = false
+/** 区间输入框更新；点选产生的更新不清锚点，手动编辑则清除。
+ *  比对写入值而不是用同步标志位：watch 在微任务里才跑，标志那时早已复位（旧实现因此
+ *  第二次点选总被当成新锚点，点选区间退化成单选）。 */
+let lastPick = ''
 function setShots(v: string) {
-  pickGuard = true
+  lastPick = v
   shots.value = v
-  pickGuard = false
 }
-watch(shots, () => {
-  if (!pickGuard) anchor.value = null
+watch(shots, (v) => {
+  if (v !== lastPick) anchorId.value = null
 })
 
 async function loadBoard() {
   board.value = null
-  anchor.value = null
+  anchorId.value = null
   if (!app.current || !storyboard.value) return
   boardLoading.value = true
   try {
@@ -378,7 +366,7 @@ useBoardSelection(storyboard, boards, 'white')
             class="flex w-full items-start gap-3 rounded-lg px-3 py-2 text-left transition"
             :class="rangeIdx.has(i)
               ? 'bg-sky-400/15 ring-1 ring-sky-400/40'
-              : anchor === i
+              : anchorId === s.id
                 ? 'bg-amber-400/15 ring-1 ring-amber-400/50'
                 : 'hover:bg-white/5'"
             @click="pickShot(i)"

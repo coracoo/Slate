@@ -68,6 +68,9 @@ async function precipitate() {
         const after = await fetchKnowledge()
         const delta = (after.skills?.length || 0) - (before.skills?.length || 0)
         toast(`已沉淀 ${after.skills?.length || 0} 张经验卡（新增 ${Math.max(0, delta)}）；可在 Skill 中心「经验卡片」查看/编辑/转为 Skill`, 'ok', 6000)
+      } catch (e) {
+        // 二次统计失败不能当成功报：否则卡片其实没落库，页面却提示"已沉淀"
+        toast('沉淀任务已提交，但读取卡片统计失败：' + (e instanceof Error ? e.message : '未知错误'), 'err', 6000)
       } finally {
         kbBusy.value = false
       }

@@ -174,6 +174,12 @@ def main():
         script["speakers"][s] = {"name": meta.get("name", s),
                                  "color": meta.get("color", palette[i % len(palette)])}
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
+    # 台词脚本.json 含用户手工修剪（ASR 长段伪影等），重合并前必须留底
+    try:
+        import versions as _V
+        _V.snapshot(out)
+    except Exception:
+        pass
     json.dump(script, open(out, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
     n_src = {}
     for l in lines: n_src[l["source"]] = n_src.get(l["source"], 0) + 1

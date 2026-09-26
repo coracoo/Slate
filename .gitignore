@@ -83,3 +83,7 @@ workbench/mcp_runtime.json.*
 workbench/studio_settings.json
 workbench/auth.json
 workbench/update_state.json
+
+# 本地工具产物（Qoder harness 报告/会话缓存、优雅停机标记）——不属于源码
+.qoder/
+workbench/STOP

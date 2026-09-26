@@ -161,6 +161,22 @@ class ScenePlanTests(unittest.TestCase):
         self.assertEqual(gen_plan.load_scene(self.proj, "tent")[0]["id"], "loc_tent")
         self.assertEqual(gen_plan.load_scene(self.proj, "不存在"), (None, ""))
 
+    def test_generate_by_name_or_alias_token_binds_canonical_id(self):
+        """请求 token 是场景名/别名时 scene_ref 与文件名仍须落到资产 id。
+
+        曾按请求 token 写 scene_ref，与文件名用的 row.id 双口径：下次提炼会把该场景
+        判为"未覆盖"并覆写同名文件，分镜里的 @scene: 引用随之集体悬空。
+        """
+        for token in ("中军帐", "tent"):
+            with self.subTest(token=token):
+                gen_plan.generate(self.proj, scene=token,
+                                  gen_chat=lambda msgs: json.dumps(GOOD, ensure_ascii=False),
+                                  judge_fn=judge_script([JUDGE_PASS]), log=lambda *a: None)
+                saved = json.load(open(os.path.join(self.proj, "推演", "平面图_loc_tent.plan.json"),
+                                       encoding="utf-8"))
+                self.assertEqual(saved["scene_ref"], "loc_tent")
+                self.assertEqual(saved["name"], "loc_tent")
+
     def test_generate_with_scene_binds_scene_ref(self):
         seen = []
 

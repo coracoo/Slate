@@ -99,6 +99,18 @@ class ExplicitSelectionTests(unittest.TestCase):
             self.assertEqual(skill_lib.ensure_explicit_defaults(td)["storyboard"], "dir-a")
             self.assertEqual(skill_lib.style_for(td, "storyboard"), "导演甲正文\n")
 
+    def test_style_directive_quoted_after_a_lead_phrase(self):
+        """画风取词：引号前允许一段说明词（cinematic-real 写「追加到生图提示词末尾——」）。
+        取不到引号会回退整篇正文，把「禁止：卡通…」当正向画风词注入，且与 negative 双写。"""
+        from skill_lib import resolve_asset_style_text
+
+        cinematic, _src = resolve_asset_style_text({}, "cinematic-real")
+        self.assertTrue(cinematic.startswith("35mm 胶片质感"))
+        self.assertNotIn("追加到生图提示词末尾", cinematic, "整篇正文回退=包装语被注入成画风词")
+        self.assertLess(len(cinematic), 200, "只应取引号内指令，不应吞下整篇 skill")
+        ghibli, _ = resolve_asset_style_text({}, "ghibli-soft")
+        self.assertTrue(ghibli.startswith("日式动漫赛璐璐插画风格"))
+
     def test_image_entry_matches_text_entry(self):
         # 图片入口与文本入口同一口径：都吃显式选择，override 恒优先
         p1, p2 = _patched()
@@ -190,7 +202,7 @@ class PipelineFreezeTests(unittest.TestCase):
                 return "fake-image"
 
             def generate_image(self, prompt, out, timeout=None, negative_prompt=None,
-                               image_refs=None, mode=None):
+                               image_refs=None, mode=None, **kwargs):
                 self.calls.append(out)
                 Path(out).write_bytes(b"fake-image")
 
@@ -231,7 +243,7 @@ class PipelineFreezeTests(unittest.TestCase):
                 return "fake-image"
 
             def generate_image(self, prompt, out, timeout=None, negative_prompt=None,
-                               image_refs=None, mode=None):
+                               image_refs=None, mode=None, **kwargs):
                 Path(out).write_bytes(b"fake-image")
 
         p1, p2 = _patched()

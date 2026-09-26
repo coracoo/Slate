@@ -792,6 +792,8 @@ def main():
     for i, mf in merged_from.items():
         shots[i].setdefault("merged_from", mf)
 
+    ckpt_warned = []          # 落盘失败只提示一次的开关
+
     def _checkpoint():
         """逐镜落盘半成品（含 _partial.flag）：中断后重跑按镜复用，AI 调用费不白烧。"""
         try:
@@ -801,8 +803,13 @@ def main():
                       open(os.path.join(outdir, "analysis.json"), "w", encoding="utf-8"),
                       ensure_ascii=False, indent=1)
             open(FLAG, "w", encoding="utf-8").write("partial")
-        except Exception:
-            pass
+        except Exception as exc:
+            # 断点写不进去 = "中断后按镜复用、AI 费不白烧"这个承诺当场失效。
+            # 只报第一次，避免几十镜的日志被同一句刷满。
+            if not ckpt_warned:
+                ckpt_warned.append(1)
+                print(f"[警告] 逐镜断点未能落盘（后续不再重复提示）：{exc}"
+                      f" —— 本次若中断，重跑会重新识别已完成的镜头（重复计费）", flush=True)
 
     # AI 逐镜分析：厂商路径按 --workers 并发（GLM 兜底路径保持串行），逐镜 checkpoint
     ai_done = len(reuse)

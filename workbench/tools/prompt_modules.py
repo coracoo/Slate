@@ -75,8 +75,11 @@ def _brief_tone_block(brief):
     return f"[题材与基调（项目制作规格）]\n{tone}——人物反应、冲突设计与台词风格都服从这一基调。\n"
 
 
-# 对白密度 → 扩写语速档位（字/分钟）：低密度少台词多动作，高密度台词驱动
-DIALOGUE_RATE = {"低": (120, 160), "中": (180, 220), "高": (240, 300)}
+# 对白密度 → 扩写语速档位（字/分钟）：低密度少台词多动作，高密度台词驱动。
+# **封顶值不得高于 production_studio.SPEECH_RATE×60（4 字/s=240 字/分钟）**——09-25 用户定版：
+# 扩写按 5 字/s 写出来的台词，到 ⑦ 判官（4 字/s）必然超预算，钱已经烧了才报。由
+# test_timing_consistency 锁住，改这边必须同时改那边的常数。
+DIALOGUE_RATE = {"低": (120, 160), "中": (180, 220), "高": (200, 240)}
 
 
 # 证据索引参数（E12 修复）：单条 180 字不变；全文按约 1500 字一块均匀分块，
@@ -293,9 +296,10 @@ def outline_prompt(idea, eps_n=6, style="短剧", mood=None, style_text=None, pr
 
 # ---------- 1c. 大纲 → 指定集扩写（分场剧本） ----------
 
-def expand_episode_prompt(idea, entry, prev_summary=None, style_text=None, proj=None):
+def expand_episode_prompt(idea, entry, prev_summary=None, style_text=None, proj=None, units=""):
     """大纲条目 → 该集分场剧本文本（场景标题+动作描述+台词，即 剧本.txt 格式）。
-    proj 传入且 brief.json 存在时按制作规格生成（对白密度字数档位/题材基调）；否则维持缺省文案。"""
+    proj 传入且 brief.json 存在时按制作规格生成（对白密度字数档位/题材基调）；否则维持缺省文案。
+    units=① 第一步锚定的最小单元注入块（story_units.units_block 渲染）；空串=项目未锚定，行为与改造前逐字一致。"""
     brief = _brief_block(proj)
     if brief:
         density = str(brief.get("dialogue_density") or "中")
@@ -313,19 +317,198 @@ def expand_episode_prompt(idea, entry, prev_summary=None, style_text=None, proj=
 4. {rate_rule}
 5. 关键道具必须出现在动作描述里（资产提炼会消费）。
 {_brief_tone_block(brief)}{f'''拆剧本 skill（本项目节奏契约）：
-{style_text}''' if style_text else ''}
+{style_text}''' if style_text else ''}{f'''6. 下方「已锚定设定」是全剧权威事实：人物语言风格与称呼规则、道具何时不生效、
+   场景对行动的限制都必须照写；台词要能体现每个人的"说话的破绽"与"被逼急时怎么做"。
+   只准使用白名单里的人物/场景/道具；确需白名单之外的新实体时不要现场编造，
+   改为在该场动作描述里写一行「【缺口：说明缺什么】」并继续写完本集。
+   创作禁区里列出的写法一律不得出现。
+''' if units else ''}
 
 输出：纯剧本文本，不要 JSON、不要解释、不要标题。"""
     user_p = f"[创作构想]\n{idea}\n[本集大纲]\n{json.dumps(entry, ensure_ascii=False)}" + \
-             (f"\n[上一集梗概]\n{prev_summary}" if prev_summary else "")
+             (f"\n[上一集梗概]\n{prev_summary}" if prev_summary else "") + \
+             (f"\n\n[已锚定设定（权威，不得违背）]\n{units}" if units else "")
     return sys_p, user_p
+
+
+# ---------- 1.5 全剧最小单元（① 第一步：先锚定，后写作） ----------
+
+UNITS_STORY_SCHEMA = """{
+ "premise":"一句话故事简介","highlights":["核心看点 2~3 条"],
+ "sources":[{"item":"写清是哪条设定","origin":"user|agent"}],
+ "rules":[{"id":"R1","text":"能力边界/世界硬规则","check_hint":"违例长什么样"}],
+ "taboos":[{"id":"TB1","rule":"否定式禁令","detect":["可机检的关键词"],"source":"R1"}],
+ "pressure":{"why_no_retreat":"","main_resistance":"","extra_pressure":""},
+ "arcs":[{"id":"ARC1","title":"","ep_from":"E1","ep_to":"E6","goal":"从X到Y","release":["本段释放的信息"],"why_distinct":""}],
+ "throughline":[{"stage":"起|承|转|合","text":""}],
+ "causality":[{"from":"E1","to":"E3","because":""}],
+ "roster":{"characters":[{"id":"ascii小写连字符","name":"","role":"主角|主要|次要","gender":"男|女|不明","one_line":"一句话定位"}],
+            "scenes":[{"id":"","name":"","interior":true,"one_line":""}],
+            "props":[{"id":"","name":"","kind":"叙事|证据|信物|武器","one_line":""}]},
+ "episodes":[{"id":"E1","title":"","arc_id":"ARC1","summary":"","hook":"","cliff":"","duration_min":5,
+              "beats":["节拍A","节拍B","节拍C","节拍D"],
+              "cast_refs":["@character:xxx"],"scene_refs":["@scene:xxx"],"key_asset_refs":["@prop:xxx"],
+              "fs_plant":["FS1"],"fs_pay":[]}],
+ "foreshadows":[{"id":"FS1","plant":"埋什么","set_in":"E2","form":"埋的具体形态","pay_in":"E18",
+                 "payoff":"收的方式","refs":["@character:xxx"],"status":"open"}],
+ "hooks":[{"id":"HK1","beat":"一句话画面或台词","question":"挑起什么疑问","ep":"E1"}]}"""
+
+
+def units_story_prompt(idea, script_text, eps_n=0, arc=None, prev_summary="", open_threads=None,
+                       style_text=None, proj=None, arc_size=0, known=None):
+    """① 第一步·剧情骨架：成品剧本或一句话构想 → 全剧最小单元（含实体名册与分集加厚条目）。
+
+    arc 给定时只生成该段的 episodes；arc_size 给定时首批也限定只出前 arc_size 集——
+    一次要 15 集加厚条目必然把 JSON 写断，分批是硬要求不是优化项。
+    known=项目既有资产目录（"ref | 名称" 列表）：**不喂它会出大事**——09_仙 实跑时 LLM 没见过
+    既有档案，给同一人物造了 captive-old-immortal / captured-old-immortal / captured-immortal-second
+    三个 id，仙恩药也另立 xianen-yao（既有 xianen_hei_yaowan），一次跑出 57 个重复建档。
+    """
+    brief = _brief_block(proj)
+    if isinstance(arc, dict) and arc.get("id"):
+        span = (f"分段 {arc.get('id')}（{arc.get('ep_from')}~{arc.get('ep_to')}，阶段目标：{arc.get('goal')}）"
+                f"——本批 episodes **只出这一段覆盖的集**")
+    elif arc_size and eps_n and eps_n > arc_size:
+        span = (f"全剧骨架 + 前 {arc_size} 集（E1~E{arc_size}）的分集加厚条目"
+                f"——**episodes 只出 E1~E{arc_size}**，后面的段我另起一批要；arcs 表要出全剧")
+    else:
+        span = "全剧"
+    kn = _knowledge((script_text or idea or "")[:2000], k=4)
+    caps = ""
+    try:
+        import brief as _BR
+        b = _BR.load_brief(proj) if proj else {}
+        caps = "、".join(x for x in (
+            f"主要人物 ≤{b.get('max_characters')}" if b.get("max_characters") else "",
+            f"主要场景 ≤{b.get('max_scenes')}" if b.get("max_scenes") else "") if x)
+    except Exception:
+        caps = ""
+    clip = (script_text or "")[:12000]
+    sys_p = f"""剧集策划（v{PROMPT_VERSION}）。职责：在读到正文之前，先把一部剧的**全剧最小单元**定下来，
+供后续逐集扩写与素材生成当权威底。这一步不写正文，只出结构与事实。
+
+硬约束：
+1. 集号一律写成 E+数字（"E12"），禁止"第12集""12"等写法——所有跨集引用都以此为主键，写法不统一会导致全链查不到。
+2. 分段（arcs）的 ep_from/ep_to 必须覆盖你输出的每一集，段间不得重叠或漏集。
+3. 伏笔必须成对：每条 foreshadow 的 set_in（埋）与 pay_in（收）都要指向真实存在的集，且 pay_in 晚于 set_in；
+   埋在某一集就必须在该集的 fs_plant 里列出，收在某一集就必须列在该集的 fs_pay 里，双向都要对得上。
+4. 能力边界写成可执行约束（"只判真假、不给动机、过用则伤身"），不写形容词；taboos 用否定式，
+   并给出 detect 关键词以便机检（写不出关键词的就先别写这条）。
+5. roster 是实体名册，只出**身份级**信息（id/name/role/one_line），不写外观长描述、不写画风词——
+   外观与生图提示词是 ② 素材生成的职责，这里抢写会造成两处真相。
+   id 用小写 ascii 连字符（如 shiwang-qian），全剧唯一，禁止用中文。
+   **宁缺毋滥**：只登记有名有姓、在本剧有台词或承担关键动作的人物/有实际戏份发生的场景/被动作引用的道具；
+   一次性路人、只被提到一句的名号、群体泛称都不进名册{f'''，按制作规格上限：{caps}''' if caps else ''}。
+   同一个东西换个叫法（"白袍猎仙使"与"猎仙使"）算同一条，不要另立 id。
+{f'''5b. **既有资产必须原样复用 id**：下方「项目既有资产」就是本项目已经存在的档案。
+   凡你想写的角色/场景/道具与其中某一条是同一个东西（叫法不同也算），roster 里必须用它的原 id 与原 name，
+   **禁止另起新 id**；对不上的才算新资产。同一物造两个 id 会让分镜引用、素材图索引与反查表全部错位。''' if known else ''}
+6. 每集的 cast_refs/scene_refs/key_asset_refs 只能引用本输出 roster 里的 id；roster 里没有的就不要引用，
+   宁可漏掉也不要造悬空引用。
+7. sources 要如实区分来源：用户明确指定的写 "user"，你推断补全的写 "agent"。不得把自己编的标成用户指定。
+8. 关键道具至少出现一次在某一集的 beats 或动作里，供资产提炼消费。
+{f'''9. 集数上限是硬的：arcs 的 ep_from/ep_to 与 episodes 的 id 只允许落在 E1~E{eps_n}，
+   一集不能多、一集不能少——第一步不扩集，缺的集是后面另开一轮的事。
+   分段必须首尾相接铺满 E1~E{eps_n}。''' if eps_n else ''}
+{brief or ''}{f'''拆剧本 skill（本项目节奏契约）：
+{style_text}''' if style_text else ''}
+
+输出范围：{span}。
+只输出严格 JSON，不要解释、不要 markdown 代码栏：
+{UNITS_STORY_SCHEMA}
+
+{_selfcheck([
+        "每个集号都是 E+数字",
+        "arcs 区间不重叠不漏集，覆盖全部 episodes",
+        "每条 foreshadow 的 set_in/pay_in 都存在于 episodes 且 pay_in 更晚",
+        "埋收双向对账：fs_plant/fs_pay 与 foreshadows 一一对应",
+        "所有 @kind:id 都能在 roster 找到；roster 内 id 唯一且为 ascii",
+        "rules/taboos 是否真的能拦住一类具体写法（拦不住的空话删掉）",
+    ])}"""
+    parts = []
+    if idea:
+        parts.append(f"[创作构想]\n{idea}")
+    if prev_summary:
+        parts.append(f"[已生成段落摘要]\n{prev_summary}")
+    if open_threads:
+        parts.append("[已埋未收的线（本段内要安排收点，不要凭空新增）]\n" +
+                     "\n".join(f"- {t.get('id')}：{t.get('plant')}（埋在 {t.get('set_in')}，原定收在 {t.get('pay_in')}）"
+                               for t in open_threads))
+    parts.append(f"[目标集数]\n{eps_n or '由正文实际集数决定'}")
+    if known:
+        parts.append("[项目既有资产（同一个东西必须复用这里的 id，不许另起新 id）]\n" +
+                     "\n".join(f"- {row}" for row in list(known)[:400]))
+    parts.append(f"[剧本正文/梗概（只读，不得改写）]\n{clip or '（无正文，按构想原创）'}")
+    return _emit("units_story", sys_p, kn), "\n".join(parts)
+
+
+UNITS_ENTITY_SCHEMA = """{
+ "characters":[{"ref":"@character:xxx","bio_language":"语言风格","bio_crack":"说话的破绽",
+                "bio_pressure":"被逼急时怎么做","bio_address":"称呼规则（对不同人怎么被叫/怎么称呼人）",
+                "bio_arc":"弧光：从什么变成什么","relations":[{"to_ref":"@character:yyy","kind":"师徒|仇敌|同盟",
+                 "stance_by_arc":[{"arc":"ARC1","stance":"敌对"}]}]}],
+ "scenes":[{"ref":"@scene:xxx","spatial_limit":"空间对行动的限制（谁能进出、被堵时退路在哪）",
+            "action_slots":["可复用动作位置 2~4 个"]}],
+ "props":[{"ref":"@prop:xxx","usage_boundary":"使用边界：何时生效、何时不生效、代价是什么"}],
+ "state_derive":[{"ep":"E2","ref":"@character:xxx","state_id":"xxx_S1","label":"状态名(≤6字)",
+                  "look_diff":"与常态的外观差异(≤40字)","camp":"敌方|友方|中立|不明"}],
+ "gaps":[{"kind":"character|scene|prop","ref":"","need":"正文用到但名册里没有的东西"}]}"""
+
+
+def units_entity_prompt(units, style_text=None, proj=None, targets=None):
+    """① 第一步·设定层：剧情骨架 + 实体名册 → 人物传记/场景限制/道具边界/状态派生。
+
+    这些是"写作与表演用语料"，与 ② 的外观字段不重叠：本步不出外观、不出图提示词。
+    targets=分批续跑时"本批只写这些条目"——不给它，模型会把没进本批的既有实体当成"名册缺失"报一堆假缺口
+    （09_仙 实跑就这么把主角芝靖报成了缺档）。
+    """
+    kn = _knowledge(json.dumps(units.get("episodes") or [], ensure_ascii=False)[:2000], k=3)
+    sys_p = f"""人物与世界观设定监督（v{PROMPT_VERSION}）。职责：把已锚定的剧情骨架填成**可执行设定**，
+供逐集扩写、演员表演、平面推演三方共同消费。
+
+硬约束：
+1. 只写**行为与语言的约束**，不写外貌：外貌/服装/材质/画风词一概不出现（那是 ② 素材生成的职责，抢写会造成两处真相）。
+2. 每一栏都要能被"违反它就能看出来"检验：
+   - bio_language：这个人说话的句式与词汇偏好（不是"聪明冷静"这种形容词）
+   - bio_crack：说谎/心虚/动真情时在语言上的破绽，供台词层直接演
+   - bio_pressure：被逼到退无可退时的第一反应与代价
+   - bio_address：对不同人怎么被叫、怎么称呼人，且随剧情变化要写清在哪个 arc 变
+   - bio_arc：一句"从X到Y"，必须是状态位移不是评价
+3. 场景的 spatial_limit 必须落到"谁能进出、被堵住时退路在哪"，action_slots 是给分镜与平面图用的具体位置（2~4 个）。
+4. 道具的 usage_boundary 要写清**何时不生效**与代价——只写"很强"等于没写。
+5. ref 必须来自输入名册；正文用到而名册里没有的，一律进 gaps[] 上报，禁止自己新建实体。
+{f'''5b. **本批只写「本批条目」里列出的实体**：其余名册/档案条目只是背景上下文，它们已经登记过，
+   不要为它们输出内容，更不要把它们当成"名册缺失"报进 gaps（那是一条假缺口）。''' if targets else ''}
+6. state_derive 只在外观/立场确有阶段性变化时输出，ep 必须是 E+数字且存在于输入分集里。
+{f'''拆剧本 skill（本项目节奏契约）：
+{style_text}''' if style_text else ''}
+
+只输出严格 JSON：
+{UNITS_ENTITY_SCHEMA}
+
+{_selfcheck([
+        "没有出现任何外貌/服装/画风描述词",
+        "五个 bio 栏每条都可被'违反它就能看出来'检验",
+        "所有 ref 都在输入名册内；缺的都写进 gaps",
+        "state_derive 的 ep 都是 E+数字且存在于输入分集",
+    ])}"""
+    user_p = "[剧情骨架与实体名册]\n" + json.dumps(
+        {k: units.get(k) for k in ("premise", "rules", "arcs", "roster", "episodes", "foreshadows")},
+        ensure_ascii=False)
+    if targets:
+        user_p += ("\n\n[本批要写设定的条目（只输出这些；其余已登记）]\n"
+                   + json.dumps([{"ref": t.get("ref"), "kind": t.get("kind"), "name": t.get("name"),
+                                  "缺": t.get("missing")} for t in targets[:40]], ensure_ascii=False))
+    return _emit("units_entity", sys_p, kn), user_p
 
 
 # ---------- 2. 人物 ----------
 
 def characters_prompt(episode_text, known=None, style_text=None, catalog=None):
-    """剧本文本 → 人物档案。硬信息优先、不给角色编造设定。"""
-    kn = _knowledge(episode_text, k=2)
+    """剧本文本 → 人物档案。硬信息优先、不给角色编造设定。
+    注：本步骤不垫拉片卡片（AGENTS 记录的注入点只有分镜与转场）；
+    曾在此算过 kn 却从不拼进提示词，属死代码，已移除——需要卡片请先在职责里显式加。"""
+    from skill_lib import SHEET_VIEW_PANELS_ZH as PANELS   # 构图文字只在 skill_lib 存一份
     sys_p = f"""剧集人物总监（v{PROMPT_VERSION}）。职责：从剧本提取全部出场人物并建档，
 供分镜白模的站位/服色/景别决策使用。
 
@@ -337,17 +520,26 @@ def characters_prompt(episode_text, known=None, style_text=None, catalog=None):
 4. 主角判定写依据（出场次数/驱动剧情），不拍脑袋；每条记录必须有 evidence_ids，
    只能引用下方证据索引中的 EV 编号，不得凭世界观常识补人。
 5. 外貌/服装只在剧本提到时填写；没提到填 null——但 voice/sheet_prompt 是创作必需，允许基于人设合理设计。
-6. sheet_prompt 是角色三视图的生图提示词：要求同一角色正面/侧面/背面全身立绘、纯白背景、
-   写明年龄感/体型/发型/服装/配色/材质与时代感——供生图模型产出跨镜头一致性的角色设定图。
+6. sheet_prompt 是角色设定图的生图提示词，固定五视图构图（一张图内从左到右五段）：
+   {PANELS}。
+   纯白背景，写明年龄感/体型/发型/服装/配色/材质与时代感——供生图模型产出跨镜头一致性的角色设定图。
+   ③④ 是**无头躯干**：写成"画面自领口往下、颈部以上不入画"这种正面表述，不要写"不带头部/无头"这种否定句（图像模型对中文否定句服从度极低，且"不带头部"会被读成"不带头盔"）。
    **只写外观事实**：禁止出现画风/媒介/笔触/渲染类词汇（如"赛璐璐/水彩/写实/3D渲染/胶片感"）——画风由生成时的风格层统一注入，不烘进资产档案。
+   **母图必须是开局常态**：顶层 sheet_prompt 只写该角色全剧最基础、未受伤、未染血、不持剧情道具的样子；
+   任何阶段性差异（伤情/染血/换装/持物/阵营外披）只能写进对应状态的 sheet_prompt，不得烘进母图——
+   母图是状态图的参考底，串了状态就会让开局镜头用错形象。
+   episodes 是"该状态适用于哪些剧情段"的匹配键，**两种都收且可混填**：集号（"E1"）与该状态出现的场名/场景名
+   （如"青芜山村口"）。场名比集号更细——同一集内角色换了形象（布衣→染血）就靠场名区分；
+   只填集号会让整本分镜里所有镜头共用一张状态图（09_仙 实测过这个断点）。
+   禁止填"／日""／夜"等时间后缀或整句场次标题，那些永远匹配不上。
 7. acting 是演员角色卡的稳定基线：依据本集剧本填写 personality、goal、relationship、
    expression_rules、arc_stage；只能写剧本或大纲已有依据，推断内容在 source 中标记为 design_proposal。
-8. 单集最多输出 24 个单人角色；sheet_prompt 不超过 220 字；acting 各字段不超过 60 字；只输出 JSON。
+8. 单集最多输出 24 个单人角色；sheet_prompt 不超过 260 字；acting 各字段不超过 60 字；只输出 JSON。
 9. **gender 必填**（男|女|不明）：依据原文人称指代判定——以首次出场描写为锚、全文指代多数为证；两者冲突时按首次出场判定并在 basis 注明"原文指代存在矛盾"。禁止凭名字气质/题材联想猜性别。
 10. **identity_anchor 身份锚点**（≤60字）：全剧永不变的外貌底座——性别、年龄段、体型、发色、肤色等
     生理特征。剧情中会变的（服装/伤情/阵营/发型改造）一律不写入锚点。
 11. **states 状态资产**：角色在剧情中外观/立场确有阶段性变化时输出（≤4 个），
-    每个 {{"id":"<角色id>_S1","label":"状态名(≤6字)","episodes":["出现的集号/场名"],"look_diff":"与锚点的差异(≤40字：服装/伤情/持物)","camp":"敌方|友方|中立|不明","sheet_prompt":"锚点原文+差异合成后的该状态三视图提示词(≤220字，同样只写外观事实、禁止画风词)"}}。
+    每个 {{"id":"<角色id>_S1","label":"状态名(≤6字)","episodes":["出现的集号/场名"],"look_diff":"与锚点的差异(≤40字：服装/伤情/持物)","camp":"敌方|友方|中立|不明","sheet_prompt":"锚点原文+差异合成后的该状态五视图提示词(≤260字，同样只写外观事实、禁止画风词)"}}。
     外观立场无变化的角色 states 为空数组。sheet_prompt（顶层）= 默认/戏份最重状态的版本。
 
 输出 JSON：{{"characters":[{{"id":"pinyin_id","name":"姓名","role":"主角|配角|群演","is_collective":false,
@@ -359,7 +551,7 @@ def characters_prompt(episode_text, known=None, style_text=None, catalog=None):
 "expression_rules":"表达与反应习惯","arc_stage":"本集成长阶段"}},
 "voice":"音色描述：音高/语速/质感/口音（配音与 TTS 选型用）",
 "lens":"镜头倾向：这类角色常用什么景别与机位拍（如弱势者多用仰视近景）",
-"sheet_prompt":"角色三视图生图提示词（中文，含'正面、侧面、背面三视图'字样与全部外观细节）",
+"sheet_prompt":"角色五视图设定图生图提示词（中文，须完整含这五段：{PANELS}，并写全部外观细节）",
 "dialogue_count":数字,"first_scene":"首次出场场景名","evidence_ids":["EV001"],
 "parent_ref":null,"relation":null,"derived_from":null,"related_refs":[]}}]}}
 {f"\n可参考的既有档案（合并而非重复创建，优先复用其中 id）：{json.dumps(known, ensure_ascii=False)}" if known else ""}
@@ -424,8 +616,9 @@ owner 是“谁持有/制造/使用”，只表示剧情动作发起者；parent
 
 # ---------- 5. 分镜（创作线核心） ----------
 
-def storyboard_prompt(episode_text, characters, scenes, props=None, mood_text=None, style_text=None):
-    """剧本+人物+场景 → dialogue 契约分镜。注入拉片知识库参考片例 + 导演风格 skill。"""
+def storyboard_prompt(episode_text, characters, scenes, props=None, mood_text=None, style_text=None, units=""):
+    """剧本+人物+场景 → dialogue 契约分镜。注入拉片知识库参考片例 + 导演风格 skill。
+    units=① 锚定的最小单元注入块（story_units.units_block 单点渲染）；空串=未锚定，提示词逐字不变。"""
     try:
         from script_repository import is_collective_asset, is_asset_prop
     except Exception:
@@ -480,6 +673,10 @@ def storyboard_prompt(episode_text, characters, scenes, props=None, mood_text=No
 {f'''
 导演风格 skill（本项目的风格契约，镜头语言/色彩/节奏按此执行）：
 {style_text}''' if style_text else ''}
+{f'''
+已锚定设定（① 第一步的权威事实：场景对行动的限制、道具何时不生效、本段阶段目标与待埋伏笔都必须
+落到镜头里；「创作禁区」列出的写法一律不得出现）：
+{units}''' if units else ''}
 输出 JSON：{{"shots":[{{"id":"S1","dur":4.0,"shot_size":"近景","camera_move":"固定","angle":"平视",
 "transition":"硬切","cam":"cu","scene":"room","light":"夜晚-烛光",
 "pos":[x,y,z],"look":[x,y,z],"speaker":"人物id",
@@ -564,7 +761,7 @@ CHARACTER_RECONCILE_SYS = """你是角色 continuity 校准师。给你全剧正
 - gender：男|女|不明。依据全文人称指代（他/她）+首次出场描写；多数一致才定，冲突以首次出场为准。
 - identity_anchor：身份锚点 ≤60字（性别/年龄段/体型/发色/肤色——全剧不变的生理底座）。
 - states：角色确有阶段性外观/立场变化时输出 ≤4 个：
-  {"id":"<角色id>_S1","label":"≤6字","episodes":["E2"],"look_diff":"与锚点的差异≤40字","camp":"敌方|友方|中立|不明","sheet_prompt":"锚点原文+差异合成的三视图提示词≤220字"}。
+  {"id":"<角色id>_S1","label":"≤6字","episodes":["E2"],"look_diff":"与锚点的差异≤40字","camp":"敌方|友方|中立|不明","sheet_prompt":"锚点原文+差异合成的五视图提示词≤260字"}。
   弧线型角色必须拆状态（如"反派→盟友"两状态）；全剧无变化输出空数组。
 旁白/叙述者/画外音/解说不是人物：若清单中存在此类记录，输出时直接剔除。
 只输出 JSON：{"characters":[{"id":"原id","gender":"男","identity_anchor":"...","states":[]}]}。"""
@@ -699,11 +896,18 @@ SYSTEM_SKILLS = [
     {"id": "outline", "name": "构想→大纲", "target": "script",
      "desc": "一段话从0生成剧集大纲（主线/类型/人物提示）",
      "preview": lambda: outline_prompt("示例构想一句话", 6)[0]},
+    {"id": "units_story", "name": "全剧最小单元·剧情骨架", "target": "script",
+     "desc": "剧本/构想→大纲加厚+分段+推演+埋线+实体名册+分集加厚条目（E\\d+ 主键）",
+     "preview": lambda: units_story_prompt("示例构想", "【场景：示例／日】\n示例动作。\n角色A：台词。", 6)[0]},
+    {"id": "units_entity", "name": "全剧最小单元·设定层", "target": "script",
+     "desc": "骨架→人物传记五件套/场景空间限制/道具使用边界/状态派生（不写外观）",
+     "preview": lambda: units_entity_prompt({"premise": "示例", "rules": [], "arcs": [], "roster": {},
+                                             "episodes": [], "foreshadows": []})[0]},
     {"id": "expand", "name": "分集扩写", "target": "script",
      "desc": "大纲条目→分场剧本原文（180~220字/分钟）",
      "preview": lambda: expand_episode_prompt("示例构想", {"id": "E1", "title": "示例", "summary": "示例梗概", "hook": "钩子", "cliff": "落点", "duration_min": 4})[0]},
     {"id": "characters", "name": "人物提炼", "target": "assets",
-     "desc": "人物档案+音色+镜头倾向+三视图提示词",
+     "desc": "人物档案+音色+镜头倾向+五视图提示词",
      "preview": lambda: characters_prompt("示例剧本文本，角色A对角色B说话。")},
     {"id": "scenes", "name": "场景提炼", "target": "assets",
      "desc": "场景清单+白模几何要点+概念图提示词",

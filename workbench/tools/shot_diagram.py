@@ -166,6 +166,8 @@ def main():
     ap.add_argument("storyboard", nargs="?", default=None)
     ap.add_argument("--outdir", default=None)
     ap.add_argument("--plan", default=None, help="plan v1 平面图 JSON（作底图；镜头缺省字段以 plan 补）")
+    ap.add_argument("--shots", default=None,
+                    help="只渲染这些镜号（逗号分隔）：跨场景分镜须按各自场景的底图分组渲染，见 plan_frames")
     a = ap.parse_args()
     plan = None
     if a.plan:
@@ -199,6 +201,12 @@ def main():
         base_name = os.path.splitext(os.path.basename(jp))[0]
         outdir = a.outdir or os.path.join(os.path.dirname(os.path.dirname(jp)), "推演", "平面图_" + base_name)
         scenes = load_scenes(jp)
+        if a.shots:
+            want = {x.strip() for x in str(a.shots).split(",") if x.strip()}
+            if want:
+                shots = [s for s in shots if str(s.get("id")) in want]
+                if not shots:
+                    print("[错误] --shots 与分镜镜号无交集"); sys.exit(1)
         if plan is not None:
             for aid, info in plan_actors_map(plan).items():
                 actors.setdefault(aid, info)
@@ -248,6 +256,17 @@ def main():
         # 供下一镜走位箭头：在场角色当前位置
         prev = positions
         n += 1
+    if plan is not None and a.storyboard:
+        # 跨场景分镜共用一张 plan 底图时，非本场景的镜会被画在别场的墙纸陈设上，
+        # 而 ⑦ 会把这些图当参考帧喂视频模型。此处只让问题可见：
+        # 跳过、改图还是拦截，归 ⑥/assemble 侧的 scene_ref 匹配口径决定。
+        from plan_adapt import shot_scene_ref as _sref
+        _pscene = str(plan.get("scene_ref") or "")
+        _bad = [str(sh.get("id")) for sh in shots if _pscene and _sref(sh) and _sref(sh) != _pscene]
+        if _bad:
+            print(f"[警告] {len(_bad)} 镜的 scene_ref 与底图场景（{_pscene}）不符，"
+                  f"图中墙/陈设属他场，勿当空间参考: "
+                  + ", ".join(_bad[:12]) + ("…" if len(_bad) > 12 else ""))
     print(f"[完成] 平面图 {n} 张{'（plan 底图）' if plan is not None else ''} -> {outdir}")
     print("OUTPUT:" + outdir)
 

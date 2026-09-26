@@ -15,7 +15,7 @@ RULES = {
     '疑似密钥': rb'\b(?:sk-|ghp_|github_pat_|AKIA)[A-Za-z0-9_-]{20,}',
     '字面量凭证': rb'''(?i)["']?(?:api_key|access_token|client_secret|password)["']?\s*[:=]\s*["'][A-Za-z0-9_./+=-]{20,}["']''',
 }
-PRIVATE = re.compile(r'(^|/)(?:projects|_vendor|node_modules|exports|jobs|runtime|\.git_backup_[^/]+)(/|$)|(^|/)(?:providers|media_gateway|llm_config|mcp|mcp_runtime|source_manifest|user_cards)\.json(?:\.|$)|(^|/)\.env(?:\.|$)')
+PRIVATE = re.compile(r'(^|/)(?:projects|_vendor|node_modules|exports|jobs|runtime|billing|\.git_backup_[^/]+)(/|$)|(^|/)(?:providers|media_gateway|llm_config|mcp|mcp_runtime|source_manifest|user_cards|auth)\.json(?:\.|$)|(^|/)\.env(?:\.|$)')
 
 
 def git(*args):

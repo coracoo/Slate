@@ -23,7 +23,7 @@ class ChatGPTAssetQueueTests(unittest.TestCase):
             os.makedirs(os.path.join(project, "创作"), exist_ok=True)
             with open(os.path.join(project, "素材", "人物.json"), "w", encoding="utf-8") as fh:
                 json.dump({"characters": [{
-                    "id": "hero", "name": "主角", "sheet_prompt": "黑发蓝制服人物三视图",
+                    "id": "hero", "name": "主角", "sheet_prompt": "五视图设定图：脸部正面特写、45度左侧脸特写、不带头部正面全身、不带头部侧面全身、严格背面全身；黑发蓝制服",
                     "states": [{"id": "S1", "label": "战损期", "look_diff": "红色破损外套",
                                 "sheet_prompt": "保持同一主角身份，穿红色破损外套"}],
                 }]}, fh, ensure_ascii=False)
@@ -49,7 +49,7 @@ class ChatGPTAssetQueueTests(unittest.TestCase):
             os.makedirs(os.path.join(project, "素材", "人物"), exist_ok=True)
             os.makedirs(os.path.join(project, "创作"), exist_ok=True)
             with open(os.path.join(project, "素材", "人物.json"), "w", encoding="utf-8") as fh:
-                json.dump({"characters": [{"id": "hero", "name": "主角", "sheet_prompt": "黑发制服三视图"}]}, fh, ensure_ascii=False)
+                json.dump({"characters": [{"id": "hero", "name": "主角", "sheet_prompt": "五视图设定图：脸部正面特写、45度左侧脸特写、不带头部正面全身、不带头部侧面全身、严格背面全身；黑发制服"}]}, fh, ensure_ascii=False)
             Image.new("RGB", (8, 8), (10, 20, 30)).save(os.path.join(project, "素材", "人物", "hero.png"))
 
             job = chatgpt_queue.queue_assets(project, ["@character:hero"])[0]
@@ -66,7 +66,7 @@ class ChatGPTAssetQueueTests(unittest.TestCase):
             os.makedirs(os.path.join(project, "素材"), exist_ok=True)
             os.makedirs(os.path.join(project, "创作"), exist_ok=True)
             with open(os.path.join(project, "素材", "人物.json"), "w", encoding="utf-8") as fh:
-                json.dump({"characters": [{"id": "hero", "name": "主角", "sheet_prompt": "黑发制服三视图"}]}, fh, ensure_ascii=False)
+                json.dump({"characters": [{"id": "hero", "name": "主角", "sheet_prompt": "五视图设定图：脸部正面特写、45度左侧脸特写、不带头部正面全身、不带头部侧面全身、严格背面全身；黑发制服"}]}, fh, ensure_ascii=False)
             with open(os.path.join(project, "素材", "道具.json"), "w", encoding="utf-8") as fh:
                 json.dump({"props": [{"id": "hero_sword", "name": "佩剑", "image_prompt": "青铜佩剑",
                                        "parent_ref": "@character:hero"}]}, fh, ensure_ascii=False)
@@ -84,7 +84,7 @@ class ChatGPTAssetQueueTests(unittest.TestCase):
             os.makedirs(os.path.join(project, "素材"), exist_ok=True)
             os.makedirs(os.path.join(project, "创作"), exist_ok=True)
             with open(os.path.join(project, "素材", "人物.json"), "w", encoding="utf-8") as fh:
-                json.dump({"characters": [{"id": "hero", "name": "主角", "sheet_prompt": "黑发制服三视图"}]}, fh, ensure_ascii=False)
+                json.dump({"characters": [{"id": "hero", "name": "主角", "sheet_prompt": "五视图设定图：脸部正面特写、45度左侧脸特写、不带头部正面全身、不带头部侧面全身、严格背面全身；黑发制服"}]}, fh, ensure_ascii=False)
             with open(os.path.join(project, "创作", "creation.json"), "w", encoding="utf-8") as fh:
                 json.dump({"items": []}, fh)
             jobs = chatgpt_queue.queue_assets(project, ["@character:hero"])

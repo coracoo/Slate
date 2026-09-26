@@ -167,8 +167,14 @@ def project_style(proj):
 
 
 def set_project_style(proj, style):
-    os.makedirs(os.path.join(proj, "剧本"), exist_ok=True)
-    with open(os.path.join(proj, "剧本", "style.json"), "w", encoding="utf-8") as f:
+    p = os.path.join(proj, "剧本", "style.json")
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    try:
+        import versions as _V
+        _V.snapshot(p)
+    except Exception:
+        pass
+    with open(p, "w", encoding="utf-8") as f:
         json.dump(style, f, ensure_ascii=False, indent=1)
 
 
@@ -294,12 +300,32 @@ STORY_FRAME_NEGATIVE = "额外角色,重复角色"
 # character/scene/prop 等资产设定图 kind 永远不带（三视图/空镜/单道具的正约束已够）
 STORY_FRAME_KINDS = frozenset({"frame", "keyframe", "panel", "shot", "video_frame", "story_frame"})
 
+# 人物设定图五段构图的**唯一权威文本**。以前这四段文字在 ①类别硬约束 ②② 提炼提示词 ③单资产重生成
+# 三处各抄一份，改一处就分叉（本次就是"迁移幂等"只在其中一处加了守卫）。
+# ③④ 用正面表述（"画面自领口往下"）而不是"不带头部"：图像模型对中文否定句服从度极低，
+# 而且"不带头部"会被读成"不带头盔"；⑤ 补"含头部背面"，免得模型把背面也画成无头。
+SHEET_VIEW_TITLE_ZH = "五视图设定图（一张图内从左到右五段）"
+SHEET_VIEW_PANELS_ZH = ("①脸部正面与脖子特写；②脸部45度左侧脸与脖子特写；"
+                        "③无头躯干正面像——画面自领口往下，颈部以上不入画；"
+                        "④无头躯干侧面像——同样止于领口；⑤严格背面全身像（含头部背面）")
+SHEET_VIEW_LAYOUT_ZH = f"{SHEET_VIEW_TITLE_ZH}：{SHEET_VIEW_PANELS_ZH}。纯白背景。"
+# 英文对照：图像模型对纯中文指令服从度低（本仓老坑，画风禁令因此也是中英双语）。
+SHEET_VIEW_LAYOUT_EN = ("character reference sheet, five panels in one image arranged left to right, plain white background: "
+                        "panel 1 face and neck front close-up; panel 2 face and neck 45-degree profile close-up; "
+                        "panel 3 headless torso front view cropped at the collar, nothing above the neck in this panel; "
+                        "panel 4 headless torso side view, also cropped at the collar; "
+                        "panel 5 full back view including the back of the head.")
+
 # 类别硬约束：拼在最终提示词末尾并声明不可覆盖，保证不被外观/画风文本冲淡
 ASSET_KIND_CONSTRAINTS = {
-    "character": "硬性构图约束（最高优先级，不可被任何其他描述覆盖）：画面中只有该角色同一主体的三视图，不出现其他角色或无关人物。",
+    "character": (f"硬性构图约束（最高优先级，不可被任何其他描述覆盖）：画面为同一角色的五视图拼版——{SHEET_VIEW_PANELS_ZH}"
+                  "——五段从左到右排列在同一画面内，不出现其他角色或无关人物。"
+                  f"EN: {SHEET_VIEW_LAYOUT_EN}"),
     "scene": "硬性构图约束（最高优先级，不可被任何其他描述覆盖）：纯场景空镜，画面中不出现任何人物、角色、人形剪影、面部或肢体。",
     "prop": "硬性构图约束（最高优先级，不可被任何其他描述覆盖）：只有该道具单个主体居中，画面中不出现任何人物、角色或人形剪影。",
 }
+ASPECT_CONSTRAINT = ("硬性画幅约束（不可被任何其他描述覆盖）：画面严格为 16:9 横构图（宽高比 16:9，"
+                     "strictly 16:9 landscape aspect ratio），禁止方形/竖构图输出。")
 
 
 def compose_asset_negative(proj, skill_id=None, kind=None):
@@ -326,8 +352,9 @@ def resolve_asset_style_text(proj, skill_id=None, style_prompt=None):
     if not selected:
         return "", "none"
     raw = image_skill_text(proj, skill_id)
-    # “追加——”与引号之间允许换行（ghibli-soft 等 skill 的实际排版），只取引号内指令
-    quoted = re.search(r'追加[\s—–-]*[“"](.+?)[”"]', raw, re.S)
+    # “追加——”与引号之间允许换行/破折号，也允许一小段说明词（cinematic-real 写作
+    # “追加到生图提示词末尾——”）；取不到引号时仍回退整篇正文。
+    quoted = re.search(r'追加[^“”"]{0,40}[“"](.+?)[”"]', raw, re.S)
     text = (quoted.group(1) if quoted else raw).strip()
     return text, ("asset_skill" if str(skill_id or "").strip() else "project")
 
@@ -347,6 +374,7 @@ def compose_asset_image_prompt(proj, source_prompt, skill_id=None, kind="charact
     constraint = ASSET_KIND_CONSTRAINTS.get(str(kind or "").strip())
     if constraint:
         parts.append(constraint)
+    parts.append(ASPECT_CONSTRAINT)
     return "\n".join(parts), compose_asset_negative(proj, skill_id, kind=kind)
 
 

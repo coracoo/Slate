@@ -68,6 +68,20 @@ class ProjectLayoutTests(unittest.TestCase):
         index = json.loads(self.proj.joinpath("素材/素材图.json").read_text(encoding="utf-8"))
         self.assertEqual(index["人物"]["a"]["path"], "素材/人物/a.png")
 
+    def test_fix_strings_does_not_touch_bare_asset_paths(self):
+        """--fix-strings 不该把已正确的 素材/（资产）路径改成 拉片素材/（09_蜘女 实测 380 条）。"""
+        _write(self.proj, "素材/素材图.json",
+               json.dumps({"人物": {"a": {"path": "资产/人物/a.png"}}}, ensure_ascii=False))
+        _write(self.proj, "创作/creation.json", json.dumps(
+            {"refs": ["资产/道具/k.png", "素材/人物/a.png", "拉片素材/角色参考/甲.png"]},
+            ensure_ascii=False))
+        _write(self.proj, "拉片素材/v.mp4", "v")
+        self.assertEqual(PL.migrate_project(str(self.proj)), [])
+
+        PL.migrate_project(str(self.proj), fix_strings=True)
+        refs = json.loads(self.proj.joinpath("创作/creation.json").read_text(encoding="utf-8"))["refs"]
+        self.assertEqual(refs, ["素材/道具/k.png", "素材/人物/a.png", "拉片素材/角色参考/甲.png"])
+
     def test_coexisting_old_and_new_not_merged(self):
         _write(self.proj, "素材/v.mp4", "v")
         _write(self.proj, "拉片素材/old.mp4", "o")

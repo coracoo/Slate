@@ -267,6 +267,33 @@ class ComfyUIClient:
             raise ComfyUIError("ComfyUI 上传参考图未返回文件名")
         return str(result["name"])
 
+    def upload_media(self, path, timeout=120):
+        """上传任意参考媒体（视频/音频）到 ComfyUI input 目录，供 LoadVideo/LoadAudio 引用。"""
+        if not os.path.isfile(path):
+            raise ComfyUIError("参考媒体不存在: " + str(path))
+        if str(path).startswith("http"):
+            raise ComfyUIError("本地 ComfyUI 不支持远程 URL 参考，请使用本地音视频文件")
+        boundary = "----VideoWorkbench" + uuid.uuid4().hex
+        name = os.path.basename(path)
+        size = os.path.getsize(path)
+        if size > 200 * 1024 * 1024:
+            raise ComfyUIError("单个 ComfyUI 参考媒体超过 200 MB")
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        parts = [
+            ("--" + boundary + "\r\nContent-Disposition: form-data; name=\"image\"; filename=\"" +
+             name.replace('"', "") + "\"\r\nContent-Type: application/octet-stream\r\n\r\n").encode("utf-8"),
+            raw,
+            ("\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"type\"\r\n\r\ninput" +
+             "\r\n--" + boundary + "--\r\n").encode("utf-8"),
+        ]
+        response = self._request("POST", "/upload/image", b"".join(parts),
+                                 "multipart/form-data; boundary=" + boundary, timeout=timeout)
+        result = json.loads(response.decode("utf-8"))
+        if not isinstance(result, dict) or not result.get("name"):
+            raise ComfyUIError("ComfyUI 上传参考媒体未返回文件名")
+        return str(result["name"])
+
     def run_video_workflow(self, graph, out_path, *, poll_interval=5, timeout=3600):
         queued = self._json("POST", "/prompt", {"prompt": graph}, timeout=30)
         prompt_id = str((queued or {}).get("prompt_id") or "")
@@ -275,7 +302,9 @@ class ComfyUIClient:
         self._save_task(out_path, prompt_id, "video")
         deadline = time.monotonic() + timeout
         history_path = "/history/" + urllib.parse.quote(prompt_id, safe="")
+        poll_n = 0
         while time.monotonic() < deadline:
+            poll_n += 1
             history = self._json("GET", history_path, timeout=15)
             entry = history.get(prompt_id) if isinstance(history, dict) else None
             if isinstance(entry, dict):
@@ -303,6 +332,8 @@ class ComfyUIClient:
                         return out_path
                 if status.get("completed") or status.get("status_str") == "success":
                     raise ComfyUIError("ComfyUI H3 工作流结束，但没有 SaveVideo 输出；prompt_id=" + prompt_id)
+            # 进度心跳：持续刷新任务记录的 updated_at，看门狗不会把长任务误判为卡死
+            print(f"[ComfyUI] 轮询 {poll_n}：{self._queue_position(prompt_id) or '执行中'}，已等待 {poll_n * poll_interval}s / 上限 {timeout}s", flush=True)
             time.sleep(poll_interval)
         raise ComfyUIError("ComfyUI H3 视频任务轮询超时，未取消上游任务；prompt_id=" + prompt_id)
 
@@ -413,8 +444,8 @@ def load_workflow_template(workflow_path):
 def _generate_image(self, prompt, out_path, *, model, negative_prompt="", image_refs=None,
                     ratio="16:9", workflow_path="", timeout=600):
     refs = list(image_refs or [])
-    if len(refs) > 3:
-        raise ComfyUIError("当前 ComfyUI 适配器最多支持 3 张参考图")
+    if len(refs) > 16:
+        raise ComfyUIError("ComfyUI Qwen Image 2.1 参考图槽位最多 16 张（image_1~image_16）；请减少 @ref 数量")
     width, height = dimensions_for_ratio(ratio)
     seed = int.from_bytes(os.urandom(8), "big") & ((1 << 63) - 1)
     mode = "custom_workflow" if workflow_path else ""

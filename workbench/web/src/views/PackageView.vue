@@ -9,7 +9,7 @@ import {
   mediaUrl, generatePlan, fetchPlanList, buildPlanCanvas, fetchScriptData,
   type WhiteBoard, type PlanSummary
 } from '../api'
-import { app, projectFiles, toast } from '../stores/app'
+import { app, projectFiles, loadBasics, toast } from '../stores/app'
 import { trackJob } from '../stores/jobs'
 import StyledSelect from '../components/StyledSelect.vue'
 import OverlayViewer from '../components/OverlayViewer.vue'
@@ -17,7 +17,9 @@ import OverlayViewer from '../components/OverlayViewer.vue'
 interface Shot { id: string; dur?: number; move?: string; scene?: string; scene_ref?: string; action?: string; prompt?: string; lines?: { speaker: string; line: string }[]; staging?: Record<string, unknown> }
 interface PkgShot { id: string; dur?: number; move?: string; action?: string; script?: { speaker?: string; text?: string }[]; diagram?: string | null; white_ref?: string | null; prompt?: string }
 interface PkgPlan { name: string; scene_ref?: string | null; counts?: { props?: number; actors?: number; paths?: number }; validate_ok?: boolean | null; canvas_html?: string | null }
-interface Pkg { storyboard: string; title?: string; strategy_map?: string | null; shots: PkgShot[]; materials?: string[]; plans?: PkgPlan[] }
+interface Pkg { storyboard: string; title?: string; strategy_map?: string | null; shots: PkgShot[]; materials?: string[]; plans?: PkgPlan[]
+  /** 战略图底图来源：mode=fallback 表示这张底图与分镜的 scene_ref 零匹配（回退用最新一张），空间一致性未经校验 */
+  strategy_plan?: { mode?: string; name?: string; score?: number; total?: number } | null }
 
 const boards = computed(() => (projectFiles('分镜') || []).filter((f) => f.endsWith('.json') && f.startsWith('剧本_')))
 const board = ref('')
@@ -35,8 +37,15 @@ const currentShot = ref(0)
 const overlay = ref<{ visible: boolean; src: string; kind: 'image' | 'html'; title: string }>({ visible: false, src: '', kind: 'image', title: '' })
 
 const baseName = computed(() => board.value.replace(/\.json$/, ''))
+const strategyFile = computed(() => (baseName.value ? `战略图_${baseName.value}.html` : ''))
+/** 生成一次自增一次：/media 无缓存校验头，同名产物重做后需换 URL 才会真的重载 */
+const strategyNonce = ref(0)
+// iframe 直连 /media，产物不存在时只会拿到 404 纯文本（看着就是白屏），所以先查项目树里的产物清单
 const strategyUrl = computed(() =>
-  baseName.value ? `/media?p=${encodeURIComponent(`projects/${app.current}/推演/战略图_${baseName.value}.html`)}` : '')
+  strategyFile.value && projectFiles('推演').includes(strategyFile.value)
+    ? `${mediaUrl(`projects/${app.current}/推演/${strategyFile.value}`)}&v=${strategyNonce.value}` : '')
+/** 创作包 manifest 记的底图来源：零匹配回退时在本页顶部也标一次（产物内那条只在 iframe 里）。 */
+const planFallback = computed(() => (pkg.value?.strategy_plan?.mode === 'fallback' ? pkg.value.strategy_plan : null))
 
 let loadSeq = 0
 async function load() {
@@ -74,13 +83,20 @@ async function run(label: string, fn: () => Promise<{ id?: number; err?: string 
     const r = await fn()
     if (!r.id) throw new Error(r.err || '任务未启动')
     const j = await trackJob(r.id, label)
-    if (j.success) { toast(`${label}完成`, 'ok'); done?.() } else throw new Error(j.err || `${label}失败`)
+    if (j.success) { toast(`${label}完成`, 'ok'); await done?.() } else throw new Error(j.err || `${label}失败`)
   } catch (e) {
     toast(e instanceof Error ? e.message : `${label}失败`, 'err')
   } finally { busy.value = '' }
 }
-const doAssemble = () => run('拍摄资料包', () => creationAssemble(app.current!, board.value), load)
-const doStrategy = () => run('生成战略图', () => buildStrategy(app.current!, board.value), load)
+const doAssemble = () => run('拍摄资料包', () => creationAssemble(app.current!, board.value), afterBuild)
+const doStrategy = () => run('生成战略图', () => buildStrategy(app.current!, board.value), afterBuild)
+
+/** 产物落盘后：先刷新项目树（战略图存在性闸读它），再重载本页数据。 */
+async function afterBuild() {
+  strategyNonce.value++
+  await loadBasics()
+  await load()
+}
 
 /* ── AI 平面图（plan v1 场景级布局：左=场景列表，右=选中场景详情，S 降级为场景内标签） ── */
 const plans = ref<PlanSummary[]>([])
@@ -379,14 +395,28 @@ useBoardSelection(board, boards, 'package')
           :class="tab === t.k ? 'bg-sky-400/20 text-sky-200' : 'bg-white/5 text-slate-400 hover:text-slate-200'"
           @click="tab = t.k">{{ t.label }}</button>
         <span class="flex-1"></span>
-        <span v-if="pkg?.strategy_map === null && tab === 'strategy'" class="text-2xs text-amber-300">尚无战略图——点左上「生成拍摄资料包」生成</span>
       </div>
 
-      <!-- 战略图：全高 iframe -->
+      <!-- 战略图：全高 iframe（产物未生成时给空态，不再让 404 变成白屏） -->
       <div v-if="tab === 'strategy'" class="glass min-h-0 flex-1 overflow-hidden p-1">
+        <!-- 底图来源不只在产物里标一次：这页切 tab、iframe 被滚掉时就没人看见了 -->
+        <div v-if="planFallback" class="mb-1 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-1.5 text-2xs text-amber-200">
+          底图「{{ planFallback.name || '未命名' }}」与本分镜 scene_ref {{ planFallback.score || 0 }}/{{ planFallback.total || 0 }} 匹配——
+          用的是回退的最新一张，<b>空间一致性未经校验</b>；要按场景出图请先到 ② 关联场景资产、再到 ⑥ 生成对应平面图
+        </div>
         <iframe v-if="strategyUrl" id="strategyFrame" :src="strategyUrl" class="h-full w-full rounded-lg border-0 bg-white"
           title="战略图"></iframe>
-        <div v-else class="grid h-full place-items-center text-xs text-slate-500">选择分镜后展示战略图</div>
+        <div v-else class="grid h-full place-items-center p-6 text-center">
+          <div v-if="!board" class="text-xs text-slate-500">选择分镜后展示战略图</div>
+          <div v-else>
+            <div class="text-sm font-bold text-amber-300">尚无走位战略图</div>
+            <div class="mt-1 text-2xs text-slate-500">推演/{{ strategyFile }} 还没有生成</div>
+            <button class="btn btn-sm mt-3" :disabled="!!busy" @click="doStrategy">
+              {{ busy === '生成战略图' ? '生成中…' : '生成走位战略图' }}
+            </button>
+            <div class="mt-2 text-2xs text-slate-500">「生成拍摄资料包」会另出一版以场景平面图为底图的战略图</div>
+          </div>
+        </div>
       </div>
 
       <!-- AI 平面图：选中场景的详情面板 -->

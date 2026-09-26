@@ -19,7 +19,7 @@ def capabilities(cfg, model=None):
              transport='inline', adapter='', endpoint='', integer_duration=True,
              audio_output=False, seed=False)
     if vid == 'local-comfyui' and ('minimax_h3' in low or not low):
-        p.update(adapter='comfyui', modes=['reference', 'text'], max_refs=3,
+        p.update(adapter='comfyui', modes=['reference', 'text'], max_refs=9, max_audio=3, max_video=3,
                  resolutions=['workflow'], ratios=['16:9'], integer_duration=False)
     elif vid == 'minimax' and low in ('minimax-h3', 'minimax-h3-max'):
         p.update(adapter='minimax', endpoint='/v2/video_generation', max_audio=3, max_video=3,

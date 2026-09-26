@@ -109,6 +109,7 @@ def main():
     except ImportError:
         compile_shot = None
     manifest = []
+    import versions as _V
     t0 = 0.0
     for i, sh in enumerate(shots, 1):
         dur = float(sh.get("dur", 2))
@@ -117,10 +118,11 @@ def main():
         ok, buf = cv2.imencode(".png", img)
         sid = str(sh.get("id", f"S{i}"))
         png = os.path.join(outdir, sid + ".png")
-        import versions as _V; _V.snapshot(png)
+        _V.snapshot(png)
         buf.tofile(png)                          # 中文路径安全写盘
         compiled = compile_shot(cfg, sid, mode="stateful", media_type="video") if compile_shot else {}
         txt = os.path.join(outdir, sid + ".txt")
+        _V.snapshot(txt)        # 覆写前留版（与 png 同规则：同目录 .versions/，保留最近 20 份）
         with open(txt, "w", encoding="utf-8") as fh:
             fh.write(prompt_text(sh, cfg.get("actors", {}), compiled))
         refs = {ac.get("name", aid): find_ref(proj, ac.get("name", ""), aid)
@@ -146,7 +148,9 @@ def main():
                "frame_mode": a.frame, "count": len(manifest), "shots": manifest,
                "source_hash": artifact_hash(cfg, "previz", "2") if artifact_hash else "",
                "artifact_kind": "previz", "tool_version": "2"}
-    json.dump(payload, open(mpath, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    _V.snapshot(mpath)
+    with open(mpath, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False, indent=1)
     print(f"[完成] 预演包 {len(manifest)} 镜 -> {outdir}")
     print("OUTPUT:" + outdir)
     print("COUNT:" + str(len(manifest)))

@@ -399,6 +399,8 @@ useBoardSelection(board, boards, 'acting')
                       <b class="text-xs text-cyan-300">{{ s.id }}</b>
                       <span class="text-2xs text-slate-500">{{ s.dur }}s</span>
                       <span class="rounded px-1.5 py-0.5 text-2xs" :class="statusClass(s.performance_status)">{{ statusLabel(s.performance_status) }}</span>
+                      <span v-if="s.performance_check_error" class="h-1.5 w-1.5 shrink-0 rounded-full bg-slate-500"
+                        :title="'本镜的「过期探针」没能跑起来，这个状态未经核验（原因：' + s.performance_check_error + '）；不代表已过期，也不代表一定有效'"></span>
                       <span class="flex-1"></span>
                       <button class="btn btn-sm" :disabled="running || !canGenerate(s)" @click="runOne(s)" :title="s.actor_ids?.length ? '新生成或重新生成本镜主角演员表现；生成后到右侧候选草稿点击应用' : '本镜没有主角，不生成演员表现'">
                         {{ runningShot === s.id ? '生成中…' : (s.performance_status === 'pending' ? '新生成主角表演' : '重新生成主角表演') }}

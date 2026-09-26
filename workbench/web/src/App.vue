@@ -81,6 +81,7 @@ const navItems = [
   { key: 'acting', to: '/acting', label: '⑤ 演员表现', icon: 'user', group: '制作' },
   { key: 'package', to: '/package', label: '⑥ 平面推演', icon: 'box3d', group: '制作' },
   { key: 'create', to: '/create', label: '⑦ 创作生成', icon: 'wand', group: '制作' },
+  { key: 'shotRedo', to: '/studio/redo', label: '片段重拍', icon: 'frames', group: '制作' },
   { key: 'free', to: '/create/free', label: '⑧ 自由创作', icon: 'wand', group: '制作' },
   { key: 'lapian', to: '/lapian', label: '① 拉片结构', icon: 'clapper', group: '拉片' },
   { key: 'lines', to: '/lines', label: '② 台词分析', icon: 'chat', group: '拉片' },

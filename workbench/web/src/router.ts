@@ -79,6 +79,10 @@ export const routes = [
     meta: { title: '角色音色', c1: '#a78bfa', c2: '#ec4899', icon: 'box3d' }
   },
   {
+    path: '/studio/redo', name: 'shotRedo', component: () => import('./views/ShotRedoView.vue'),
+    meta: { title: '片段重拍', c1: '#f472b6', c2: '#a78bfa', icon: 'frames' }
+  },
+  {
     path: '/create/free', name: 'freeCreate', component: () => import('./views/CreateView.vue'),
     meta: { title: '自由创作与画廊', c1: '#a78bfa', c2: '#ec4899', icon: 'clapper' }
   },

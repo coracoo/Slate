@@ -46,7 +46,10 @@ def load_script(project, episode_id=None):
             if str(ep.get("id")) == str(episode_id):
                 return str(ep.get("text") or "")
         return ""
-    if mode == "generated" or episodes:
+    # 权威源：generated=按集序聚合的分集正文；imported=用户导入的 剧本.txt。
+    # 无 mode 的老项目沿用"有分集即聚合"（09_蜘女 实测无 mode，行为不变）；
+    # 曾无条件 `or episodes` 让重新导入的新稿被旧分集正文吞掉、下游还以为没过期。
+    if mode == "generated" or (mode != "imported" and episodes):
         parts = []
         for ep in episodes:
             text = str(ep.get("text") or "").strip()
@@ -60,6 +63,41 @@ def load_script(project, episode_id=None):
         return open(path, encoding="utf-8").read() if os.path.isfile(path) else ""
     except OSError:
         return ""
+
+
+def record_script_import(project):
+    """记录「当前权威正文是导入的 剧本.txt」，并让下游的过期判定跟上。
+
+    导入路由过去只写 剧本.txt：分集.json 里的旧正文仍被 load_script 当权威（聚合分支），
+    用户新导入的稿子对 ②③⑦ 全链路不可见；且 分集.json 的 rev 不动，分镜页照显「未过期」。
+    这里只改来源标记与修订号，不动任何一集正文（正文由用户再次「拆分集」时重建）。
+    """
+    project = os.path.abspath(str(project))
+    book_dir = os.path.join(project, "剧本")
+    os.makedirs(book_dir, exist_ok=True)
+    src_path = os.path.join(book_dir, "source.json")
+    src = _read(src_path, {})
+    if not isinstance(src, dict):
+        src = {}
+    src["mode"] = "imported"
+    with open(src_path, "w", encoding="utf-8") as fh:
+        json.dump(src, fh, ensure_ascii=False, indent=1)
+    ep_path = os.path.join(book_dir, "分集.json")
+    rev = 0
+    if os.path.isfile(ep_path):
+        book = _read(ep_path, {})
+        if isinstance(book, dict):
+            try:
+                import versions
+                versions.snapshot(ep_path)
+            except Exception:
+                pass
+            book["mode"] = "imported"
+            book["rev"] = int(book.get("rev") or 0) + 1
+            with open(ep_path, "w", encoding="utf-8") as fh:
+                json.dump(book, fh, ensure_ascii=False, indent=1)
+            rev = book["rev"]
+    return {"mode": "imported", "rev": rev}
 
 
 def _merge_states(old_states, new_states):

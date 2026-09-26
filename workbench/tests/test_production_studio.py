@@ -168,6 +168,16 @@ class ProductionExecutionTests(unittest.TestCase):
 
     def tearDown(self): self.temp.cleanup()
 
+    def test_compile_request_uses_camera_safe_style_directive(self):
+        """⑦ 提交必须吃镜头侧过滤后的画风词：整篇 skill 含「三视图/纯白背景」会把画面拉成白底设定图。"""
+        (self.root / '剧本').mkdir()
+        (self.root / '剧本' / 'style.json').write_text(json.dumps({'image': 'identity-anchor'}), encoding='utf-8')
+        from production_requests import compile_request
+        req = compile_request(self.root, self.body, self.cfg)
+        self.assertIn('画风：', req['prompt'], '项目画风未注入 ⑦ 请求')
+        self.assertNotIn('三视图', req['prompt'])
+        self.assertNotIn('纯白背景', req['prompt'])
+
     def test_request_keeps_all_keyframes_and_video_only_prompt(self):
         from production_requests import compile_request
         req = compile_request(self.root, self.body, self.cfg)
@@ -237,7 +247,7 @@ class ProductionExecutionTests(unittest.TestCase):
         with patch('llm_openai.VendorClient', return_value=client):
             execute(req, self.providers)
         kwargs = client.generate_image.call_args.kwargs
-        self.assertEqual(kwargs['extra'], {'size': '2k', 'ratio': '16:9'})
+        self.assertEqual(kwargs['extra'], {'size': '2048x1152', 'ratio': '16:9'})
         result = json.loads((self.root / '创作/creation.json').read_text(encoding='utf-8'))['items'][0]
         self.assertEqual(result['status'], 'done')
 
@@ -410,6 +420,70 @@ class LocalMediaTests(unittest.TestCase):
             info = concatenate(root, [{'path': source.name, 'sha256': digest(source)}] * 2, root / 'episode.mp4')
             self.assertTrue(any(s['codec_type'] == 'audio' for s in info['streams']))
             self.assertAlmostEqual(float(info['format']['duration']), 1, delta=.2)
+
+    def test_concatenate_keeps_video_length_when_audio_is_shorter(self):
+        """音频短于画面的 V 曾被 -shortest 裁到音频长度，导致 E 总时长系统性短于 ΣV。"""
+        from production_media import binary, run, concatenate, digest
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); clip = root / 'short_audio.mp4'
+            run([binary('ffmpeg'), '-v', 'error',
+                 '-f', 'lavfi', '-i', 'color=c=blue:s=128x72:d=2:r=12',
+                 '-f', 'lavfi', '-i', 'sine=frequency=440:duration=0.5',
+                 '-map', '0:v', '-map', '1:a', '-c:v', 'libx264', '-pix_fmt', 'yuv420p',
+                 '-c:a', 'aac', '-y', str(clip)])
+            info = concatenate(root, [{'path': clip.name, 'sha256': digest(clip)}], root / 'episode.mp4')
+            self.assertGreaterEqual(float(info['format']['duration']), 1.8,
+                                    '画面被音轨裁短：配音短于片段时成片会丢画面')
+
+    def test_concatenate_reports_expected_vs_actual_seconds(self):
+        """交付后必须核对成片总长与采用片段总长（§六.5 后半）：过去这一层完全不看，短片少一截无人知。"""
+        import io
+        from contextlib import redirect_stdout
+        from production_media import binary, run, concatenate, digest
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            clips = []
+            for i in range(2):
+                c = root / f'c{i}.mp4'
+                run([binary('ffmpeg'), '-v', 'error',
+                     '-f', 'lavfi', '-i', 'color=c=blue:s=128x72:d=2:r=12',
+                     '-c:v', 'libx264', '-pix_fmt', 'yuv420p', '-y', str(c)])
+                clips.append({'path': c.name, 'sha256': digest(c)})
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                info = concatenate(root, clips, root / 'episode.mp4')
+            self.assertIn('expected_seconds', info, '没回传 ΣV，⑦ 页与日志都无从核对')
+            self.assertAlmostEqual(info['expected_seconds'], 4.0, delta=0.2)
+            self.assertAlmostEqual(info['actual_seconds'], info['expected_seconds'], delta=0.2)
+            self.assertNotIn('[警告]', buf.getvalue(), '正常拼接不该刷时长告警')
+
+    def test_concatenate_warns_when_output_is_shorter_than_sum(self):
+        import io
+        from contextlib import redirect_stdout
+        import production_media as PM
+        from production_media import binary, run, concatenate, digest
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); clip = root / 'c.mp4'
+            run([binary('ffmpeg'), '-v', 'error', '-f', 'lavfi',
+                 '-i', 'color=c=blue:s=128x72:d=2:r=12', '-c:v', 'libx264',
+                 '-pix_fmt', 'yuv420p', '-y', str(clip)])
+            refs = [{'path': clip.name, 'sha256': digest(clip)}] * 3
+            real, seen = PM.probe, {'n': 0}
+
+            def shrinking(path):
+                info = real(path)
+                seen['n'] += 1
+                if seen['n'] > len(refs):        # 最后一次是成品探针
+                    return {'streams': info.get('streams', []),
+                            'format': dict(info.get('format') or {}, duration='1.0')}
+                return info
+
+            buf = io.StringIO()
+            with patch.object(PM, 'probe', shrinking), redirect_stdout(buf):
+                info = PM.concatenate(root, refs, root / 'episode.mp4')
+            self.assertIn('ΣV', buf.getvalue(), '成品被吃掉 5 秒却不报警')
+            self.assertIn('[警告]', buf.getvalue())
+            self.assertGreater(info['expected_seconds'], info['actual_seconds'])
 
 
 class VoiceBindingTests(unittest.TestCase):

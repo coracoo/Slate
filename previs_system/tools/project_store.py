@@ -213,6 +213,19 @@ def read_json(path: str) -> tuple[dict, str]:
         return _read_unlocked(path)
 
 
+def current_revision(path: str) -> str:
+    """只要当前 revision、不要内容（编辑页载入后拿到基线，回写时带上）。
+
+    与 ``read_json`` 同一条加锁读路径，判据完全一致；文件不存在时抛
+    ``FileNotFoundError``，让调用方按"还没有这份文档"处理而不是拿到空串。
+    """
+    path = _absolute(path)
+    if not os.path.isfile(path):
+        raise FileNotFoundError(path)
+    with _exclusive(path):
+        return _read_unlocked(path)[1]
+
+
 def update_json(path: str, mutate, *, expected_revision: str | None = None,
                 create_default: dict | None = None, snapshot=None) -> tuple[dict, str]:
     """锁内读改写 JSON，并返回 ``(新对象, 新 revision)``。

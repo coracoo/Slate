@@ -28,9 +28,10 @@ class _FakeClient:
         return self.models.get(kind, "")
 
     def generate_image(self, prompt, out, timeout=None, negative_prompt=None,
-                       image_refs=None, mode=None):
+                       image_refs=None, mode=None, **kwargs):
         self.calls.append({"prompt": prompt, "out": out,
-                           "image_refs": list(image_refs or []), "mode": mode})
+                           "image_refs": list(image_refs or []), "mode": mode,
+                           "extra": kwargs.get("extra")})
         Path(out).write_bytes(b"fake-image")
 
 
@@ -68,6 +69,34 @@ class AssetGenerationReferenceTests(unittest.TestCase):
         self.assertEqual(mode_label("local-comfyui", "generate", False), "生图/模型匹配")
         self.assertEqual(mode_label("doubao", "generate", True), "图生图/doubao")
         self.assertEqual(mode_label("doubao", "generate", False), "文生图/doubao")
+
+    def test_state_only_run_keeps_other_states_indexed(self):
+        """只重生成一个状态时，同角色其它状态的索引与时间锚定不得被抹掉。"""
+        gen = _load_gen()
+        src_file, rows_key, _pfield, zone = gen.KINDS["character"]
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td)
+            (project / "素材" / zone).mkdir(parents=True)
+            (project / "素材" / src_file).write_text(json.dumps({rows_key: [{
+                "id": "hero", "name": "英雄", "sheet_prompt": "全身立绘",
+                "states": [{"id": "S1", "label": "反派期", "episodes": ["E1"], "camp": "敌", "sheet_prompt": "黑风衣"},
+                           {"id": "S2", "label": "盟友期", "episodes": ["E6"], "camp": "友", "sheet_prompt": "白衬衫"}]}]},
+                ensure_ascii=False), encoding="utf-8")
+            for name in ("hero.png", "hero__S1.png", "hero__S2.png"):
+                (project / "素材" / zone / name).write_bytes(b"png")
+            # S2 只存在于索引里（本轮不生成它）：索引被整块重写时，磁盘扫描也补不回该提示词
+            (project / "素材" / "素材图.json").write_text(json.dumps({zone: {
+                "hero": {"path": f"素材/{zone}/hero.png", "states": {
+                    "S1": {"path": f"素材/{zone}/hero__S1.png", "prompt": "旧索引词"},
+                    "S2": {"path": f"素材/{zone}/hero__S2.png", "prompt": "仅索引持有",
+                           "episodes": ["E6"], "camp": "友"}}}}}, ensure_ascii=False), encoding="utf-8")
+            _code, _client = _run_main(gen, project, "--kind", "character", "--id", "hero", "--state-id", "S1")
+            saved = json.loads((project / "素材" / "素材图.json").read_text(encoding="utf-8"))
+            states = saved[zone]["hero"]["states"]
+            self.assertEqual(sorted(states), ["S1", "S2"], "索引整块重写会丢掉未参与本轮的其它状态")
+            self.assertEqual(states["S2"]["prompt"], "仅索引持有")
+            self.assertEqual(states["S1"]["episodes"], ["E1"], "补缺跳过分支也要带 episodes/camp")
+            self.assertEqual(states["S1"]["camp"], "敌")
 
     def test_parent_ref_child_uses_parent_image_as_reference(self):
         """子素材口径：parent_ref 以父资产母图为参考改图；related_refs / 提示词 @token 仍不进依赖。"""

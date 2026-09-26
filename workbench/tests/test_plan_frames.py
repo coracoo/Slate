@@ -148,6 +148,41 @@ class PlanFramesTests(unittest.TestCase):
         self.assertTrue((outdir / 'S2.png').is_file())
         self.assertEqual(sorted(frames3), ['S1', 'S2', 'S3'])
 
+    def test_multi_scene_board_renders_each_group_with_its_own_plan(self):
+        """跨场景分镜按场景各用自己的底图（规范：同场景共用一张）。
+
+        曾整板只喂一张 plan：实测 09_仙 剧本_E1 的 15 镜分属 3 场景，即便按多数镜匹配
+        仍有 8 镜画在他场墙纸上——而这些图正是 ⑦ 喂给视频模型的空间参考帧。
+        """
+        plan_b_path = _write_plan(self.proj, dict(PLAN_A, name="b", scene_ref="b"))
+        board = {"shots": [
+            {"id": "S1", "scene_ref": "@scene:a", "dur": 3},
+            {"id": "S2", "scene_ref": "@scene:b", "dur": 3},
+            {"id": "S3", "scene_ref": "@scene:b", "dur": 3}]}
+        bp = Path(self.proj) / '分镜' / '剧本_E1.json'
+        bp.write_text(json.dumps(board, ensure_ascii=False), encoding='utf-8')
+        cmds = []
+
+        def fake_run(cmd, **kw):
+            cmds.append(list(cmd))
+            outdir = Path(cmd[cmd.index('--outdir') + 1])
+            outdir.mkdir(parents=True, exist_ok=True)
+            for sid in cmd[cmd.index('--shots') + 1].split(','):
+                (outdir / f'{sid}.png').write_bytes(b'x')
+            return type('R', (), {'returncode': 0, 'stdout': '', 'stderr': ''})()
+
+        with mock.patch.object(plan_frames.subprocess, 'run', fake_run):
+            frames = plan_frames.ensure_plan_frames(str(self.proj), str(bp), self.plan_path)
+        self.assertEqual(sorted(frames), ['S1', 'S2', 'S3'])
+        self.assertEqual(len(cmds), 2, f'两个场景应分两次渲染，实际 {len(cmds)} 次')
+        by_plan = {Path(c[c.index('--plan') + 1]).name: sorted(c[c.index('--shots') + 1].split(','))
+                   for c in cmds}
+        self.assertEqual(by_plan.get(Path(self.plan_path).name), ['S1'], 'a 场只该用 a 的底图')
+        self.assertEqual(by_plan.get(Path(plan_b_path).name), ['S2', 'S3'], 'b 场必须换自己的底图')
+        meta = json.loads((Path(self.proj) / '推演' / '平面图帧_剧本_E1' / '_meta.json')
+                          .read_text(encoding='utf-8'))
+        self.assertEqual(len(meta['plan_sigs'].split(';')), 2, '签名要覆盖两张底图')
+
     def test_member_subset(self):
         frames = plan_frames.ensure_plan_frames(str(self.proj), str(self.board_path),
                                                 self.plan_path, member_ids=['S2', 'S3'])
@@ -256,16 +291,54 @@ class CompilePlanRefTests(unittest.TestCase):
         self.assertEqual([r['shot_id'] for r in req['refs']], ['S1', 'S2'])
         self.assertEqual(req['plan_refs'], 0)
 
+    def _adopt_grid(self):
+        """按 adopt_grid 写入侧的同一公式造一份"已采用的宫格参考"（新闸：宫格必须是产物，不再隐式抓图）。"""
+        from production_media import digest
+        from production_prompts import media_source_hash
+        from production_studio import shot_list
+        grid = self.proj / '创作' / 'grid-adopted.png'
+        grid.parent.mkdir(parents=True, exist_ok=True)
+        grid.write_bytes(b'grid-bytes')
+        unit = self.board['video_units'][0]
+        unit['prompt_grid'] = '两镜宫格'
+        unit['grid_binding'] = {'item_id': 'g1', 'output_index': 0,
+                                'path': grid.relative_to(self.proj).as_posix(),
+                                'sha256': digest(grid),
+                                'source_hash': media_source_hash(shot_list(self.board, unit), 'image', unit),
+                                'purpose': '故事板宫格参考'}
+        self.board_path.write_text(json.dumps(self.board), encoding='utf-8')
+        self.body['target'] = unit['id']
+        return unit
+
     def test_grid_mode_skips_injection(self):
         self.body['ref_mode'] = 'grid'
         self.body['prompt_grid_note'] = None
-        # grid 模式需要宫格提示词：unit.prompt_grid 缺省为空 → 手工填上
-        self.board['video_units'][0]['prompt_grid'] = '两镜宫格'
-        self.board_path.write_text(json.dumps(self.board), encoding='utf-8')
-        self.body['target'] = self.board['video_units'][0]['id']
+        self._adopt_grid()
         req = self._compile()
         self.assertEqual(req['plan_refs'], 0)
         self.assertNotIn('参考平面图', req['prompt'])
+        self.assertEqual([r['purpose'] for r in req['refs']], ['故事板宫格参考图'],
+                         '宫格模式只带已采用的那张宫格，不再偷偷塞关键帧或平面图')
+
+    def test_grid_mode_requires_adopted_output(self):
+        """没点过「采用为宫格参考」就不许提交——这条闸存在的意义是"参考了哪张图"永远可查。"""
+        self.body['ref_mode'] = 'grid'
+        unit = self._adopt_grid()
+        unit.pop('grid_binding')
+        self.board_path.write_text(json.dumps(self.board), encoding='utf-8')
+        with self.assertRaises(ValueError) as cm:
+            self._compile()
+        self.assertIn('尚未采用故事板宫格', str(cm.exception))
+
+    def test_stale_grid_binding_gives_the_friendly_message(self):
+        """过期分支原本引用了一个未定义的变量（会抛 NameError，友好提示永远出不来）。"""
+        self.body['ref_mode'] = 'grid'
+        unit = self._adopt_grid()
+        unit['grid_binding']['source_hash'] = 'stale-hash'
+        self.board_path.write_text(json.dumps(self.board), encoding='utf-8')
+        with self.assertRaises(ValueError) as cm:
+            self._compile()
+        self.assertIn('宫格参考已过期', str(cm.exception))
 
 
 if __name__ == '__main__':

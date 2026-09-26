@@ -5,8 +5,8 @@
     "h": { "name": "斥候", "color": "#50c878" }
   },
   "lines": [
-    { "t_in": 1.2, "t_out": 3.4, "speaker": "c", "text": "斥候回报，敌军明日拂晓渡河。", "source": "ASR" },
-    { "t_in": 4.2, "t_out": 6.6, "speaker": "v", "text": "等他半渡，我们烧他的浮桥！", "source": "ASR" },
-    { "t_in": 7.8, "t_out": 10.6, "speaker": "c", "text": "烧桥只能挡他三日。我要他全军，留在这岸。", "source": "ASR" }
+    { "t_in": 1.2, "t_out": 3.4, "speaker": "c", "text": "斥候回报，敌军明日拂晓渡河。", "source": "asr" },
+    { "t_in": 4.2, "t_out": 6.6, "speaker": "v", "text": "等他半渡，我们烧他的浮桥！", "source": "asr" },
+    { "t_in": 7.8, "t_out": 10.6, "speaker": "c", "text": "烧桥只能挡他三日。我要他全军，留在这岸。", "source": "asr" }
   ]
 }

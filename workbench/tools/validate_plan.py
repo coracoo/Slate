@@ -175,8 +175,9 @@ def _points_of(plan):
     return pts
 
 
-def validate_document(plan, scene_ids=None):
-    """校验 plan 文档。scene_ids=可选场景 id/name 集合（zones.scene_ref 悬空校验用）。"""
+def validate_document(plan, scene_ids=None, scene_id_set=None):
+    """校验 plan 文档。scene_ids=可选场景 id/name 集合（zones.scene_ref 允许写 id 或 name）；
+    scene_id_set=仅 id 集合，顶层 scene_ref 按规范只认资产 id，不传则退回用 scene_ids 判。"""
     errors, warnings = [], []
     if not isinstance(plan, dict):
         return {"errors": [_err("PLAN_TYPE", "$", "plan 必须是对象")], "warnings": []}
@@ -253,6 +254,13 @@ def validate_document(plan, scene_ids=None):
             if ref and ref not in scene_ids:
                 errors.append(_err("REF_DANGLING", f"zones[{i}].scene_ref",
                                    f"引用不存在的场景: {ref}"))
+        # 顶层 scene_ref 规范定为"场景资产 id"（平面图规范-2D-plan-v1.md:35/104），
+        # 下游 choose_plan 按它匹配底图；此前全链不校验，资产重编号后引用静默悬空。
+        top_ref = str(plan.get("scene_ref") or "")
+        if top_ref and top_ref not in (scene_id_set if scene_id_set is not None else scene_ids):
+            errors.append(_err("SCENE_REF_DANGLING", "scene_ref",
+                               f"顶层 scene_ref 未命中场景资产 id: {top_ref}（应为 素材/场景.json 的 id，"
+                               f"下游按它匹配底图；改过资产 id 请重新生成平面图）"))
 
     # 错误 3：openings 越界
     if room:
@@ -377,6 +385,15 @@ def validate_document(plan, scene_ids=None):
     return {"errors": errors, "warnings": warnings}
 
 
+def load_scene_id_set(scenes_path):
+    """仅场景 id 集合（顶层 scene_ref 绑定用；zones 另用含 name 的宽集合）。"""
+    try:
+        rows = json.load(open(scenes_path, encoding="utf-8")).get("scenes") or []
+    except Exception:
+        return set()
+    return {str(r["id"]) for r in rows if isinstance(r, dict) and r.get("id")}
+
+
 def load_scene_ids(scenes_path):
     """从 素材/场景.json 提取场景 id∪name 集合，供 zones.scene_ref 校验。"""
     try:
@@ -407,7 +424,8 @@ def main():
         print(f"[错误] JSON 解析失败: {exc}")
         sys.exit(1)
     scene_ids = load_scene_ids(a.scenes) if a.scenes else None
-    result = validate_document(plan, scene_ids=scene_ids)
+    scene_id_set = load_scene_id_set(a.scenes) if a.scenes else None
+    result = validate_document(plan, scene_ids=scene_ids, scene_id_set=scene_id_set)
     for item in result["warnings"]:
         print("  [警告]", item["path"], item["message"])
     for item in result["errors"]:

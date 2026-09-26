@@ -35,6 +35,49 @@ class ScriptRepositoryTests(unittest.TestCase):
             self.assertIn("正文一", load_script(td))
             self.assertIn("正文二", load_script(td))
 
+    def test_imported_script_wins_over_stale_episode_texts(self):
+        """重新导入剧本后权威源回到 剧本.txt：曾继续回读旧分集正文，新稿对全链路不可见。"""
+        from script_repository import load_script
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "剧本"
+            base.mkdir()
+            (base / "分集.json").write_text(json.dumps({"mode": "imported", "episodes": [
+                {"id": "E1", "title": "一", "text": "上一稿的旧正文"}]}, ensure_ascii=False), encoding="utf-8")
+            (base / "剧本.txt").write_text("新导入的完整剧本", encoding="utf-8")
+            text = load_script(td)
+            self.assertIn("新导入的完整剧本", text)
+            self.assertNotIn("上一稿的旧正文", text)
+
+    def test_legacy_project_without_mode_still_aggregates(self):
+        """无 mode 的老项目（09_蜘女 实测如此）仍按分集聚合，不因新规则改变行为。"""
+        from script_repository import load_script
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "剧本"
+            base.mkdir()
+            (base / "分集.json").write_text(json.dumps({"episodes": [
+                {"id": "E1", "title": "一", "text": "分集正文一"}]}, ensure_ascii=False), encoding="utf-8")
+            (base / "剧本.txt").write_text("根目录旧稿", encoding="utf-8")
+            self.assertIn("分集正文一", load_script(td))
+
+    def test_record_script_import_switches_source_and_bumps_rev(self):
+        """导入路由必须同时切来源标记与 rev（否则分镜页照显「未过期」），且不动任何一集正文。"""
+        from script_repository import load_script, record_script_import
+        with tempfile.TemporaryDirectory() as td:
+            base = Path(td) / "剧本"
+            base.mkdir()
+            book = {"mode": "generated", "rev": 7, "episodes": [{"id": "E1", "title": "一", "text": "正文一"}]}
+            (base / "分集.json").write_text(json.dumps(book, ensure_ascii=False), encoding="utf-8")
+            (base / "剧本.txt").write_text("用户新导入的稿子", encoding="utf-8")
+            rec = record_script_import(td)
+            self.assertEqual(rec["mode"], "imported")
+            self.assertEqual(rec["rev"], 8)
+            saved = json.loads((base / "分集.json").read_text(encoding="utf-8"))
+            self.assertEqual(saved["episodes"][0]["text"], "正文一", "只改标记，不得改写正文")
+            self.assertEqual(json.loads((base / "source.json").read_text(encoding="utf-8"))["mode"], "imported")
+            self.assertIn("用户新导入的稿子", load_script(td))
+            # 覆写前必须留快照（产出版本管理通用层）
+            self.assertTrue((base / ".versions").is_dir() and any((base / ".versions").iterdir()))
+
     def test_storyboard_generation_has_room_for_structured_output(self):
         import creation_pipeline
         self.assertGreaterEqual(creation_pipeline.STORYBOARD_MAX_TOKENS, 16000)
@@ -128,7 +171,7 @@ class ActorCardHydrationTests(unittest.TestCase):
 class ImageSizingTests(unittest.TestCase):
     def test_storyboard_aspect_ratio_maps_to_explicit_image_size(self):
         import create_media
-        self.assertEqual(create_media.image_size_for_aspect("16:9"), "2k")  # Seedream 5.x：size 只吃档位，比例走 ratio
+        self.assertEqual(create_media.image_size_for_aspect("16:9"), "2048x1152")  # Seedream images/generations 忽略 ratio：16:9 必须显式像素
         self.assertEqual(create_media.image_ratio_for_aspect("9:16"), "9:16")
         self.assertEqual(create_media.image_ratio_for_aspect(""), "16:9")
 
@@ -147,7 +190,7 @@ class ImageSizingTests(unittest.TestCase):
                 client.generate_image.return_value = str(Path(td) / "img_1.png")
                 with mock.patch.object(create_media.llm_openai, "VendorClient", return_value=client):
                     create_media.main()
-                self.assertEqual(client.generate_image.call_args.kwargs["extra"]["size"], "2k")
+                self.assertEqual(client.generate_image.call_args.kwargs["extra"]["size"], "2048x1152")
                 self.assertEqual(client.generate_image.call_args.kwargs["extra"].get("ratio"), "16:9")
             finally:
                 sys.argv = old_argv

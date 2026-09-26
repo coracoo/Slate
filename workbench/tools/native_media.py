@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
 """媒体厂商原生协议。网络由 VendorClient 注入，便于离线契约验证。"""
 import base64
+import json
 import mimetypes
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
@@ -71,8 +73,21 @@ def video(c,prompt,refs,out_path,model,timeout,interval,max_wait,extra,first_fra
     _error(f'轮询超时，保留任务 ID {task}；请查询已有任务，勿重新生成')
 
 def audio(c,kind,text,out_path,model=None,timeout=300,extra=None):
-    if c.id!='minimax': _error('当前音乐/语音原生适配器仅支持 MiniMax')
-    opts=dict(extra or {})
+    if c.id!='minimax':
+        # 非 MiniMax 厂商走 OpenAI 兼容 /audio/speech（IndexTTS / Qwen3-TTS / GPT-SoVITS 等本地 TTS 包装服务的事实标准）
+        if kind!='speech': _error('音乐生成当前仅支持 MiniMax')
+        payload={'model':model or c.model('speech'),'input':text,'response_format':'mp3',
+                 'voice':(extra or {}).get('voice') or (c.cfg.get('extra') or {}).get('voice') or 'alloy'}
+        req=urllib.request.Request(c._url('speech'),data=json.dumps(payload).encode('utf-8'),
+                                   headers=c._headers(),method='POST')
+        try:
+            with urllib.request.urlopen(req,timeout=timeout) as r: raw=r.read()
+        except urllib.error.HTTPError as e:
+            _error(f'语音合成 HTTP {e.code}: {e.read().decode("utf-8","replace")[:300]}')
+        if not raw: _error('音频响应为空')
+        Path(out_path).write_bytes(raw)
+        return out_path
+    opts=dict(extra or {}); opts.pop('voice',None)
     payload={'model':model or c.model(kind),**opts,'stream':False,'output_format':'hex'}
     if kind=='speech':
         payload['text']=text

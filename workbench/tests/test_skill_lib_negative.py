@@ -45,7 +45,7 @@ class NegativeLayerTests(unittest.TestCase):
             proj = self._proj(td)
             prompt, negative = skill_lib.compose_asset_image_prompt(
                 proj, "某角色的外观事实", kind="character")
-        self.assertIn("三视图", prompt)          # 类别硬约束（正面）保留不动
+        self.assertIn("五视图拼版", prompt)       # 类别硬约束（正面）保留不动
         self.assertIn("文字", negative)          # 全局基础负面保留
         self.assertIn("畸形手指", negative)
         self.assertNotIn("多人", negative)       # E11：冲突禁令移除

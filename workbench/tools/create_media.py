@@ -83,8 +83,14 @@ ASPECT_DEFAULT = "16:9"
 
 
 def image_size_for_aspect(aspect):
-    """兼容旧签名：返回画面档位（分辨率档），比例由 image_ratio_for_aspect 提供。"""
-    return "2k"
+    """Seedream images/generations 的 size 参数：实测 ratio 字段会被忽略（2k 档缺省方图），
+    16:9 等比例必须用显式像素（官方像素模式，宽高比范围约 [1/16, 16]）。"""
+    return {
+        "1:1": "2048x2048", "4:3": "2048x1536", "3:4": "1536x2048",
+        "16:9": "2048x1152", "9:16": "1152x2048",
+        "3:2": "2048x1365", "2:3": "1365x2048",
+        "21:9": "2688x1152", "9:21": "1152x2688",
+    }.get(str(aspect or "").strip(), "2048x1152")
 
 
 def image_ratio_for_aspect(aspect):

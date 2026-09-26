@@ -154,17 +154,19 @@ def concatenate(project, refs, out, spec='proxy'):
         else:
             w, h, fps = int(spec['w']), int(spec['h']), float(spec['fps'])
         clips = []
+        intended = 0.0
         for i, (ref, info, video_stream) in enumerate(infos):
             src = bound_path(project, ref)
             seconds = float(video_stream.get('duration') or info.get('format', {}).get('duration') or 0)
             if seconds <= 0: raise ValueError('无法确定视频片段时长，停止拼接')
+            intended += seconds
             audio = any(s.get('codec_type') == 'audio' for s in info.get('streams', []))
             dst = Path(tmp) / f'{i}.mp4'
             args = [binary('ffmpeg'), '-v', 'error', '-i', str(src)]
             if not audio: args += ['-f', 'lavfi', '-i', 'anullsrc=r=48000:cl=stereo']
             args += ['-map', '0:v:0', '-map', '0:a:0' if audio else '1:a:0', '-vf',
                      f'scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={fps:g}',
-                     '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-t', str(seconds), '-shortest', '-y', str(dst)]
+                     '-c:v', 'libx264', '-preset', 'fast', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-ar', '48000', '-ac', '2', '-t', str(seconds), '-y', str(dst)]
             run(args, 1800); clips.append(dst)
         listing = Path(tmp) / 'concat.txt'
         listing.write_text('\n'.join(f"file '{p.name}'" for p in clips), encoding='utf-8')
@@ -176,4 +178,14 @@ def concatenate(project, refs, out, spec='proxy'):
         else:
             final_args[9:9] = ['-c', 'copy']
         run(final_args, 1800)
-    return probe(out)
+    result = probe(out)
+    actual = float((result.get('format') or {}).get('duration') or 0)
+    # 交付后核对：拼接是否把采用的时长吃掉了（容器取整与响度归一会有边界差，按片段数给容差）。
+    # 曾经这一步完全不核对，E 成片比 ΣV 短也无人知道——与 -shortest 那次同源。
+    tolerance = max(0.25, 2.0 * len(refs) / max(fps, 1.0))
+    if actual and abs(intended - actual) > tolerance:
+        print(f"[警告] E 成片时长与采用片段总长不符：ΣV={intended:.2f}s 实际={actual:.2f}s"
+              f"（容差 {tolerance:.2f}s）；请核对是否有片段被截或丢帧", flush=True)
+    result['expected_seconds'] = round(intended, 3)
+    result['actual_seconds'] = round(actual, 3)
+    return result

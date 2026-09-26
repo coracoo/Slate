@@ -110,7 +110,9 @@ class BriefPromptTests(unittest.TestCase):
         brief.save_brief(self.proj, {"dialogue_density": "低"})
         self.assertIn("120~160", PM.expand_episode_prompt("构想", entry, proj=str(self.proj))[0])
         brief.save_brief(self.proj, {"dialogue_density": "高"})
-        self.assertIn("240~300", PM.expand_episode_prompt("构想", entry, proj=str(self.proj))[0])
+        # 高档原来写 240~300 字/分钟（=4~5 字/s），比 ⑦ 判官的 4 字/s 还快——扩写出的台词到 ⑦ 必然超预算，
+        # 属于"先烧钱再提醒"。09-25 定版封顶到 4 字/s，由 test_timing_consistency 锁住两档同源。
+        self.assertIn("200~240", PM.expand_episode_prompt("构想", entry, proj=str(self.proj))[0])
         brief.save_brief(self.proj, {"dialogue_density": "中"})
         self.assertIn("180~220", PM.expand_episode_prompt("构想", entry, proj=str(self.proj))[0])
         # 无 brief：维持旧文案

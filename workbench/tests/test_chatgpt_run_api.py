@@ -31,7 +31,7 @@ class ChatGPTRunApiTests(unittest.TestCase):
         (self.project / "素材" / "人物").mkdir(parents=True)
         (self.project / "创作").mkdir(parents=True)
         (self.project / "素材" / "人物.json").write_text(json.dumps({
-            "characters": [{"id": "hero", "name": "主角", "sheet_prompt": "黑发制服人物三视图"}]
+            "characters": [{"id": "hero", "name": "主角", "sheet_prompt": "黑发制服，五视图设定图：脸部正面特写、45度左侧脸特写、不带头部正面全身、不带头部侧面全身、严格背面全身"}]
         }, ensure_ascii=False), encoding="utf-8")
         (self.project / "素材" / "道具.json").write_text(json.dumps({
             "props": [{

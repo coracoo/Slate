@@ -9,6 +9,9 @@ export function pendingRequest(project: string, storage: Storage = localStorage)
   if (!value.nonce || !value.body) throw new Error('未确认请求记录损坏，请保留记录并检查服务日志')
   return value
 }
+export function clearPendingRequest(project: string, storage: Storage = localStorage): void {
+  storage.removeItem(key(project))
+}
 export async function durableRequest<T>(body: RequestBody, send: (body: RequestBody) => Promise<T>, recover = false, storage: Storage = localStorage): Promise<T> {
   const project = String(body.project || '')
   const previous = pendingRequest(project, storage)

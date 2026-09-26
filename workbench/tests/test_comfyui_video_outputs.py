@@ -13,7 +13,12 @@ class VideoOutputTests(unittest.TestCase):
         client = ComfyUIClient('http://localhost:8188')
         history = {'task': {'status': {'completed': True, 'status_str': 'success'},
                            'outputs': {'14': {'images': [{'filename': 'H3_00001_.mp4', 'subfolder':'VideoWorkbench','type':'output'}], 'animated':[True]}}}}
-        with tempfile.TemporaryDirectory() as folder, patch.object(client, '_json', side_effect=[{'prompt_id':'task'}, {'task':{'status':{'completed':False},'outputs':{}}}, history]) as request, patch.object(client, '_bytes', return_value=b'video'):
+        with tempfile.TemporaryDirectory() as folder, patch.object(client, '_json', side_effect=[
+                {'prompt_id': 'task'},
+                {'task': {'status': {'completed': False}, 'outputs': {}}},
+                # 轮询心跳：每轮会多问一次队列（GET /queue），少备一项会把后面的 history 提前吃掉
+                {'queue_running': [], 'queue_pending': []},
+                history]) as request, patch.object(client, '_bytes', return_value=b'video'):
             out=Path(folder)/'vid_1.mp4'
             client.run_video_workflow({},str(out),poll_interval=0)
             self.assertEqual(out.read_bytes(),b'video')

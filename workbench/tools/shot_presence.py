@@ -2,6 +2,8 @@
 """两种俯视图共用的在场角色及平面位置规则。"""
 import re
 
+from narration import is_narrator
+
 
 def actor_positions(shot, actors, scene=None):
     staging = shot.get('staging') or {}
@@ -18,7 +20,9 @@ def actor_positions(shot, actors, scene=None):
                 mentioned.add(aid); spawn_positions[aid] = pos
     result = {}
     for aid, actor in actors.items():
-        if aid == 'narrator': continue
+        # 旁白不是角色：曾只挡字面量 'narrator'，手写/拉片导入的分镜写「旁白/画外音」
+        # 会被当在场人物画进俯视图（narration.is_narrator 是唯一的别名口径）
+        if is_narrator(aid, actor): continue
         # 显式 staging 按原契约覆盖；没有任何在场线索时保留旧分镜的全角色回退。
         if not staging and mentioned and aid not in mentioned: continue
         pos = staging.get(aid,spawn_positions.get(aid,actor.get('pos',[0,0])))

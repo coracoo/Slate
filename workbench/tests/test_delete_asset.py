@@ -102,3 +102,47 @@ class DeleteVersionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OrphanIndexRowTests(unittest.TestCase):
+    """重跑 ② 提炼会换资产 id，而 素材图.json 只增不删 → 索引孤儿 + 分镜旧引用静默丢锚点。"""
+
+    def _proj(self, characters, index_people):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        proj = Path(td.name)
+        (proj / "素材" / "人物").mkdir(parents=True)
+        json.dump({"characters": characters},
+                  open(proj / "素材" / "人物.json", "w", encoding="utf-8"), ensure_ascii=False)
+        json.dump({"人物": index_people},
+                  open(proj / "素材" / "素材图.json", "w", encoding="utf-8"), ensure_ascii=False)
+        return str(proj)
+
+    def test_reports_index_rows_without_archive_record(self):
+        proj = self._proj([{"id": "hero", "name": "主角"}], {
+            "hero": {"path": "素材/人物/hero.png"},
+            "old_side": {"path": "素材/人物/old_side.png"},
+            "hero__S1": {"path": "素材/人物/hero__S1.png"},
+        })
+        rows = gen_asset_images.find_orphan_index_rows(proj)
+        self.assertEqual([r["id"] for r in rows], ["old_side"],
+                         "状态图 hero__S1 按母 id 归位，不该被当孤儿")
+
+    def test_healthy_project_stays_silent(self):
+        proj = self._proj([{"id": "hero"}], {"hero": {"path": "素材/人物/hero.png"}})
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(gen_asset_images.report_orphan_index_rows(proj), [])
+        self.assertNotIn("[警告]", buf.getvalue())
+
+    def test_missing_archive_is_not_guessed_at(self):
+        td = tempfile.TemporaryDirectory()
+        self.addCleanup(td.cleanup)
+        proj = Path(td.name)
+        (proj / "素材").mkdir()
+        json.dump({"人物": {"x": {"path": "素材/人物/x.png"}}},
+                  open(proj / "素材" / "素材图.json", "w", encoding="utf-8"), ensure_ascii=False)
+        self.assertEqual(gen_asset_images.find_orphan_index_rows(str(proj)), [],
+                         "档案读不到时不能报孤儿——那会把正常项目全刷成警告")

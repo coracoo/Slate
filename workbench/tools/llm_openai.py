@@ -30,6 +30,22 @@ except Exception:
 DEFAULT_PROVIDERS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "providers.json")
 
 from provider_catalog import KINDS
+
+import threading
+
+# 记账归属：账本 schema 早有 project 字段、⑥ 用量计费页也有该列，但调用链从不传，
+# 实测 2797 条账全部无归属、那列一片 —。用线程局部而非进程全局：
+# server 进程内会并发跑多个项目的任务，进程级变量会串台。
+_bill_ctx = threading.local()
+
+
+def set_billing_project(name):
+    """设定当前线程后续 AI 调用记账归属的项目名；传空=取消归属。"""
+    _bill_ctx.project = str(name or "").strip()
+
+
+def current_billing_project():
+    return getattr(_bill_ctx, "project", "") or ""
 DEFAULT_ENDPOINTS = {"text": "/chat/completions", "vision": "/chat/completions",
                      "image": "/images/generations", "image_edit": "/images/generations",
                      "video": "/videos/generations",
@@ -113,7 +129,8 @@ class VendorClient:
             if billing is None:
                 return
             billing.bill(self.cfg, kind=kind, model=model or "", op=op, ok=ok,
-                         usage=usage, units=units, error=error, source=source)
+                         usage=usage, units=units, error=error, source=source,
+                         project=getattr(self, "billing_project", None) or current_billing_project())
         except Exception:
             pass
 
@@ -439,7 +456,10 @@ class VendorClient:
             adapter = ComfyUIClient(self.base, (self.cfg or {}).get("api_key", ""))
             try:
                 result = generate_h3(adapter, prompt, list(image_refs or []), out_path,
-                                     seconds=float((extra or {}).get("duration", 5)))
+                                     seconds=float((extra or {}).get("duration", 5)),
+                                     timeout=max(int(poll_max or 3600), 7200),
+                                     video_refs=list((extra or {}).get("video_refs") or []),
+                                     audio_refs=list((extra or {}).get("audio_refs") or []))
                 self.last_request = getattr(adapter, "last_request", None)
                 return result
             except ComfyUIError as exc:

@@ -86,7 +86,7 @@ def list_scenes(project_dir):
 
 
 def scene_desc_text(row):
-    """场景资产行 → 平面图描述文本：名称 + geometry 各行 + 时间/光线/室内外。
+    """场景资产行 → 平面图描述文本：名称 + geometry 各行 + 时间/光线/室内外 + ① 锚定的空间约束。
     不带 image_prompt（那里面烘着画风词，与平面图几何无关）。"""
     parts = [f"场景：{row.get('name') or row.get('id')}"]
     for g in row.get("geometry") or []:
@@ -100,6 +100,12 @@ def scene_desc_text(row):
         meta.append("室内" if row.get("interior") else "室外")
     if meta:
         parts.append("（" + "，".join(meta) + "）")
+    # ① 第一步锚定的设定层：墙门窗的取舍与动作位排布要服从它（未锚定项目两键皆空，描述不变）
+    if str(row.get("spatial_limit") or "").strip():
+        parts.append(f"空间对行动的限制：{row['spatial_limit']}——门/窗/通道的可开可堵必须支持这条。")
+    slots = [str(s).strip() for s in (row.get("action_slots") or []) if str(s).strip()]
+    if slots:
+        parts.append("必须留出的可复用动作位置：" + "、".join(slots))
     return "\n".join(parts)
 
 
@@ -139,6 +145,10 @@ def generate(project_dir, name=None, scene_desc=None, keyframe=None, zone=None,
         row, desc = load_scene(project_dir, scene)
         if row is None:
             raise ValueError(f"场景资产未命中: {scene}（检查 素材/场景.json 的 id/name/aliases）")
+        # 一律归一到资产 id：曾按请求 token 写 scene_ref（token 可能是 name/alias），
+        # 与文件名用的 row.id 双口径，下次提炼把该场景判为"未覆盖"并覆写同名文件，
+        # 导致分镜里的 @scene: 引用集体悬空。
+        scene = str(row.get("id") or scene)
         scene_desc = desc + (("\n补充描述：" + str(extra_desc)) if extra_desc else "")
         name = name or str(row.get("id") or row.get("name") or scene)
     if not name:
@@ -177,7 +187,9 @@ def generate(project_dir, name=None, scene_desc=None, keyframe=None, zone=None,
         plan["name"] = name
         if scene:
             plan["scene_ref"] = str(scene)
-        vr = validate_plan.validate_document(plan, scene_ids=scene_ids)
+        vr = validate_plan.validate_document(plan, scene_ids=scene_ids,
+                                            scene_id_set=validate_plan.load_scene_id_set(scenes_path)
+                                            if os.path.isfile(scenes_path) else None)
         if vr["errors"]:
             feedback = "\n".join(f"- [{e['path']}] {e['message']}" for e in vr["errors"][:12])
             log(f"[打回] validate {len(vr['errors'])} 错误：{vr['errors'][0]['message']} 等")

@@ -49,13 +49,24 @@ def main():
     ap.add_argument("--mode", choices=["generate", "edit"], default="generate", help="图片模式")
     ap.add_argument("--vendor", required=True)
     ap.add_argument("--providers", required=True)
-    ap.add_argument("--shot-id", action="append", default=[], help="只执行指定镜头，可重复")
+    ap.add_argument("--shot-id", action="append", default=[], help="只执行指定镜头，可重复；"
+                    "整板执行必须同时给 --all（不给又不用 --all 会直接拒绝，避免误烧全板）")
+    ap.add_argument("--all", action="store_true", dest="all_shots",
+                    help="显式声明整板执行（与 --shot-id 二选一）")
     a = ap.parse_args()
     project = os.path.abspath(a.project)
     board_name, board = _board(project, a.board)
     manifest = os.path.join(project, "创作", "creation.json")
     os.makedirs(os.path.dirname(manifest), exist_ok=True)
     selected = {str(x) for x in (a.shot_id or []) if str(x).strip()}
+    if not selected and not a.all_shots:
+        # 曾默认"未选=整板"：调用方漏传选择器就按全板计费（服务端已加闸，直跑 CLI 绕得过）
+        print("[错误] 未指定 --shot-id；确认要整板执行请显式加 --all", flush=True)
+        sys.exit(2)
+    unknown = selected - {str(s.get("id")) for s in (board.get("shots") or [])}
+    if unknown:
+        print(f"[错误] 以下镜号不在分镜 {board_name} 中：{sorted(unknown)}", flush=True)
+        sys.exit(2)
     shots = [s for s in (board.get("shots") or []) if not selected or str(s.get("id")) in selected]
     try:
         with open(a.providers, encoding="utf-8") as fh:
