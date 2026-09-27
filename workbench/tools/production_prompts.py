@@ -71,6 +71,10 @@ def fingerprint(value):
 def source_hash(shots):
     fields = ('id', 'dur', 'scene_ref', 'actor_refs', 'prop_refs', 'action', 'content',
               'shot_size', 'camera_move', 'angle', 'lighting', 'lines', 'negative') + FIELDS
+    camera_fields = ('lens', 'fov', 'pos', 'look', 'cam', 'move', 'scene', 'staging', 'table', 'sound')
+    # 新机位字段只在实际存在时扩展指纹形状，避免没有这些字段的历史分镜全部被判过期。
+    if any(s.get(k) not in (None, '', [], {}) for s in shots for k in camera_fields):
+        fields += camera_fields
     value = [{k: s.get(k) for k in fields} for s in shots]
     # transition 只在"这本分镜确实写了转场"时并入指纹（同本文件 media_source_hash 的 performance 先例）：
     # 无条件加键会让全部存量 V 的 source_hash 一次性对不上、集体判过期，
@@ -83,7 +87,11 @@ def source_hash(shots):
 
 def media_source_hash(shots, kind, unit=None):
     """按消费阶段计算依赖：视频/宫格文字修改不会使静帧无端失效。"""
-    fields = ('id', 'scene_ref', 'actor_refs', 'prop_refs', 'action', 'content', 'shot_size', 'angle', 'lighting', 'negative')
+    fields = ('id', 'scene_ref', 'actor_refs', 'prop_refs', 'action', 'content', 'shot_size', 'angle',
+              'lighting', 'negative')
+    camera_fields = ('lens', 'fov', 'pos', 'look', 'cam', 'move', 'scene', 'staging', 'table', 'sound')
+    if any(s.get(k) not in (None, '', [], {}) for s in shots for k in camera_fields):
+        fields += camera_fields
     values = [{k: s.get(k) for k in fields + (('prompt_image',) if kind == 'image' else ('dur', 'prompt_video', 'lines', 'camera_move'))} for s in shots]
     payload = {'shots': values, 'kind': kind}
     # 转场会改写 S 图提示词里的"本镜如何接上下镜"，所以它变了静帧就该重出；
@@ -92,10 +100,13 @@ def media_source_hash(shots, kind, unit=None):
     if trans:
         payload['transition'] = trans
     if kind == 'image': payload['shared_negative'] = (unit or {}).get('negative') or ''
+    # 图片与视频都会消费已采用表演；保存完整 packet，不能只看 status/source_hash。
+    # 这样 visible_action、时间点或姿态任一变化都会精确使相应媒体过期。
+    perf = [(s.get('id'), s.get('performance')) for s in shots
+            if isinstance(s.get('performance'), dict) and s['performance'].get('status') == 'ready']
+    if perf:
+        payload['performance'] = perf
     if kind == 'video':
         payload['keyframes'] = [(s.get('keyframe') or {}).get('sha256') for s in shots]
         payload['unit'] = {k: (unit or {}).get(k) for k in ('id', 'duration', 'prompt_video', 'prompt_grid', 'negative', 'generation_options')}
-        # 采用/更换演员表演后旧视频应提示重生成；仅在存在表演时并入指纹，保证无表演的旧绑定不误报过期
-        perf = [(s.get('id'), (s.get('performance') or {}).get('status') or '', (s.get('performance') or {}).get('source_hash') or '') for s in shots]
-        if any(p[1] for p in perf): payload['performance'] = perf
     return fingerprint(payload)

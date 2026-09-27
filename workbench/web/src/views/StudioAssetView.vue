@@ -2,7 +2,6 @@
 // -*- coding: utf-8 -*-
 /** 项目级素材族：母素材大图 + 子素材缩略图；层级关系由后台 JSON 管理。 */
 import { ref, computed, watch, onMounted, onBeforeUnmount, reactive, nextTick } from 'vue'
-import { useRouter } from 'vue-router'
 import {
   deleteAssetImage, postJSON,
   fetchScriptData, scriptExtract, genAssetImage, fetchEnvConfig, fetchAssets, fetchAssetPromptLayers, createAsset, editAsset, saveAssetRelations, rebuildProductionPrompts, queueChatGPTAssets, fetchChatGPTJobs, importChatGPTPackage, importChatGPTImages, mediaUrl, getJSON,
@@ -30,7 +29,6 @@ type CreateForm = {
   prop_kind: string
 }
 
-const router = useRouter()
 const data = ref<ScriptBundle | null>(null)
 const assets = ref<AssetRegistryItem[]>([])
 const vendors = ref<Vendor[]>([])
@@ -733,49 +731,63 @@ function parentAsset(row?: AssetRegistryItem | null) {
     <header class="mb-6">
       <div class="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 class="grad-text text-2xl font-black">② 素材生成</h1><RouterLink to="/studio/asset/voices" class="mt-2 inline-block text-sm text-sky-300">音色绑定 · 云端音色库 · AI 音色创作 →</RouterLink>
-          <p class="mt-1 text-xs text-slate-500">母素材统一身份，子素材保存服饰、配饰和身体组件的差异；子图生成自动继承母图参考。拖动资产卡到另一张卡下方即可移动，拖到资产区空白处可提升为母素材。</p>
+          <h1 class="grad-text text-2xl font-black">② 素材生成</h1>
+          <p class="mt-1 text-xs text-slate-500">提炼人物、场景和道具，再生成设定图。子素材生成时继承母图参考。</p>
         </div>
         <button class="btn btn-ghost" title="新增独立角色、场景或道具母素材" @click="openCreate('mother')">＋新增母素材</button>
       </div>
     </header>
     <EmptyState v-if="!app.current" title="请先在左侧选择项目" />
     <template v-else>
-      <div class="mb-3 rounded-lg bg-sky-400/10 px-3 py-2 text-xs-plus text-sky-200">
-        推荐顺序：① 剧本生成 → ② 本页提炼（人物/场景/道具，收尾自动出场景平面图初稿）→ ③ 分镜生成（自动关联 scene_ref，无需手动绑定）→ ④ 音色绑定 → ⑤ 演员表现 → ⑥ 平面推演 → ⑦ 创作生成。
-      </div>
-      <div class="glass mb-5 flex flex-wrap items-end gap-3 p-4">
-        <div class="flex items-end gap-2">
-          <label class="text-xs text-slate-400">提炼/查看分集
-            <StyledSelect v-model="episode" class="mt-1 w-48" :options="['', ...episodes.map(e => e.id)]" :labels="epLabels" placeholder="全部" />
-          </label>
-        </div>
-        <div class="flex flex-wrap gap-1.5">
-          <button class="btn btn-sm" :disabled="busy || !episode" title="只提炼人物（一次 LLM 调用），按当前分集" @click="doExtractOne('人物')">{{ busy ? '…' : '提炼·人物' }}</button>
-          <button class="btn btn-sm" :disabled="busy || !episode" title="只提炼场景（一次 LLM 调用），按当前分集" @click="doExtractOne('场景')">{{ busy ? '…' : '提炼·场景' }}</button>
-          <button class="btn btn-sm" :disabled="busy || !episode" title="只提炼道具（依赖人物/场景的 @ 目录，建议在两者之后跑）" @click="doExtractOne('道具')">{{ busy ? '…' : '提炼·道具' }}</button>
-          <button class="btn btn-ghost btn-sm" :disabled="busy" @click="doExtract" title="三件套按序完整提炼；已有同 ID 资产自动复用">{{ busy ? '提炼中…' : '完整提炼' }}</button>
-        </div>
-        <StyleSelect target="image" label="生图风格" :hint="styleHint" @changed="load" />
-        <label class="text-xs text-slate-400">设定图模型
-          <StyledSelect v-model="vendorId" class="mt-1 w-60" :options="vendorOptions" :labels="vendorOptionLabels" :storage-key="`wb.${app.current}.assets.vendor`" placeholder="选择生图模型" />
-        </label>
-        <button class="btn btn-ghost" @click="router.push('/acting')" title="编辑角色卡、连续性记忆和表演候选">编辑演员卡/记忆</button>
-        <!-- 自然宽度按钮组：文字不截断；容器 flex-wrap + items-end，换行对齐一致 -->
-        <button v-if="!isChatGPTQueue" class="btn btn-ghost" :disabled="busy || !!genning || !selectedVendor" @click="doGen('all')" :title="selectedVendor ? '补缺模式：只生成尚未存在的素材图，已有图片会跳过，不创建新版本' : '先选择生图模型'">
-          {{ genning === 'all' ? '补缺生图中…' : '补缺生成全部素材图' }}
-        </button>
-        <button v-else class="btn border-cyan-400/30 text-cyan-200" :disabled="busy || !!genning || !queueableAssets.length" :title="'加入队列后由 image-use 逐项生成并导入，最多选择20项'" @click="queueAllChatGPTAssets">{{ genning === 'chatgpt' ? '启动执行中…' : `加入并执行（${Math.min(queueableAssets.length, 20)} 项）` }}</button>
-        <button v-if="!isChatGPTQueue" class="btn btn-ghost text-amber-200" :disabled="busy || !!genning || !selectedVendor" @click="doGen('all', undefined, true)" :title="selectedVendor ? '强制重生成全项目素材图，会为被覆盖的图片创建版本快照' : '先选择生图模型'">
-          {{ genning === 'all' ? '全部生图中…' : '全部重生成' }}
-        </button>
-        <template v-else>
-          <input ref="importInput" type="file" multiple accept=".zip,image/png,image/jpeg,image/webp" class="hidden" @change="onChatGPTImport" />
-          <button class="btn btn-ghost text-violet-200" title="批量导入 ChatGPT 原图 / ZIP" @click="importInput?.click()">导入原图/ZIP</button>
-        </template>
-        <span v-if="isChatGPTQueue" class="mb-1 inline-flex h-4 w-4 cursor-help items-center justify-center rounded-full border border-cyan-400/50 text-2xs text-cyan-300" title="可一次选择多张独立原图，系统按文件名或队列顺序预匹配">?</span>
-        <span class="ml-auto text-xs-plus text-slate-500">{{ episode ? `当前 ${episode}` : '全局全部素材' }} · 母素材 {{ mothers.length }} · 子素材 {{ childCount }}</span>
-        <span v-if="!imageVendors.length && !isChatGPTQueue" class="text-xs-plus text-amber-300">环境页暂无启用的生图模型</span>
+      <div class="mb-5 grid gap-4 xl:grid-cols-2">
+        <section class="glass space-y-3 p-4" aria-labelledby="asset-extract-title">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h2 id="asset-extract-title" class="text-sm font-bold text-slate-100">提炼素材设定</h2>
+            <span class="text-xs text-slate-400">人物 · 场景 · 道具</span>
+          </div>
+          <div class="flex flex-wrap items-end gap-3">
+            <label class="min-w-40 flex-1 text-xs text-slate-300">分集范围
+              <StyledSelect v-model="episode" class="mt-1" :options="['', ...episodes.map(e => e.id)]" :labels="epLabels" placeholder="全剧" />
+            </label>
+            <button class="btn" :disabled="busy" @click="doExtract" title="按顺序提炼人物、场景和道具；已有同 ID 资产会复用">{{ busy ? '提炼中…' : episode ? `提炼 ${episode} 素材` : '提炼全剧素材' }}</button>
+          </div>
+          <details class="text-xs text-slate-300">
+            <summary class="cursor-pointer text-sky-300">只重跑单类素材</summary>
+            <div class="mt-2 flex flex-wrap gap-2">
+              <button class="btn btn-ghost btn-sm" :disabled="busy || !episode" @click="doExtractOne('人物')">重跑人物</button>
+              <button class="btn btn-ghost btn-sm" :disabled="busy || !episode" @click="doExtractOne('场景')">重跑场景</button>
+              <button class="btn btn-ghost btn-sm" :disabled="busy || !episode" @click="doExtractOne('道具')">重跑道具</button>
+            </div>
+            <p v-if="!episode" class="mt-2 text-slate-400">单类重跑需先选择一集。</p>
+          </details>
+        </section>
+        <section class="glass space-y-3 p-4" aria-labelledby="asset-image-title">
+          <div class="flex flex-wrap items-center justify-between gap-2">
+            <h2 id="asset-image-title" class="text-sm font-bold text-slate-100">生成素材图</h2>
+            <span class="text-xs text-slate-400">母素材 {{ mothers.length }} · 子素材 {{ childCount }}</span>
+          </div>
+          <div class="flex flex-wrap items-end gap-3">
+            <StyleSelect target="image" label="生图风格" :hint="styleHint" @changed="load" />
+            <label class="min-w-48 flex-1 text-xs text-slate-300">生图模型
+              <StyledSelect v-model="vendorId" class="mt-1" :options="vendorOptions" :labels="vendorOptionLabels" :storage-key="`wb.${app.current}.assets.vendor`" placeholder="选择生图模型" />
+            </label>
+          </div>
+          <div class="flex flex-wrap items-center gap-2">
+            <button v-if="!isChatGPTQueue" class="btn" :disabled="busy || !!genning || !selectedVendor" @click="doGen('all')" title="仅生成尚未有图片的素材；已有图保持不变">
+              {{ genning === 'all' ? '生成中…' : '生成缺失素材图' }}
+            </button>
+            <button v-else class="btn border-cyan-400/30 text-cyan-200" :disabled="busy || !!genning || !queueableAssets.length" title="由 image-use 逐项生成并导入，最多选择 20 项" @click="queueAllChatGPTAssets">{{ genning === 'chatgpt' ? '启动中…' : `加入并执行（${Math.min(queueableAssets.length, 20)} 项）` }}</button>
+            <template v-if="isChatGPTQueue">
+              <input ref="importInput" type="file" multiple accept=".zip,image/png,image/jpeg,image/webp" class="hidden" @change="onChatGPTImport" />
+              <button class="btn btn-ghost btn-sm" title="导入 ChatGPT 原图或 ZIP，按任务配对" @click="importInput?.click()">导入已有图片</button>
+            </template>
+          </div>
+          <details v-if="!isChatGPTQueue" class="text-xs text-slate-300">
+            <summary class="cursor-pointer text-amber-200">重新生成现有图片</summary>
+            <button class="btn btn-ghost btn-sm mt-2 text-amber-200" :disabled="busy || !!genning || !selectedVendor" @click="doGen('all', undefined, true)" title="强制重新生成全项目素材图，并保存旧图版本">{{ genning === 'all' ? '生成中…' : '重新生成全项目素材图' }}</button>
+          </details>
+          <span v-if="!imageVendors.length && !isChatGPTQueue" class="text-xs text-amber-300">请先在环境检查中启用生图模型。</span>
+        </section>
       </div>
 
       <ChatGPTRunPanel

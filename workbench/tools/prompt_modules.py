@@ -788,8 +788,8 @@ SKILLS = {
 
 
 # ---------- 系统提示词注册表（Skill 中心可视/可编辑/可重置） ----------
-# 覆盖层：workbench/skills/system/<id>.md 存在 → 整体替换内置系统提示词；
-#   正文支持 {{knowledge}} 占位（运行时替换为拉片知识库检索结果）。
+# 策略补充层：workbench/skills/system/<id>.md 存在时追加到内置硬契约之后；
+#   正文支持 {{knowledge}} 等命名占位，不能替换内置输出格式与安全边界。
 # 拆片线工具（analyze_film/attribute_speakers/fix_transcript/gen_scene_env）经 sys_for() 消费。
 
 import os as _os
@@ -803,24 +803,44 @@ def _override(sid):
     return open(p, encoding="utf-8").read() if _os.path.isfile(p) else None
 
 
-def _emit(sid, sys_p, kn=""):
+def _replace_named_tokens(text, values):
+    out = str(text or "")
+    for key, value in values.items():
+        out = out.replace("{{" + key + "}}", str(value))
+        out = out.replace("{" + key + "}", str(value))
+    return out
+
+
+def _escape_deferred_format_literals(text):
+    """保护用户补充里的 JSON 花括号，供 attribute 两步在稍后调用 str.format。"""
+    import re as _re
+    text = _re.sub(r"(?<!\{)\{(?!\{)", "{{", str(text or ""))
+    return _re.sub(r"(?<!\})\}(?!\})", "}}", text)
+
+
+def compile_system_prompt(sid, builtin_text, *, knowledge="", values=None, deferred_format=False):
+    """系统提示词唯一编译入口：内置硬契约恒在，用户文本只能作为策略补充。"""
+    vals = {"knowledge": knowledge or "", **(values or {})}
+    builtin = _replace_named_tokens(builtin_text, vals)
     ov = _override(sid)
-    if ov is not None:
-        out = ov.replace("{{knowledge}}", kn or "")
-        if sid in ("storyboard", "actor_prepare", "actor_perform") and "@character:<id>" not in out:
-            out += chr(10) + ASSET_REFERENCE_RULES
-        return out
-    return sys_p
+    if ov is None or not str(ov).strip():
+        return builtin
+    extension = _replace_named_tokens(ov, vals).strip()
+    if deferred_format:
+        extension = _escape_deferred_format_literals(extension)
+    return builtin.rstrip() + "\n\n【用户策略补充】\n" + extension
+
+
+def _emit(sid, sys_p, kn=""):
+    return compile_system_prompt(sid, sys_p, knowledge=kn)
 
 
 def sys_for(sid, builtin_text, **vals):
-    """拆片线工具入口：override 存在则用之（支持 {{key}} 占位替换），否则用内置文本。"""
-    t = _override(sid)
-    if t is None:
-        t = builtin_text
-    for k, v in vals.items():
-        t = t.replace("{{" + k + "}}", str(v))
-    return t
+    """拆片线工具入口；attribute 两步保留稍后 str.format 的运行时变量。"""
+    return compile_system_prompt(
+        sid, builtin_text, knowledge=str(vals.get("knowledge") or ""), values=vals,
+        deferred_format=sid in ("attribute", "attribute_norm") and not vals,
+    )
 
 
 def save_system(sid, text):
@@ -878,7 +898,7 @@ SCENE_ENV_SYS = """你是 3D 预演场景师。把场景文字描述转成极简
 
 
 def _scene_env_preview():
-    return SCENE_ENV_SYS
+    return sys_for("scene_env", SCENE_ENV_SYS)
 
 
 PANEL_DRAFT_SYS = """你是故事版画面提示词设计师。把一个叙事时刻写成可供图像模型绘制的静态剧情画格。
@@ -917,7 +937,7 @@ SYSTEM_SKILLS = [
      "preview": lambda: props_prompt("示例剧本文本。")},
     {"id": "panel_draft", "name": "故事版画格描述", "target": "image",
      "desc": "只从画格事实生成静态画面 JSON；画风与负面词由编译器负责",
-     "preview": lambda: PANEL_DRAFT_SYS.replace("{{style_positive}}", "项目画风")},
+     "preview": lambda: sys_for("panel_draft", PANEL_DRAFT_SYS, style_positive="项目画风")},
     {"id": "storyboard", "name": "分镜生成", "target": "storyboard",
      "desc": "对话契约分镜（受控词表+知识库+导演风格注入）",
      "preview": lambda: storyboard_prompt("示例剧本文本。", [], [])[0]},
@@ -926,16 +946,16 @@ SYSTEM_SKILLS = [
      "preview": lambda: transitions_prompt([], "示例气氛")[0]},
     {"id": "fill", "name": "拉片解构填充", "target": "analysis",
      "desc": "三帧视觉分析→景别/运镜/角度/转场/台词/提示词（vision）",
-     "preview": lambda: FILL_SYS.replace("{{vocab}}", "(词表在运行时注入)")},
+     "preview": lambda: sys_for("fill", FILL_SYS, vocab="(词表在运行时注入)")},
     {"id": "attribute", "name": "台词人物归属", "target": "analysis",
      "desc": "按镜头关键帧判断谁说的（vision）",
-     "preview": lambda: ATTRIBUTE_SYS.format(t0="0.0", t1="3.0", lines="0: 示例台词", roster="['角色A']")},
+     "preview": lambda: sys_for("attribute", ATTRIBUTE_SYS, t0="0.0", t1="3.0", lines="0: 示例台词", roster="['角色A']")},
     {"id": "attribute_norm", "name": "角色别名归一", "target": "analysis",
      "desc": "归属结果的角色名合并",
-     "preview": lambda: ATTRIBUTE_NORM_SYS.format(names="['老者','左侧老者']")},
+     "preview": lambda: sys_for("attribute_norm", ATTRIBUTE_NORM_SYS, names="['老者','左侧老者']")},
     {"id": "fixasr", "name": "ASR 台词纠错", "target": "analysis",
      "desc": "同音/近音错字订正（行数不变）",
-     "preview": lambda: FIXASR_SYS},
+     "preview": lambda: sys_for("fixasr", FIXASR_SYS)},
     {"id": "scene_env", "name": "3D 场景陈设 DSL", "target": "scene3d",
      "desc": "场景描述→env 几何清单（box/cyl/sphere）",
      "preview": _scene_env_preview},
@@ -951,7 +971,7 @@ def list_system_skills():
     out = []
     for e in SYSTEM_SKILLS:
         try:
-            text = _override(e["id"]) if _override(e["id"]) is not None else str(e["preview"]())
+            text = str(e["preview"]())
         except Exception as ex:
             text = f"(预览失败: {ex})"
         out.append({"id": e["id"], "name": e["name"], "category": "系统提示词",
@@ -961,7 +981,7 @@ def list_system_skills():
     return out
 
 
-# 运行时覆盖接线：创作线 builder 全部经过 _emit（override 存在则替换系统提示词）
+# 运行时接线：创作线 builder 全部经过 _emit（用户文本追加在内置硬契约之后）
 def _wrap(sid, fn):
     def w(*a, **kw):
         sys_p, user_p = fn(*a, **kw)

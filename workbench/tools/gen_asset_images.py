@@ -18,10 +18,10 @@
 - related_refs / 提示词内 @token：仅叙事关联，永不进入生图依赖——
   related/parent 互指（A related→B、B parent→A）不构成环，不互相阻塞。
 
-用法: python gen_asset_images.py <项目目录> [--kind character|scene|prop|all] [--id 资产id] [--vendor 厂商id] [--force]
+用法: python gen_asset_images.py <项目目录> [--kind character|scene|prop|all] [--id 资产id] [--vendor 厂商id] [--workers N] [--force]
 stdout 末行 OUTPUT:<素材根目录>；退出码 0=全部成功 1=部分/全部失败（部分成功也写出已完成的索引）
 """
-import sys, os, json, argparse, re
+import sys, os, json, argparse, re, copy
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -122,6 +122,31 @@ def load_asset_index(project):
         return value if isinstance(value, dict) else {}
     except (OSError, ValueError, TypeError):
         return {}
+
+
+def skipped_image_entry(previous, descriptive, desired_spec):
+    """图片未重生成时保留真实生成溯源，只把当前目标记录为待更新规格。"""
+    previous = copy.deepcopy(previous) if isinstance(previous, dict) else {}
+    entry = previous
+    entry.update(copy.deepcopy(descriptive))
+    entry["desired_spec"] = copy.deepcopy(desired_spec)
+    reasons = []
+    if not previous.get("prompt"):
+        entry.setdefault("generation_status", "unknown_legacy")
+        reasons.append("历史图片缺少生成提示词记录")
+    elif previous.get("prompt") != desired_spec.get("prompt"):
+        reasons.append("当前提示词与历史生成提示词不同")
+    if previous.get("skill_snapshot") != desired_spec.get("skill_snapshot"):
+        reasons.append("当前 Skill 与历史生成 Skill 不同")
+    if previous.get("reference_refs") != desired_spec.get("reference_refs"):
+        reasons.append("当前参考资产与历史生成参考不同")
+    if reasons:
+        entry["stale"] = True
+        entry["stale_reasons"] = reasons
+    else:
+        entry.pop("stale", None)
+        entry.pop("stale_reasons", None)
+    return entry
 
 
 def archive_ids(project, kind):
@@ -305,6 +330,38 @@ def collect_asset_image_plan(project, kind="all", asset_id=None, vendor_id="",
     return ordered
 
 
+def plan_waves(plans):
+    """把 collect_asset_image_plan 的线性拓扑序压成「依赖深度相同的分波」。
+
+    波内互不依赖 → 可并发；子图（parent_ref/derived_from）一定排在父资产之后的波，
+    等父图落盘后才会去取参考图。父资产不在本批次（已生成/被 --id 过滤）时按 0 波算，
+    与旧的「缺父图降级无参考」口径一致。派生链有环时退回当前深度，不死递归。
+    """
+    by_key = {f"{p['kind']}:{p['id']}": p for p in plans}
+    memo = {}
+
+    def depth_of(plan, stack):
+        key = f"{plan['kind']}:{plan['id']}"
+        if key in memo:
+            return memo[key]
+        if key in stack:
+            return 0
+        stack.add(key)
+        value = 0
+        for ref in plan.get("reference_tokens") or []:
+            parent = by_key.get(str(ref).lstrip("@"))
+            if parent is not None and parent is not plan:
+                value = max(value, depth_of(parent, stack) + 1)
+        stack.discard(key)
+        memo[key] = value
+        return value
+
+    grouped = {}
+    for p in plans:
+        grouped.setdefault(depth_of(p, set()), []).append(p)
+    return [grouped[k] for k in sorted(grouped)]
+
+
 def asset_image_needs_generation(path, force=False):
     """补缺模式只在目标图片不存在时生成；force 用于显式重生成。"""
     return bool(force) or not os.path.isfile(path)
@@ -417,6 +474,8 @@ def main():
     ap.add_argument("--id", default=None, help="只生成指定资产 id")
     ap.add_argument("--vendor", default=None)
     ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--workers", type=int, default=4,
+                    help="云端厂商生图并发数（默认 4，上限 8；本机 ComfyUI 与 ChatGPT 网页队列自动降为 1）")
     ap.add_argument("--force", action="store_true", help="强制重生成已存在图片（默认只补缺）")
     ap.add_argument("--states", default="include", choices=["include", "only", "skip"],
                     help="人物状态图口径：include=母图+缺失状态图（默认）；only=只补状态图"
@@ -465,22 +524,22 @@ def main():
             if ident and (not a.id or ident == a.id):
                 source_items[(kind, ident)] = item
     plans = [plan for plan in plans if (plan["kind"], plan["id"]) in source_items]
-    ok_all, fail = True, []
-    for plan in plans:
+    fail = []
+    def do_plan(plan):
         if a.states == "skip":
             plan["skip_states"] = True
         kind = plan["kind"]
         src, key, pfield, zone = KINDS[kind]
         it = source_items.get((kind, plan["id"]))
         if not it:
-            continue
+            return
         index.setdefault(zone, {})
         aid = str(it.get("id") or "").strip()
         prompt = str(it.get(pfield) or "").strip()
         if not aid or not prompt:
             if aid:
                 print(f"[跳过] {zone}/{aid} 无 {pfield}（重新提炼可补）")
-            continue
+            return
         prompt, guard_notes = _gender_guard(it, prompt)
         for note in guard_notes:
             print(f"[告警] {zone}/{aid} {note}")
@@ -524,17 +583,16 @@ def main():
         if (a.states == "only" or a.state_id) and os.path.isfile(out):
             mother_needed = False
         if not mother_needed:
-            # 图片已存在时保留文件，顺手修复/刷新索引元数据，不调用模型也不创建版本。
-            index[zone][aid] = {"path": f"素材/{zone}/{aid}.png", "prompt": prompt,
-                                "name": it.get("name", aid),
-                                "parent_ref": it.get("parent_ref"),
-                                "relation": it.get("relation"),
-                                "derived_from": it.get("derived_from"),
-                                "related_refs": it.get("related_refs") or [],
-                                "reference_refs": reference_tokens,
-                                **({"states": _kept_states} if _kept_states else {}),
-                                # E10：实际注入的 skill 快照随索引归档（未注入则不写该键）
-                                **({"skill_snapshot": asset_skill_snap} if asset_skill_snap else {})}
+            # 图片已存在时不得把旧像素伪装成由当前提示词/Skill 生成；当前目标单列为 desired_spec。
+            index[zone][aid] = skipped_image_entry(
+                index.get(zone, {}).get(aid),
+                {"path": f"素材/{zone}/{aid}.png", "name": it.get("name", aid),
+                 "parent_ref": it.get("parent_ref"), "relation": it.get("relation"),
+                 "derived_from": it.get("derived_from"), "related_refs": it.get("related_refs") or [],
+                 **({"states": _kept_states} if _kept_states else {})},
+                {"prompt": prompt, "reference_refs": reference_tokens,
+                 "skill_snapshot": asset_skill_snap},
+            )
             print(f"[跳过] {zone}/{aid} 已存在（补缺模式）")
         else:
             if missing_refs:
@@ -565,7 +623,7 @@ def main():
                                     **({"skill_snapshot": asset_skill_snap} if asset_skill_snap else {})}
                 print(f"[完成] {zone}/{aid} -> 素材/{zone}/{aid}.png")
             except Exception as e:
-                ok_all = False; fail.append(f"{zone}/{aid}: {e}")
+                fail.append(f"{zone}/{aid}: {e}")
                 print(f"[失败] {zone}/{aid}: {e}")
         # ---- 场景平面图派生：场景母图就位后自动确保 plan → 底图 PNG → 素材图派生注册 ----
         # fail-soft：无厂商/生成失败只告警；注册只改内存 index，随本轮统一落盘（行尾 dump）。
@@ -579,7 +637,7 @@ def main():
                 print(f"[告警] 场景「{aid}」平面图派生失败（不影响资产生图）: {_e}")
         # ---- 状态资产图：同一角色的剧情阶段变体（锚点+差异），文件 <aid>__<状态id>.png ----
         if kind != "character" or plan.get("skip_states"):
-            continue
+            return
         states_entry = {}
         for st_item in (it.get("states") or []):
             if not isinstance(st_item, dict):
@@ -599,11 +657,14 @@ def main():
             if not asset_image_needs_generation(s_out, a.force):
                 # 补缺跳过也要带时间锚定字段，否则一次「补齐全素材图」就把
                 # episodes/camp 清零，分镜再也选不到对应阶段的形象。
-                states_entry[sid] = {"path": f"素材/{zone}/{aid}__{sid}.png",
-                                     "prompt": s_prompt, "label": st_item.get("label", sid),
-                                     "episodes": st_item.get("episodes") or [],
-                                     "camp": st_item.get("camp", ""),
-                                     **({"skill_snapshot": asset_skill_snap} if asset_skill_snap else {})}
+                previous_state = ((_kept_states or {}).get(sid) if isinstance(_kept_states, dict) else None)
+                states_entry[sid] = skipped_image_entry(
+                    previous_state,
+                    {"path": f"素材/{zone}/{aid}__{sid}.png", "label": st_item.get("label", sid),
+                     "episodes": st_item.get("episodes") or [], "camp": st_item.get("camp", "")},
+                    {"prompt": s_prompt, "reference_refs": [current_ref],
+                     "skill_snapshot": asset_skill_snap},
+                )
                 continue
             import versions as _V2; _V2.snapshot(s_out)
             try:
@@ -621,7 +682,7 @@ def main():
                                      **({"skill_snapshot": asset_skill_snap} if asset_skill_snap else {})}
                 print(f"[完成] {zone}/{aid}#{sid} -> {aid}__{sid}.png")
             except Exception as e:
-                ok_all = False; fail.append(f"{zone}/{aid}#{sid}: {e}")
+                fail.append(f"{zone}/{aid}#{sid}: {e}")
                 print(f"[失败] {zone}/{aid}#{sid}: {e}")
         if states_entry and aid in index.get(zone, {}):
             # 按状态 id 并集写回：单状态重生成不得抹掉同角色其它状态的索引
@@ -629,6 +690,34 @@ def main():
             _merged = dict(_prev_states) if isinstance(_prev_states, dict) else {}
             _merged.update(states_entry)
             index[zone][aid]["states"] = _merged
+    # ---- 依赖分波执行：派生子图必须等父资产母图落盘 ----
+    # 子素材（parent_ref/derived_from）拿父图当参考改图，父图还在同批次排队时
+    # 文件还不存在，会被降级成文生图、身份锚点散掉——所以按依赖深度分波，
+    # 只有同一波内互不依赖的资产才并发。本机 ComfyUI/ChatGPT 网页队列压回 1 路。
+    from vendor_concurrency import parallel_cap
+    waves = plan_waves(plans)
+
+    def _run_one(plan):
+        try:
+            do_plan(plan)
+        except Exception as e:
+            # 单张意外不拖垮整批：已经付过费的图必须留在索引里
+            zone = KINDS[plan["kind"]][3]
+            fail.append(f"{zone}/{plan['id']}: {e}")
+            print(f"[失败] {zone}/{plan['id']} 意外中断：{e}", flush=True)
+
+    cap = parallel_cap(cli.id, a.workers)
+    print(f"[信息] 生图并发 {cap} 路（厂商 {cli.id}；本机 ComfyUI 与 ChatGPT 网页队列恒为 1 路）"
+          f"，{len(plans)} 项分 {len(waves)} 波执行", flush=True)
+    from concurrent.futures import ThreadPoolExecutor
+    for wi, batch in enumerate(waves):
+        if cap <= 1 or len(batch) <= 1:
+            for p in batch:
+                _run_one(p)
+            continue
+        print(f"[并发] 第 {wi + 1}/{len(waves)} 波：{len(batch)} 项 × {min(cap, len(batch))} 路", flush=True)
+        with ThreadPoolExecutor(max_workers=min(cap, len(batch))) as ex:
+            list(ex.map(_run_one, batch))
     try:
         import versions as _V
         _V.snapshot(idx_path)
@@ -639,7 +728,7 @@ def main():
         print("[部分失败] " + "；".join(fail[:5]))
     print(f"[完成] 索引 -> {idx_path}")
     print("OUTPUT:" + out_root)
-    sys.exit(0 if ok_all else 1)
+    sys.exit(1 if fail else 0)
 
 
 if __name__ == "__main__":

@@ -2431,6 +2431,11 @@ class H(BaseHTTPRequestHandler):
                 return self._send_run_json(400, {"ok":False,"err":scrub_err(exc)})
         cmd=[sys.executable,os.path.join(TOOLS,"create_batch.py"),"--project",d,"--board",board_name,
              "--type",mtype,"--mode",image_mode,"--vendor",vendor_id,"--providers",PROV]
+        try:
+            workers=int(body.get("workers") or 4)
+        except (TypeError,ValueError):
+            workers=4
+        cmd+=["--workers",str(max(1,min(workers,16)))]
         raw_ids=body.get("shot_ids")
         shot_ids=[str(x).strip() for x in raw_ids if str(x).strip()] if isinstance(raw_ids,list) else []
         if not shot_ids or len(shot_ids)>200:
@@ -3690,6 +3695,11 @@ class H(BaseHTTPRequestHandler):
             return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目不存在"},ensure_ascii=False).encode())
         cmd=[sys.executable,os.path.join(TOOLS,"gen_asset_images.py"),d,
              "--kind",str(body.get("kind") or "all")]
+        try:
+            workers=int(body.get("workers") or 4)
+        except (TypeError,ValueError):
+            workers=4
+        cmd+=["--workers",str(max(1,min(workers,16)))]
         if body.get("id"): cmd+=["--id",str(body["id"])]
         if body.get("force"): cmd+=["--force"]
         states_mode=str(body.get("states") or "include").strip()

@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { app, projectFiles, toast } from '../stores/app'
 import { trackJob } from '../stores/jobs'
 import { fetchCreate, fetchEnvConfig, getJSON, mediaUrl, postJSON, type Vendor } from '../api'
-import { reconcilePending, studioData, studioPost, submitStudioJob, submitRedoJob, type StudioState, type VideoUnit, type ProductionShot, type ProductionItem } from '../utils/productionStudio'
+import { fetchStudioSettings, saveStudioSettings, reconcilePending, studioData, studioPost, submitStudioJob, submitRedoJob, type StudioState, type VideoUnit, type ProductionShot, type ProductionItem } from '../utils/productionStudio'
 import { useBoardSelection } from '../utils/useBoardSelection'
 import VideoSettings from '../components/VideoSettings.vue'
 import MediaReferences from '../components/MediaReferences.vue'
@@ -26,6 +26,21 @@ const canBindVoices = computed(() => referenceAudio.value && !['agnes','aliyun']
 const urlLines = (value:string) => value.split(/\r?\n/).map(s => s.trim()).filter(Boolean)
 const promptFields = [{key: 'prompt_image', label: '参考帧提示词'}, {key: 'prompt_video', label: '视频提示词'}, {key: 'prompt_grid', label: '宫格提示词'}] as const
 const optimizing = ref('')
+const defaultVideoDuration = ref(15), savedDefaultVideoDuration = ref(15), defaultDurationSaving = ref(false)
+async function saveDefaultVideoDuration() {
+  if (defaultDurationSaving.value) return
+  defaultDurationSaving.value = true
+  try {
+    const r = await saveStudioSettings({default_video_duration: Number(defaultVideoDuration.value)})
+    defaultVideoDuration.value = r.default_video_duration
+    savedDefaultVideoDuration.value = r.default_video_duration
+    toast('V 分组默认时长已保存', 'ok')
+  } catch (e) {
+    defaultVideoDuration.value = savedDefaultVideoDuration.value
+    error.value = e instanceof Error ? e.message : '保存默认时长失败'
+  }
+  finally { defaultDurationSaving.value = false }
+}
 const units = computed(() => data.value?.board.video_units || [])
 const allShots = computed(() => data.value?.board.shots || [])
 const unit = computed(() => units.value.find(u => u.id === selectedUnit.value))
@@ -109,12 +124,6 @@ function recomposeUnit() {
   u.prompt_video = sections.join('\n') + (m ? '\n整段补充：' + m[1] : '')
   dirty.value = true
   toast('已按当前各 S 提示词重拼，尾部整段补充保留', 'ok')
-}
-async function genV() {
-  if (!unit.value) return
-  scope.value = 'V'; kind.value = 'video'
-  if (dirty.value && !await savePrompts()) return
-  await job('generate')
 }
 function onModeSelect(event: Event, s: ProductionShot) {
   const value = (event.target as HTMLSelectElement).value
@@ -216,7 +225,9 @@ function restoreOptions() {
   videoOptions.value = options.video_options || {mode:'reference'}
   firstShot.value = options.first_shot_id || currentShots.value[0]?.id || ''; lastShot.value = options.last_shot_id || currentShots.value.at(-1)?.id || ''
   imageUrls.value = {...options.image_urls}; audioUrls.value = options.audio_urls || ''; videoUrls.value = options.video_urls || ''
-  refMode.value = options.ref_mode || 'grid'   // 整 V 直出默认故事板宫格（A 路线推荐）; tailMode.value = options.tail_mode || ''; tailItem.value = options.tail_item || ''
+  refMode.value = options.ref_mode || 'grid'
+  tailMode.value = options.tail_mode || ''
+  tailItem.value = options.tail_item || ''
   visionVendor.value = options.vision_vendor || visionModels.value[0]?.id || ''; includeVoices.value = options.include_voices ?? true
 }
 function selectionKey() { return `slate:production-target:${app.current}:${board.value}` }
@@ -276,11 +287,6 @@ async function saveUnits(confirm = false, values = units.value) {
 async function initialize() {
   try { await studioPost('save', {...base(), initialize: true}); await load() } catch (e) { error.value = String(e) }
 }
-async function saveDuration() {
-  if (scope.value === 'S' && shot.value) shot.value.video_duration = duration.value
-  if (scope.value === 'V' && unit.value) unit.value.duration = duration.value
-  await savePrompts()
-}
 function editDuration(event: Event) {
   duration.value = (event.target as HTMLInputElement).valueAsNumber
   if (scope.value === 'S' && shot.value) shot.value.video_duration = duration.value
@@ -317,6 +323,10 @@ async function job(action: string, recover = false) {
     })
     toast(result.reused ? '已复用同一请求' : '后台任务已提交，可继续编辑', 'ok')
   } catch (e) { error.value = String(e) } finally { busy.value = false }
+}
+async function submitCurrent() {
+  if (dirty.value && !await savePrompts()) return
+  await job('generate')
 }
 async function adopt(item: ProductionItem) {
   try { await studioPost('adopt', {...base(), scope: scope.value, target: currentTarget.value, type: kind.value, item_id: item.id}); await load() }
@@ -394,6 +404,10 @@ void fetchEnvConfig().then(r => {
   vendors.value = r.vendors
   if (!visionModels.value.some(v => v.id === visionVendor.value)) visionVendor.value = visionModels.value[0]?.id || ''
 })
+void fetchStudioSettings().then(r => {
+  defaultVideoDuration.value = r.default_video_duration
+  savedDefaultVideoDuration.value = r.default_video_duration
+}).catch(() => { /* 保持默认值 */ })
 const timer = window.setInterval(() => { if (items.value.some(i => ['queued', 'running'].includes(i.status))) void gallery() }, 5000)
 onBeforeUnmount(() => window.clearInterval(timer))
 </script>
@@ -401,8 +415,11 @@ onBeforeUnmount(() => window.clearInterval(timer))
 <template>
   <div class="page-wide production-studio">
     <header class="mb-5 flex flex-wrap items-end justify-between gap-3">
-      <div><h1 class="grad-text text-2xl font-black">⑦ 创作生成</h1><p class="mt-1 text-xs text-slate-500">S 转场镜头 → V 分镜视频 → E 集视频</p></div>
-      <nav class="flex gap-3 text-xs text-sky-300"><RouterLink to="/studio/shots">分镜生成</RouterLink><RouterLink to="/studio/asset/voices">角色音色</RouterLink><RouterLink to="/create/free">自由创作 · 音乐 · 全部画廊</RouterLink></nav>
+      <div><h1 class="grad-text text-2xl font-black">⑦ 创作生成</h1><p class="mt-1 text-xs text-slate-500">按 S 生成关键帧，按 V 生成视频；已采用片段可继续重拍。</p></div>
+      <div class="flex items-center gap-2">
+        <span v-if="dirty" class="text-xs text-amber-200">有未保存修改</span>
+        <button class="btn btn-sm" :disabled="busy || !dirty" @click="savePrompts">保存提示词与时长</button>
+      </div>
     </header>
     <div v-if="error" role="alert" class="mb-3 rounded-xl bg-rose-950/40 p-3 text-sm text-rose-200">{{ error }}<button class="ml-3" @click="error = ''">×</button></div>
     <!-- 制作规格（E05）：V 总时长超过单集目标时后端 state 给出提示 -->
@@ -412,8 +429,13 @@ onBeforeUnmount(() => window.clearInterval(timer))
       <aside class="glass studio-sidebar">
         <label class="block text-xs text-slate-400">分集 / 分镜 JSON<select v-model="board" class="control mt-2"><option v-for="b in boards" :key="b">{{ b }}</option></select></label>
         <label class="block text-xs text-slate-400">编排模型<select v-model="textVendor" class="control mt-1"><option v-for="v in textModels" :key="v.id" :value="v.id">{{ v.models.text }}</option></select></label>
+        <label class="block text-xs text-slate-300">自动合并的 V 默认时长（全局）
+          <select v-model.number="defaultVideoDuration" class="control mt-1" :disabled="defaultDurationSaving" @change="saveDefaultVideoDuration">
+            <option :value="8">8 秒</option><option :value="15">15 秒</option><option :value="30">30 秒</option>
+          </select>
+        </label>
         <button class="btn w-full" :disabled="busy || !board || !textVendor" @click="job('group')">自动合并分镜</button>
-        <button v-if="!units.length" class="btn btn-ghost w-full" :disabled="!board" @click="initialize">先按场景建立 V 分组</button>
+        <button v-if="!units.length" class="btn btn-ghost w-full" :disabled="!board" @click="initialize">按场景创建 V 分组</button>
         <button v-for="u in units" :key="u.id" class="unit-card" :class="{'selected': u.id === selectedUnit}" @click="chooseUnit(u)">
           <b>{{ u.label }} · {{ u.title }}<span v-if="u.judge?.warnings?.length" class="ml-1 cursor-help text-amber-300" :title="u.judge.warnings.join('\n')">！</span></b><small>{{ u.shot_ids.join(' · ') }} · {{ u.duration }}s</small>
           <small class="unit-status" :class="u.stale || u.video_stale ? 'is-pending' : 'is-ready'">{{ u.stale ? '汇总待更新' : u.video_stale ? '已采用视频待确认' : u.video_binding ? '已采用视频' : '待生成视频' }}</small>
@@ -422,18 +444,24 @@ onBeforeUnmount(() => window.clearInterval(timer))
       <main class="glass min-w-0 space-y-4 p-4">
         <section v-if="unit" class="space-y-3 rounded-xl border border-sky-400/30 bg-sky-950/20 p-4">
           <div class="flex flex-wrap items-center justify-between gap-2">
-            <h2 class="text-base font-black text-sky-200">① 整 V 直出 <span class="text-xs font-normal text-slate-400">{{ unit.label }} · 一次调用生成本 V 整段 {{ unit.duration }}s 视频</span></h2>
+            <h2 class="text-base font-black text-sky-200">{{ unit.label }} · 分镜视频 <span class="text-xs font-normal text-slate-400">{{ unit.duration }} 秒 · 一次生成整段</span></h2>
             <span v-if="unit.judge?.warnings?.length" class="cursor-help text-xs text-amber-300" :title="unit.judge.warnings.join('\n')">！提示词可能无法完整生成（悬浮看详情）</span>
           </div>
           <label class="block text-xs text-slate-400">V 标题<input v-model="unit.title" class="control mt-1" @input="dirty = true" /></label>
-          <label class="block text-xs text-slate-400">整 V 直出提示词<button class="ml-2 text-sky-300" :disabled="busy || !!optimizing || !textVendor" @click="optimize('V', unit.id, 'prompt_video')">{{ optimizing === unit.id + ':prompt_video' ? '优化中…' : '重新生成 / 优化' }}</button><button class="ml-2 text-xs text-cyan-200" :disabled="busy" title="丢弃当前 V 汇总文本，用下方各 S 的视频提示词重新拼接（保留尾部整段补充），修掉历史叠加的重复" @click="recomposeUnit">按 S 重拼（去重复）</button><textarea v-model="unit.prompt_video" class="control mt-1" rows="6" @input="dirty = true" /></label>
+          <label class="block text-xs text-slate-400">整段视频提示词<button class="ml-2 text-sky-300" :disabled="busy || !!optimizing || !textVendor" @click="optimize('V', unit.id, 'prompt_video')">{{ optimizing === unit.id + ':prompt_video' ? '优化中…' : '优化提示词' }}</button><button class="ml-2 text-xs text-cyan-200" :disabled="busy" title="按当前各 S 的视频提示词重组整段内容，保留末尾整段补充" @click="recomposeUnit">从 S 重组</button><textarea v-model="unit.prompt_video" class="control mt-1" rows="6" @input="dirty = true" /></label>
+          <label class="block text-xs text-slate-400">整段负面提示词<textarea v-model="unit.negative" class="control mt-1" rows="2" @input="dirty = true" /></label>
+          <div class="flex flex-wrap items-center gap-2">
+            <button class="btn btn-sm" :disabled="busy" title="保存本 V 的修改，并确认各 S 内容已汇总" @click="saveUnits(true)">确认 V 汇总</button>
+            <button class="btn btn-sm btn-ghost" :disabled="busy" title="将下一个 V 的 S 并入当前 V" @click="mergeNext">合并下一个 V</button>
+            <span class="text-xs text-slate-500">{{ unit.scene_ref || '未关联场景' }}</span>
+          </div>
           <div class="space-y-2">
             <div class="flex flex-wrap gap-2">
               <button class="ref-choice flex-1" :class="{active: refMode === 'grid'}" :disabled="busy" @click="setRefMode('grid')">故事板宫格（推荐）</button>
               <button class="ref-choice flex-1" :class="{active: refMode === 'keyframes'}" :disabled="busy" @click="setRefMode('keyframes')">按 S 关键帧序列</button>
             </div>
             <div v-if="refMode === 'keyframes'" class="space-y-2">
-              <p class="text-xs text-slate-500">关键帧没有 V 级提示词——每张关键帧在 ② 分 S 出镜对应 S 卡里生成（各有自己的提示词），此处按 S 顺序引用：</p>
+              <p class="text-xs text-slate-500">按 S 顺序引用已采用关键帧；缺图可在此生成。</p>
               <div class="flex flex-wrap gap-2">
               <template v-for="s in shots" :key="s.id">
                 <figure class="w-[124px]">
@@ -451,7 +479,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
               </div>
             </div>
             <div v-else class="space-y-2">
-              <label class="block text-xs text-slate-400">宫格提示词（分格布局说明，留空 = 默认九宫格 3×3 按剧情时间顺序）<button class="ml-2 text-sky-300" :disabled="busy || !!optimizing || !textVendor" @click="optimize('V', unit.id, 'prompt_grid')">{{ optimizing === unit.id + ':prompt_grid' ? '优化中…' : '重新生成 / 优化' }}</button><textarea v-model="unit.prompt_grid" class="control mt-1" rows="2" placeholder="例：九宫格 3×3；格1 叩首、格2 拎匣入场、格3 递牌…所有格人物一致、格内无文字" @input="dirty = true" /></label>
+              <label class="block text-xs text-slate-400">宫格布局（留空采用默认 3×3）<button class="ml-2 text-sky-300" :disabled="busy || !!optimizing || !textVendor" @click="optimize('V', unit.id, 'prompt_grid')">{{ optimizing === unit.id + ':prompt_grid' ? '优化中…' : '优化布局' }}</button><textarea v-model="unit.prompt_grid" class="control mt-1" rows="2" placeholder="例：3×3；格1 叩首，格2 拎匣入场，格3 递牌；人物一致，格内无文字" @input="dirty = true" /></label>
               <div class="flex flex-wrap items-start gap-2">
                 <figure v-if="gridCandidate" class="w-[124px]">
                   <div class="aspect-video w-full overflow-hidden rounded-md border bg-black" :class="gridAdopted ? 'border-emerald-400/60' : 'border-white/10'">
@@ -466,31 +494,17 @@ onBeforeUnmount(() => window.clearInterval(timer))
                 </div>
                 <div class="space-y-1 self-center">
                   <button v-if="gridCandidate" class="btn btn-sm btn-ghost" :disabled="busy || !vendor" @click="makeGrid()">重新生成宫格</button>
-                  <p class="text-xs text-slate-500">一次生图调用：按整 V 剧情生成多格故事板图；采用后才作为整 V 视频的参考。生图模型：{{ vendor || '未选择' }}（右侧栏可换）。</p>
+                  <p class="text-xs text-slate-500">采用宫格图后，整 V 视频会以它为参考。</p>
                 </div>
               </div>
-              <p class="text-xs text-slate-500">一次生图调用：按整 V 剧情生成多格故事板图，作为整 V 视频的参考。生图模型：{{ vendor || '未选择' }}（右侧栏可换）。</p>
             </div>
           </div>
           <div class="flex flex-wrap items-center gap-2">
-            <button class="btn" :disabled="busy || !vendor || !capability?.known" @click="genV()">{{ busy ? '提交中…' : `▶ 生成整 V 视频（${unit.duration}s）` }}</button>
             <span v-for="beat in unit.timeline" :key="beat.shot_id" class="rounded-lg bg-sky-950/40 px-2 py-1 text-xs text-sky-200">{{ beat.shot_id }} · {{ beat.start }}–{{ beat.end }}s</span>
           </div>
         </section>
-        <div v-if="unit" class="space-y-3">
-        <section class="space-y-2 rounded-xl border border-white/10 bg-black/20 p-4">
-          <h2 class="text-sm font-black text-slate-300">V 汇总与管理 <span class="text-xs font-normal text-slate-500">结构操作，与生成无关</span></h2>
-          <p class="text-xs text-slate-400">当前场景：{{ unit.scene_ref || '请在分镜生成中补充 scene_ref' }}</p>
-          <div class="flex flex-wrap items-center gap-2">
-            <button class="btn btn-sm" :disabled="busy" title="S 改动后 V 标记「汇总待更新」；确认把各 S 最新内容收进本 V，确认后才能整 V 生成" @click="saveUnits(true)">保存并确认 V 汇总</button>
-            <button class="btn btn-sm btn-ghost" :disabled="busy" title="把下一个 V 的全部 S 并入本 V（同场景连续段才可合并）" @click="mergeNext">与下一个 V 合并</button>
-          </div>
-          <label class="block text-xs text-slate-400">本 V 统一负面提示词<textarea v-model="unit.negative" class="control mt-1" rows="2" @input="dirty = true" /></label>
-          <p class="text-xs text-slate-500">改动 S 后 V 汇总会标记过期，需重新确认；逐 S 精修在下方「② 分 S 出镜」。</p>
-        </section>
-      </div>
       <div v-if="unit" class="space-y-3 rounded-xl border border-white/10 p-4">
-        <h2 class="text-sm font-black text-slate-300">② 分 S 出镜 <span class="text-xs font-normal text-slate-500">每 S 独立：静态参考（关键帧/宫格）出图，动态视频逐镜直出</span></h2>
+        <h2 class="text-sm font-black text-slate-200">S 转场镜头 <span class="text-xs font-normal text-slate-400">逐镜编辑关键帧、宫格或视频提示词</span></h2>
         <div class="reference-and-shots">
           <aside class="space-y-2 text-xs"><b class="text-slate-300">本段引用素材</b>
             <div v-for="r in assetRefs" :key="r.token" class="overflow-hidden rounded-lg border border-white/10 bg-black/30">
@@ -518,27 +532,25 @@ onBeforeUnmount(() => window.clearInterval(timer))
                   </div>
                   <template v-if="kind === 'image'">
                     <label v-if="staticTabOf(s) === 'keyframe'" class="block text-xs text-sky-300">
-                      <span>关键帧提示词</span><button class="ml-3 text-xs text-cyan-200" :aria-label="'优化 ' + s.id + ' 关键帧提示词'" :disabled="busy || !!optimizing || !textVendor" @click="optimize('S', s.id, 'prompt_image')">{{ optimizing === s.id + ':prompt_image' ? '优化中…' : '重新生成 / 优化' }}</button>
+                      <span>关键帧提示词</span><button class="ml-3 text-xs text-cyan-200" :aria-label="'优化 ' + s.id + ' 关键帧提示词'" :disabled="busy || !!optimizing || !textVendor" @click="optimize('S', s.id, 'prompt_image')">{{ optimizing === s.id + ':prompt_image' ? '优化中…' : '优化提示词' }}</button>
                       <textarea v-model="s.prompt_image" :aria-label="s.id + ' 关键帧提示词'" class="control mt-2" rows="4" @input="dirty = true" />
                     </label>
                     <label v-else class="block text-xs text-sky-300">
-                      <span>宫格提示词（故事板宫格参考模式的布局说明）</span><button class="ml-3 text-xs text-cyan-200" :aria-label="'优化 ' + s.id + ' 宫格提示词'" :disabled="busy || !!optimizing || !textVendor" @click="optimize('S', s.id, 'prompt_grid')">{{ optimizing === s.id + ':prompt_grid' ? '优化中…' : '重新生成 / 优化' }}</button>
+                      <span>宫格布局</span><button class="ml-3 text-xs text-cyan-200" :aria-label="'优化 ' + s.id + ' 宫格提示词'" :disabled="busy || !!optimizing || !textVendor" @click="optimize('S', s.id, 'prompt_grid')">{{ optimizing === s.id + ':prompt_grid' ? '优化中…' : '优化布局' }}</button>
                       <textarea v-model="s.prompt_grid" :aria-label="s.id + ' 宫格提示词'" class="control mt-2" rows="4" placeholder="分格布局说明。例：九宫格 3×3；格1 起手、格2 俯身、格3 按地叩首…所有格人物一致、格内无文字。留空=默认九宫格 3×3 按剧情顺序" @input="dirty = true" />
                     </label>
                   </template>
                   <template v-else>
                     <label class="block text-xs text-sky-300">
-                      <span>视频提示词</span><button class="ml-3 text-xs text-cyan-200" :aria-label="'优化 ' + s.id + ' 视频提示词'" :disabled="busy || !!optimizing || !textVendor" @click="optimize('S', s.id, 'prompt_video')">{{ optimizing === s.id + ':prompt_video' ? '优化中…' : '重新生成 / 优化' }}</button>
+                      <span>视频提示词</span><button class="ml-3 text-xs text-cyan-200" :aria-label="'优化 ' + s.id + ' 视频提示词'" :disabled="busy || !!optimizing || !textVendor" @click="optimize('S', s.id, 'prompt_video')">{{ optimizing === s.id + ':prompt_video' ? '优化中…' : '优化提示词' }}</button>
                       <textarea v-model="s.prompt_video" :aria-label="s.id + ' 视频提示词'" class="control mt-2" rows="4" @input="dirty = true" />
                     </label>
-                    <p class="text-xs text-slate-500">视频生成参数与提交入口在右侧栏。</p>
+                    <p class="text-xs text-slate-500">在右侧设置视频参数并提交当前 S。</p>
                   </template>
                   <div class="flex flex-wrap gap-2">
-                    <button v-if="kind === 'image'" class="btn btn-sm" :disabled="busy || !vendor" @click="staticTabOf(s) === 'keyframe' ? genShotImage(s) : makeGrid(s)">{{ busy ? '提交中…' : (staticTabOf(s) === 'keyframe' ? '生成关键帧' : '生成宫格图（本 S 一次调用）') }}</button>
-                    <button class="btn btn-sm btn-ghost" :disabled="busy" @click="savePrompts">保存提示词</button>
-                    <button class="btn btn-sm btn-ghost" @click="chooseShot(s)">选择本 S 创作</button>
+                    <button v-if="kind === 'image' && staticTabOf(s) === 'grid'" class="btn btn-sm" :disabled="busy || !vendor" @click="makeGrid(s)">{{ busy ? '提交中…' : '生成本 S 宫格图' }}</button>
+                    <button v-if="scope !== 'S' || selectedShot !== s.id" class="btn btn-sm btn-ghost" @click="chooseShot(s)">设为当前镜头</button>
                   </div>
-                  <p class="text-2xs text-slate-500">序号、时段、景别、镜头、运镜、画面（内容/人物/动作/声音/台词）、光影。以当前文字为基础优化。</p>
                 </div>
                 <aside class="shot-thumb">
                   <template v-if="thumbFor(s)">
@@ -559,7 +571,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
       </main>
       <aside class="glass space-y-4 p-4">
         <div><span class="text-xs text-slate-400">当前创作范围</span><h2 class="mt-1 font-bold text-sky-200">{{ scope === 'S' ? `${selectedShot} · 转场镜头` : `${unit?.label || 'V'} · 分镜视频` }}</h2></div>
-        <div class="flex gap-2"><button class="btn flex-1" :class="{'opacity-50': kind !== 'image'}" @click="kind = 'image'">参考关键帧</button><button class="btn flex-1" :class="{'opacity-50': kind !== 'video'}" @click="kind = 'video'">视频</button></div>
+        <div class="flex gap-2"><button class="ref-choice flex-1 text-center" :class="{active: kind === 'image'}" :aria-pressed="kind === 'image'" @click="kind = 'image'">关键帧</button><button class="ref-choice flex-1 text-center" :class="{active: kind === 'video'}" :aria-pressed="kind === 'video'" @click="kind = 'video'">视频</button></div>
         <label class="block text-xs text-slate-400">生成模型<select v-model="vendor" class="control mt-1"><option v-for="v in models" :key="v.id" :value="v.id">{{ v.label }} · {{ v.models[kind] }}</option></select></label>
         <p v-if="vendor === 'chatgpt-queue'" class="text-xs text-slate-500">由 <a href="https://github.com/leeguooooo/image-use" target="_blank" rel="noopener">image-use / chrome-use</a> 提供。每个任务独立上传参考图、生成一张并回填。</p>
         <template v-if="kind === 'video'">
@@ -572,12 +584,11 @@ onBeforeUnmount(() => window.clearInterval(timer))
             <MediaReferences v-if="capability?.max_audio" :key="currentTarget + 'audio'" v-model="audioUrls" :project="app.current" kind="audio" :limit="capability.max_audio" @change="saveOptions" />
             <MediaReferences v-if="capability?.max_video" :key="currentTarget + 'video'" v-model="videoUrls" :project="app.current" kind="video" :limit="capability.max_video" @change="saveOptions" />
           </div>
-          <button class="btn btn-sm" @click="saveOptions">保存视频参数</button>
-          <label class="block text-xs text-slate-400">总时长（秒）<input :value="duration" type="number" step="1" min="1" class="control mt-1" @input="editDuration" /></label>
-          <button class="btn btn-sm" :disabled="busy || !Number.isFinite(duration) || duration <= 0" @click="saveDuration">保存时长</button>
+          <button class="btn btn-sm btn-ghost" :disabled="busy" @click="saveOptions">保存视频参数</button>
+          <label class="block text-xs text-slate-400">当前生成时长（秒）<input :value="duration" type="number" step="0.1" min="0.1" class="control mt-1" @input="editDuration" /></label>
           <p v-if="capability" class="text-xs text-slate-500">当前适配器：{{ capability.min_duration }}–{{ capability.max_duration }} 秒，最多 {{ capability.max_refs }} 张图</p>
           <section class="reference-options space-y-4 rounded-xl border border-white/10 p-3">
-            <h3 class="text-sm font-bold text-sky-200">尾帧 · 音色 <span class="text-2xs font-normal text-slate-500">关键帧/宫格参考方式已在上方「① 整 V 直出」中选择</span></h3>
+            <h3 class="text-sm font-bold text-sky-200">尾帧与角色音色</h3>
             <fieldset><legend>尾帧关联</legend><div class="space-y-2 mt-2">
               <button class="ref-choice" :class="{active: tailMode === ''}" :disabled="busy" @click="tailMode = ''; saveOptions()">独立镜头（不关联）</button>
               <button class="ref-choice" :class="{active: tailMode === 'tail_context'}" :disabled="busy" @click="tailMode = 'tail_context'; saveOptions()">尾帧画面参考 · Vision 理解</button>
@@ -593,16 +604,16 @@ onBeforeUnmount(() => window.clearInterval(timer))
           </section>
         </template>
         <p v-if="scope === 'V' && kind === 'image'" class="text-xs text-amber-300">请点击中间的 S 转场镜头，选择要生成的关键帧。</p>
-        <button class="btn w-full" :disabled="busy || !vendor || !currentTarget || (scope === 'V' && kind === 'image') || (kind === 'video' && !capability?.known)" @click="job('generate')">{{ busy ? '提交中…' : `生成${kind === 'image' ? '关键帧' : '视频'}` }}</button>
-        <p class="text-xs text-slate-500">后台执行，可刷新页面。实际时长以生成文件为准；每次产出均保留为候选。</p>
-        <button class="text-xs text-sky-300" :disabled="busy" @click="job('recover', true)">接管未确认请求</button>
+        <button class="btn w-full justify-center" :disabled="busy || !vendor || !currentTarget || (scope === 'V' && kind === 'image') || (kind === 'video' && !capability?.known)" @click="submitCurrent">{{ busy ? '提交中…' : `生成当前${scope === 'V' ? ' V 视频' : kind === 'image' ? ' S 关键帧' : ' S 视频'}` }}</button>
+        <p class="text-xs text-slate-500">后台执行，产出先进入候选，审核后再采用。</p>
+        <details class="text-xs"><summary class="text-sky-300">异常任务处理</summary><button class="mt-2 text-sky-300" :disabled="busy" @click="job('recover', true)">接管未确认请求</button></details>
         <section v-if="scope === 'V' && kind === 'video' && unit?.video_binding" class="space-y-2 rounded-xl border border-white/10 p-3">
           <div class="flex items-center justify-between text-sm"><b>已采用视频</b><span v-if="unit.video_stale" class="text-xs text-amber-300">已采用视频待确认</span></div>
           <video :src="pathUrl(unit.video_binding.path)" controls preload="metadata" class="w-full" />
-          <button class="btn btn-sm w-full" :disabled="busy || !vendor" title="抽首尾锚点帧重做中间段并自动拼回原片" @click="openRedo">局部修补（重做片段）</button>
-          <p class="text-2xs text-slate-500">修补产出只进候选列表，人工采用后剪辑自然归位。</p>
+          <button class="btn btn-sm w-full justify-center" :disabled="busy || !vendor" title="按时间范围重做中间段并拼回原片" @click="openRedo">按时间范围修补</button>
+          <RouterLink to="/studio/redo" class="block text-center text-xs text-sky-300">逐帧选范围重拍 →</RouterLink>
         </section>
-        <section class="space-y-3 border-t border-white/10 pt-4"><div class="flex justify-between text-sm"><b>当前目标产出</b><button @click="gallery">刷新</button></div>
+        <section class="space-y-3 border-t border-white/10 pt-4"><div class="text-sm"><b>当前目标产出</b></div>
           <article v-for="item in candidates" :key="item.id" class="rounded-lg bg-black/25 p-2"><p class="mb-2 text-xs text-slate-400">{{ item.status }} · {{ item.created_at }} <span v-if="elapsedText(item)" class="ml-1 font-bold text-sky-300">已运行 {{ elapsedText(item) }}</span> <span v-if="item.actual_duration">· {{ item.actual_duration }}s</span><span v-if="item.redo" class="ml-1 rounded bg-violet-900/60 px-1.5 py-0.5 text-violet-200" :title="item.redo.anchors ? `锚点：${item.redo.anchors.head} / ${item.redo.anchors.tail}` : ''">修补 {{ item.redo.t0 }}–{{ item.redo.t1 }}s</span></p>
             <video v-if="item.type === 'video' && outputPath(item)" :src="pathUrl(outputPath(item))" controls preload="metadata" class="w-full" />
             <img v-else-if="outputPath(item)" :src="pathUrl(outputPath(item))" class="w-full cursor-zoom-in" :alt="item.shot_id" title="点击查看大图" @click="openImage(outputPath(item), (item.shot_id || item.unit_id || '') + ' 产出')" />
@@ -630,11 +641,11 @@ onBeforeUnmount(() => window.clearInterval(timer))
 </template>
 
 <style scoped>
-.reference-options legend{font-size:12px;color:#94a3b8}.ref-choice{display:block;width:100%;text-align:left;padding:9px;border:1px solid #ffffff20;border-radius:8px;font-size:12px;color:#b9c8db;white-space:normal}.ref-choice.active{background:#075985;border-color:#38bdf8;color:#e0f2fe}.ref-choice:disabled{opacity:.45;cursor:not-allowed}
+.reference-options legend{font-size:13px;color:#b9c8db}.ref-choice{display:block;width:100%;text-align:left;padding:9px;border:1px solid #ffffff30;border-radius:8px;font-size:13px;color:#d1def0;white-space:normal}.ref-choice.active{background:#075985;border-color:#38bdf8;color:#e0f2fe}.ref-choice:disabled{opacity:.45;cursor:not-allowed}
 
 .studio-sidebar{display:flex;flex-direction:column;gap:12px;min-width:0;padding:12px;position:sticky;top:16px;max-height:calc(100dvh - 32px);overflow-y:auto;scrollbar-width:thin}
 .studio-sidebar>label{min-width:0}
-.studio-sidebar .btn{width:100%;justify-content:center;white-space:normal;overflow-wrap:anywhere;font-size:12px;line-height:1.5;min-height:38px}
+.studio-sidebar .btn{width:100%;justify-content:center;white-space:normal;overflow-wrap:anywhere;font-size:13px;line-height:1.5;min-height:40px}
 .studio-sidebar .control{min-width:0;max-width:100%;text-overflow:ellipsis}
 .studio-sidebar .unit-card{flex-shrink:0;cursor:pointer;transition:border-color .15s,background .15s;overflow-wrap:anywhere;color:#dbe5f2}
 .studio-sidebar .unit-card:hover{border-color:#38bdf855;background:#12304866}
@@ -645,5 +656,5 @@ onBeforeUnmount(() => window.clearInterval(timer))
 .studio-sidebar .unit-status.is-pending{color:#fcd34d}
 .studio-sidebar .unit-status.is-ready{color:#6ee7b7}
 @media(max-width:800px){.studio-sidebar{position:static;max-height:none}}
-.studio-columns{display:grid;grid-template-columns:220px minmax(0,1fr) 310px;gap:16px;align-items:start}.control{width:100%;border:1px solid #ffffff18;border-radius:8px;padding:8px;background:#0c1420;color:#dbe5f2;font-size:12px;resize:vertical}.control:focus{outline:1px solid #38bdf8}select.control option{background:#101a27}.unit-card{display:block;width:100%;text-align:left;padding:14px 12px;border:1px solid #ffffff10;border-radius:12px;background:#0a1420}.unit-card b{font-size:13px}.unit-card small{display:block;margin-top:7px;font-size:11px;color:#91a2b8}.selected{border-color:#38bdf888!important;background:#12304844}.reference-and-shots{display:grid;grid-template-columns:125px minmax(0,1fr);gap:14px}.shot-card{border:1px solid #ffffff16;padding:14px;border-radius:14px;background:#090f1880}.shot-grid{display:grid;grid-template-columns:minmax(0,1fr) 190px;gap:12px}.shot-thumb{min-width:0}.shot-thumb img{max-height:190px}.shot-thumb .btn{padding:3px 8px;font-size:10px}@media(max-width:1100px){.shot-grid{grid-template-columns:1fr}.shot-thumb img{max-height:230px}}summary{cursor:pointer}@media(max-width:1250px){.studio-columns{grid-template-columns:180px minmax(0,1fr)}.studio-columns>aside:last-child{grid-column:1/-1}.reference-and-shots{grid-template-columns:100px 1fr}}@media(max-width:800px){.studio-columns{display:block}.studio-columns>*{margin-bottom:12px}.reference-and-shots{display:block}.reference-and-shots>aside{margin-bottom:14px}}
+.studio-columns{display:grid;grid-template-columns:220px minmax(0,1fr) 320px;gap:16px;align-items:start}.control{width:100%;min-height:40px;border:1px solid #ffffff30;border-radius:8px;padding:9px;background:#0c1420;color:#e2e8f0;font-size:14px;line-height:1.5;resize:vertical}.control:focus{outline:2px solid #38bdf8;outline-offset:1px}textarea.control{min-height:88px}textarea.control[rows="4"]{min-height:140px}textarea.control[rows="6"]{min-height:180px}select.control option{background:#101a27}.unit-card{display:block;width:100%;text-align:left;padding:14px 12px;border:1px solid #ffffff28;border-radius:12px;background:#0a1420}.unit-card b{font-size:14px}.unit-card small{display:block;margin-top:7px;font-size:12px;color:#b0c0d4}.selected{border-color:#38bdf888!important;background:#12304844}.reference-and-shots{display:grid;grid-template-columns:150px minmax(0,1fr);gap:14px}.shot-card{border:1px solid #ffffff28;padding:14px;border-radius:14px;background:#090f1880}.shot-grid{display:grid;grid-template-columns:minmax(0,1fr) 210px;gap:12px}.shot-thumb{min-width:0}.shot-thumb img{max-height:210px}.shot-thumb .btn{padding:4px 9px;font-size:11px}@media(max-width:1100px){.shot-grid{grid-template-columns:1fr}.shot-thumb img{max-height:230px}}summary{cursor:pointer}@media(max-width:1250px){.studio-columns{grid-template-columns:200px minmax(0,1fr)}.studio-columns>aside:last-child{grid-column:1/-1}.reference-and-shots{grid-template-columns:130px 1fr}}@media(max-width:800px){.studio-columns{display:block}.studio-columns>*{margin-bottom:12px}.reference-and-shots{display:block}.reference-and-shots>aside{margin-bottom:14px}}
 </style>

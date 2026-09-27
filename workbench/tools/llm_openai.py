@@ -38,6 +38,16 @@ import threading
 # server 进程内会并发跑多个项目的任务，进程级变量会串台。
 _bill_ctx = threading.local()
 
+# 生图重试口径：只认「请求被拒」（限流/厂商侧故障），这类失败一定没出图、没扣费。
+# 与 creation_pipeline.RETRYABLE 不同——那边连"超时"都能重试（文本无产出损失），
+# 生图超时重试可能把已生成、已计费的图再买一次。
+RETRYABLE_MEDIA = ("429", "HTTP 5", "too many requests", "rate limit", "限流")
+
+
+def _rate_limited(msg):
+    low = str(msg or "").lower()
+    return any(w.lower() in low for w in RETRYABLE_MEDIA)
+
 
 def set_billing_project(name):
     """设定当前线程后续 AI 调用记账归属的项目名；传空=取消归属。"""
@@ -307,20 +317,29 @@ class VendorClient:
     def generate_image(self, prompt, out_path, model=None, timeout=900, extra=None, negative_prompt=None,
                        image_refs=None, strict_negative=False, mode="generate"):
         """生图入口（记账包装）：成功计费一次（units images=1），VendorError 记 ok=false。
-        ComfyUI（本地）与 ChatGPT 网页队列为免费通道，不计账。"""
+        ComfyUI（本地）与 ChatGPT 网页队列为免费通道，不计账。
+        批量并发时厂商限流（429/5xx）自动退避重试；**超时不重试**——图可能已经生成并计费，
+        重来一次就是二次扣费（文本 chat_retry 可以重试超时，是因为文本没有产出损失）。"""
         image_kind = "image_edit" if str(mode or "generate").lower() == "edit" else "image"
         resolved_model = model or self.models.get(image_kind) or ""
         if self.id in ("local-comfyui", "chatgpt-queue"):
             return self._generate_image_impl(prompt, out_path, model=model, timeout=timeout, extra=extra,
                                              negative_prompt=negative_prompt, image_refs=image_refs,
                                              strict_negative=strict_negative, mode=mode)
-        try:
-            out = self._generate_image_impl(prompt, out_path, model=model, timeout=timeout, extra=extra,
-                                            negative_prompt=negative_prompt, image_refs=image_refs,
-                                            strict_negative=strict_negative, mode=mode)
-        except VendorError as e:
-            self._bill(image_kind, resolved_model, "generate_image", ok=False, error=str(e))
-            raise
+        wait = 5
+        for attempt in range(3):
+            try:
+                out = self._generate_image_impl(prompt, out_path, model=model, timeout=timeout, extra=extra,
+                                                negative_prompt=negative_prompt, image_refs=image_refs,
+                                                strict_negative=strict_negative, mode=mode)
+                break
+            except VendorError as e:
+                if attempt == 2 or not _rate_limited(str(e)):
+                    self._bill(image_kind, resolved_model, "generate_image", ok=False, error=str(e))
+                    raise
+                print(f"[限流] {self.id} 生图被拒（{str(e)[:70]}），{wait}s 后第 {attempt + 2} 次", flush=True)
+                time.sleep(wait)
+                wait = min(60, wait * 2)
         self._bill(image_kind, resolved_model, "generate_image", ok=True, units={"images": 1})
         return out
 

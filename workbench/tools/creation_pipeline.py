@@ -437,7 +437,7 @@ def cmd_units(proj, vendor, eps_n=0, arc_size=6, do_anchor=False, stage="all"):
     if do_anchor and failed:
         print("[未锚定] 有批次没完成，不锚定——先把缺的段补齐（重跑本命令）再锚，否则权威底是半张。", flush=True)
     elif do_anchor:
-        done = story_units.anchor(proj, force=not report["ok"])
+        done = story_units.anchor(proj, force=False)
         if done.get("ok"):
             print(f"[已锚定] anchor_rev=v{done['anchor_rev']}；第二步逐集扩写将吃这套最小单元", flush=True)
         else:
@@ -763,6 +763,31 @@ def reconcile_characters(proj, cli, full_text):
     return n
 
 
+ASSET_DOCUMENTS = {
+    "人物": ("人物.json", "characters"),
+    "场景": ("场景.json", "scenes"),
+    "道具": ("道具.json", "props"),
+}
+
+
+def load_asset_documents(proj):
+    """读取三类权威资产档案，返回 ``(documents, combined)``。"""
+    base = os.path.join(proj, "素材")
+    documents = {}
+    combined = {key: [] for _, key in ASSET_DOCUMENTS.values()}
+    for name, (filename, key) in ASSET_DOCUMENTS.items():
+        path = os.path.join(base, filename)
+        try:
+            raw = json.load(open(path, encoding="utf-8")) if os.path.isfile(path) else {}
+        except (OSError, ValueError) as exc:
+            raise ValueError(f"既有{name}资产无法读取：{exc}") from exc
+        doc = raw if isinstance(raw, dict) else {}
+        rows = doc.get(key) or []
+        documents[name] = doc
+        combined[key] = rows if isinstance(rows, list) else []
+    return documents, combined
+
+
 def _extract_one(proj, cli, name, text, combined, documents=None, paths=None, keys=None,
                  known=None, style_text="", ep_id=""):
     """单一资产类的提炼单元：一次 LLM 调用 → 门控 → 合并 → 落盘。
@@ -771,10 +796,9 @@ def _extract_one(proj, cli, name, text, combined, documents=None, paths=None, ke
     也可被 /api/extract/one 单独调用，实现最小单元重跑。
     返回更新后的 combined。
     """
-    paths = paths or {"人物": os.path.join(proj, "素材", "人物.json"),
-                      "场景": os.path.join(proj, "素材", "场景.json"),
-                      "道具": os.path.join(proj, "素材", "道具.json")}
-    keys = keys or {"人物": "characters", "场景": "scenes", "道具": "props"}
+    paths = paths or {name: os.path.join(proj, "素材", filename)
+                      for name, (filename, _key) in ASSET_DOCUMENTS.items()}
+    keys = keys or {name: key for name, (_filename, key) in ASSET_DOCUMENTS.items()}
     out = paths[name]
     catalog = _asset_catalog(combined)
     if name == "人物":
@@ -848,7 +872,8 @@ def _extract_one(proj, cli, name, text, combined, documents=None, paths=None, ke
 # 留在接缝上（09_仙 zhijing 的"纯白背景。，纯白背景"就是这么来的），而在已迁移过的档案上
 # 再跑一次迁移会把模板叠两遍（同一份提示词里"五视图设定图"出现 2 次）。两者都是幂等缺口。
 _LEGACY_LAYOUT_PREFIXES = ("正面、侧面、背面三视图，纯白背景；", "正面、侧面、背面三视图，纯白背景。",
-                           "正面、侧面、背面三视图。", "正面、侧面、背面三视图，", "三视图，纯白背景；", "三视图。")
+                           "正面、侧面、背面三视图。", "正面、侧面、背面三视图，", "三视图，纯白背景；", "三视图。",
+                           "五视图设定图：", "五视图设定图（一张图内从左到右五段）：")
 
 
 def strip_layout(text):
@@ -921,20 +946,9 @@ def cmd_extract(proj, vendor, ep_id):
         print("[错误] 无剧本文本（先 episodes 或导入剧本）"); sys.exit(1)
     cli = VendorClient(pick_vendor(vendor))
     base = os.path.join(proj, "素材")
-    paths = {"人物": os.path.join(base, "人物.json"),
-             "场景": os.path.join(base, "场景.json"),
-             "道具": os.path.join(base, "道具.json")}
-    keys = {"人物": "characters", "场景": "scenes", "道具": "props"}
-    documents = {}
-    combined = {"characters": [], "scenes": [], "props": []}
-    for name, out in paths.items():
-        try:
-            raw = json.load(open(out, encoding="utf-8")) if os.path.isfile(out) else {}
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"既有{name}资产无法读取：{exc}")
-        documents[name] = raw if isinstance(raw, dict) else {}
-        rows = documents[name].get(keys[name]) or []
-        combined[keys[name]] = rows if isinstance(rows, list) else []
+    paths = {name: os.path.join(base, filename) for name, (filename, _key) in ASSET_DOCUMENTS.items()}
+    keys = {name: key for name, (_filename, key) in ASSET_DOCUMENTS.items()}
+    documents, combined = load_asset_documents(proj)
     # 先把历史档案归一化，再把目录交给 LLM。否则旧数据中“derived_from=道具、
     # parent_ref=角色”的错误关系会继续成为模型的错误示范，下一次提炼会复制它。
     relation_mod = getattr(script_repository, "asset_relations", None)
@@ -1119,7 +1133,8 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
         print("[错误] LLM 未产出 shots:\n" + txt[:400]); sys.exit(1)
     from production_prompts import require_prompts, normalize_prompts, source_hash
     from production_studio import (default_units, validate_units, shot_list, retain_production, auto_split_units,
-                                   fit_speech_budget, SPEECH_RATE, SHOT_DURATION_MIN, SHOT_DURATION_MAX)
+                                   fit_speech_budget, timing_conflicts, SPEECH_RATE,
+                                   SHOT_DURATION_MIN, SHOT_DURATION_MAX)
     require_prompts(shots)
     for shot in shots:
         normalize_prompts(shot)
@@ -1133,6 +1148,7 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
              "cam": ["wide", "two", "cu", "ots"], "scene": ["room", "field"]}
     name2id = _speaker_id_map(chars)
     seen = set()
+    storyboard_time_conflicts = []
     for i, s in enumerate(shots, 1):
         sid = str(s.get("id") or f"S{i}")
         k = 2
@@ -1158,11 +1174,9 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
                 L["speaker"] = "narrator"
             L["at"] = round(max(0.0, float(L.get("at") or 0)), 2)
             L["dur"] = round(max(0.8, float(L.get("dur") or 2)), 2)
-            if L["at"] + L["dur"] > s["dur"]:
-                print(f"[警告] {s['id']} 台词超镜（at={L['at']} dur={L['dur']} > 镜长 {s['dur']}），已夹取到镜内："
-                      f"{str(L.get('line') or L.get('text') or '')[:20]}", flush=True)
-                L["at"] = round(max(0.0, s["dur"] - 0.8), 2)
-                L["dur"] = round(max(0.8, s["dur"] - L["at"]), 2)
+        storyboard_time_conflicts.extend(
+            timing_conflicts({"shots": [s]}, {"shot_ids": [sid], "duration": s["dur"]})
+        )
         if s.get("speaker") in name2id:
             s["speaker"] = name2id[s["speaker"]]
         if is_narrator(s.get("speaker")):
@@ -1189,6 +1203,9 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
             if asset_line not in prompt:
                 s["prompt"] = (prompt + "\n" if prompt else "") + asset_line
         s["move"] = "·".join(x for x in (s.get("shot_size"), s.get("camera_move"), s.get("angle")) if x)
+    if storyboard_time_conflicts:
+        print("[错误] 分镜时间预算冲突，已拒绝写入：" + "；".join(storyboard_time_conflicts), flush=True)
+        sys.exit(1)
     cfg = {"project": os.path.basename(proj).rstrip("/") + "_剧本" + (f"_{ep_id}" if ep_id else ""),
            "title": (f"剧本创作 · {ep_id}" if ep_id else "剧本创作 · 全本"),
            "w": 960, "h": 540, "fps": 24, "set": {}, "env": {},
@@ -1303,7 +1320,8 @@ def split_units_by_scene(cfg, units):
 
 def collect_plans(proj):
     """扫 推演/平面图_*.plan.json（plan v1）→ 组装/页面共用的清单（mtime 降序，最新在前）。
-    每张：{name, scene_ref, counts(props/actors/paths 数), validate_ok, canvas_html, path, mtime}；
+    每张：{name, scene_ref, counts, validate_ok, judge_ok, judge_reasons, approval_state,
+    canvas_html, path, mtime}；
     scene_ref = plan 绑定的场景资产 id（--scene 生成时写入，老图没有为 None）；
     canvas_html = 对应 战略图_平面图_<名>.html 存在则填相对路径否则 None。
     validate_plan 缺失/异常时 validate_ok=None（不阻断组装）。"""
@@ -1320,9 +1338,16 @@ def collect_plans(proj):
             validate_ok = not validate_document(plan)["errors"]
         except Exception:
             validate_ok = None
+        judge = plan.get("_judge") if isinstance(plan.get("_judge"), dict) else None
+        judge_ok = judge.get("ok") if judge is not None else None
+        approval_state = ("approved" if judge_ok is True else
+                          "rejected" if judge_ok is False else "legacy_unreviewed")
         canvas = os.path.join(proj, "推演", f"战略图_平面图_{name}.html")
         out.append({"name": name, "scene_ref": plan.get("scene_ref") or None,
                     "counts": counts, "validate_ok": validate_ok,
+                    "judge_ok": judge_ok,
+                    "judge_reasons": list((judge or {}).get("reasons") or []),
+                    "approval_state": approval_state,
                     "canvas_html": f"推演/战略图_平面图_{name}.html" if os.path.isfile(canvas) else None,
                     "path": fp, "mtime": os.path.getmtime(fp)})
     out.sort(key=lambda r: -r["mtime"])
@@ -1532,13 +1557,7 @@ def main():
         style_text = (skill_lib.style_for(proj, "image") if str(st.get("image") or "").strip() else "").strip()
         # 单类重跑也要读全量既有档案做合并与目录（道具依赖人物/场景 @ 引用）
         base = os.path.join(proj, "素材")
-        keys = {"人物": "characters", "场景": "scenes", "道具": "props"}
-        combined = {"characters": [], "scenes": [], "props": []}
-        for nm, fn in keys.items():
-            try: raw = json.load(open(os.path.join(base, fn + ".json"), encoding="utf-8"))
-            except Exception: raw = {}
-            rows = (raw if isinstance(raw, dict) else {}).get(fn) or []
-            combined[fn] = rows if isinstance(rows, list) else []
+        documents, combined = load_asset_documents(proj)
         relation_mod = getattr(script_repository, "asset_relations", None)
         if relation_mod is not None:
             combined, _ = relation_mod.normalize_asset_relations(combined)

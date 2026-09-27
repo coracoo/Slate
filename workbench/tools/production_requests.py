@@ -119,6 +119,9 @@ def compile_request(project, body, cfg):
     kind = body['type']
     if not prompt.strip(): raise ValueError('当前类型的提示词为空，请先由 LLM 补全或手动编辑')
     if kind not in ('image', 'video'): raise ValueError('制作请求只支持关键帧或视频')
+    if kind == 'video':
+        from production_studio import require_timing_budget
+        require_timing_budget(board, unit)
     # 制作规格（E05）：画幅缺省读 brief.aspect_ratio；无 brief 保持 16:9
     aspect = aspect_ratio_of(project)
     video_options = settings(cfg, {**(body.get('video_options') or {}), 'duration': unit['duration']}) if kind == 'video' else {}

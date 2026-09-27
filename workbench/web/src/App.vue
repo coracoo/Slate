@@ -81,7 +81,6 @@ const navItems = [
   { key: 'acting', to: '/acting', label: '⑤ 演员表现', icon: 'user', group: '制作' },
   { key: 'package', to: '/package', label: '⑥ 平面推演', icon: 'box3d', group: '制作' },
   { key: 'create', to: '/create', label: '⑦ 创作生成', icon: 'wand', group: '制作' },
-  { key: 'shotRedo', to: '/studio/redo', label: '片段重拍', icon: 'frames', group: '制作' },
   { key: 'free', to: '/create/free', label: '⑧ 自由创作', icon: 'wand', group: '制作' },
   { key: 'lapian', to: '/lapian', label: '① 拉片结构', icon: 'clapper', group: '拉片' },
   { key: 'lines', to: '/lines', label: '② 台词分析', icon: 'chat', group: '拉片' },
@@ -92,8 +91,7 @@ const navItems = [
   { key: 'white3d', to: '/white3d', label: '② 辅助·Blender', icon: 'box3d', group: '系统' },
   { key: 'skills', to: '/skills', label: '③ Skill 配置', icon: 'book', group: '系统' },
   { key: 'env', to: '/env', label: '④ 环境检查', icon: 'server', group: '系统' },
-  { key: 'blender', to: '/blender', label: '⑤ Blender 配置', icon: 'wrench', group: '系统' },
-  { key: 'billing', to: '/billing', label: '⑥ 用量计费', icon: 'chart', group: '系统' }
+  { key: 'billing', to: '/billing', label: '⑤ 用量计费', icon: 'chart', group: '系统' }
 ]
 
 watch(
@@ -138,7 +136,7 @@ watch(showShell, (v) => { if (v && !isGuest()) void loadBasics() })
         </div>
       </div>
 
-      <nav class="flex-1 space-y-1 px-3">
+      <nav class="min-h-0 flex-1 space-y-1 overflow-y-auto px-3 pb-3" aria-label="工作台导航">
         <template v-for="r in navItems" :key="r.key">
           <div v-if="r.group && r.group !== (navItems[navItems.indexOf(r)-1]?.group || '')"
             class="mt-3 mb-1 px-3 text-2xs font-black tracking-[0.25em] text-slate-500">{{ r.group }}</div>
@@ -148,7 +146,7 @@ watch(showShell, (v) => { if (v && !isGuest()) void loadBasics() })
           custom
         >
           <button
-            class="group flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-[13px] transition-all duration-200"
+            class="group flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm transition-all duration-200"
             :class="isActive
               ? 'font-bold text-white shadow-lg'
               : 'text-slate-400 hover:bg-white/5 hover:text-slate-200'"
@@ -180,7 +178,7 @@ watch(showShell, (v) => { if (v && !isGuest()) void loadBasics() })
       </div>
 
       <!-- GitHub 更新检查（左下角，1 小时轮询）+ 退出登录 -->
-      <div class="mt-auto border-t border-white/5 p-3 text-[10px]">
+      <div class="mt-auto border-t border-white/5 p-3 text-[11px]">
         <div v-if="update?.supported" class="mb-2">
           <button class="flex w-full items-center gap-1.5 rounded-lg px-1 py-1 hover:bg-white/5" @click="updateOpen = !updateOpen">
             <span class="h-1.5 w-1.5 rounded-full" :class="update.behind ? 'bg-amber-400' : (update.ahead ? 'bg-sky-400' : 'bg-emerald-400')"></span>

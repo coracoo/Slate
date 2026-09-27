@@ -178,6 +178,16 @@ class ProductionExecutionTests(unittest.TestCase):
         self.assertNotIn('三视图', req['prompt'])
         self.assertNotIn('纯白背景', req['prompt'])
 
+    def test_compile_request_rejects_dialogue_that_cannot_fit_before_submission(self):
+        from production_prompts import source_hash
+        from production_requests import compile_request
+        self.board['shots'][0]['lines'] = [{'speaker': 'hero', 'line': '字' * 80, 'at': 0, 'dur': 20}]
+        unit = self.board['video_units'][0]
+        unit['source_hash'] = source_hash(self.board['shots'])
+        self.path.write_text(json.dumps(self.board), encoding='utf-8')
+        with self.assertRaisesRegex(ValueError, '时间预算冲突'):
+            compile_request(self.root, {**self.body, 'duration': 15}, self.cfg)
+
     def test_request_keeps_all_keyframes_and_video_only_prompt(self):
         from production_requests import compile_request
         req = compile_request(self.root, self.body, self.cfg)
@@ -211,7 +221,7 @@ class ProductionExecutionTests(unittest.TestCase):
         self.assertEqual(digest(self.root / req['refs'][0]['path']), req['refs'][0]['sha256'])
         with self.assertRaises(ValueError): enqueue(self.root, {**self.body, 'duration': 9}, spawn, self.providers)
 
-    def test_worker_forwards_model_duration_and_adopts_matching_output(self):
+    def test_worker_forwards_model_duration_and_keeps_output_as_candidate(self):
         from production_jobs import enqueue, execute
         first = enqueue(self.root, self.body, Mock(return_value=100), self.providers)
         req = json.loads((self.root / '创作' / first['item_id'] / 'request.json').read_text(encoding='utf-8'))
@@ -228,7 +238,7 @@ class ProductionExecutionTests(unittest.TestCase):
         self.assertEqual(result['status'], 'done')
         self.assertIsInstance(result['outputs'][0], str)
         saved = json.loads(self.path.read_text(encoding='utf-8'))
-        self.assertEqual(saved['video_units'][0]['video_binding']['item_id'], first['item_id'])
+        self.assertNotIn('video_binding', saved['video_units'][0], '生成成功只能登记候选，采用必须由用户明确触发')
         with self.assertRaises(ValueError): execute(req, self.providers)
         self.assertEqual(client.generate_video.call_count, 1)
 
@@ -285,6 +295,7 @@ class ProductionExecutionTests(unittest.TestCase):
         perf = {'status': 'ready', 'source_hash': '',
                 'packet': {'actors': [{'actor_id': 'c', 'beats': [{'at': 0, 'duration': 2, 'intent': '施压', 'posture': '前倾按案'}]}]}}
         self.board['shots'][0]['performance'] = copy.deepcopy(perf)
+        self.board['shots'][0]['keyframe']['source_hash'] = media_source_hash([self.board['shots'][0]], 'image')
         self.path.write_text(json.dumps(self.board), encoding='utf-8')
         r2 = compile_request(self.root, body, self.cfg)
         self.assertIn('表演指导', r2['prompt']); self.assertIn('施压', r2['prompt'])
@@ -292,11 +303,13 @@ class ProductionExecutionTests(unittest.TestCase):
         self.assertEqual(strip(r1['prompt']), strip(r2['prompt']))   # 表演段之外逐字不变
         perf['packet']['actors'][0]['beats'][0]['intent'] = '隐忍'
         self.board['shots'][0]['performance'] = copy.deepcopy(perf)
+        self.board['shots'][0]['keyframe']['source_hash'] = media_source_hash([self.board['shots'][0]], 'image')
         self.path.write_text(json.dumps(self.board), encoding='utf-8')
         r3 = compile_request(self.root, body, self.cfg)
         self.assertNotEqual(r2['prompt'], r3['prompt']); self.assertIn('隐忍', r3['prompt'])
         # 过期表演（source_hash 不匹配）静默不注入
         self.board['shots'][0]['performance'] = {**copy.deepcopy(perf), 'source_hash': 'stale'}
+        self.board['shots'][0]['keyframe']['source_hash'] = media_source_hash([self.board['shots'][0]], 'image')
         self.path.write_text(json.dumps(self.board), encoding='utf-8')
         r4 = compile_request(self.root, body, self.cfg)
         self.assertNotIn('表演指导', r4['prompt'])
@@ -306,16 +319,17 @@ class ProductionExecutionTests(unittest.TestCase):
                         {'at': 0, 'duration': 1, 'intent': '起势', 'posture': '后仰'},
                         {'at': 2, 'duration': 1, 'intent': '落定', 'gaze': '直锁对方'}]}]}}
         self.board['shots'][0]['performance'] = img_perf
+        self.board['shots'][0]['keyframe']['source_hash'] = media_source_hash([self.board['shots'][0]], 'image')
         self.path.write_text(json.dumps(self.board), encoding='utf-8')
         r5 = compile_request(self.root, {**body, 'scope': 'S', 'target': 'S1', 'type': 'image'}, self.cfg)
         self.assertIn('落定', r5['prompt']); self.assertNotIn('起势', r5['prompt'])
-        # 采用表演 → video 指纹联动（提示重生成）、image 关键帧指纹不受影响
+        # 采用表演 → 图片与视频指纹联动；关键帧也消费演员最终姿态，必须重生成或重新采用。
         unit = self.board['video_units'][0]
         with_perf = media_source_hash(self.board['shots'], 'video', unit)
         no_perf = media_source_hash([{**x, 'performance': None} for x in self.board['shots']], 'video', unit)
         self.assertNotEqual(with_perf, no_perf)
-        self.assertEqual(media_source_hash(self.board['shots'][:1], 'image', None),
-                         media_source_hash([{**self.board['shots'][0], 'performance': None}], 'image', None))
+        self.assertNotEqual(media_source_hash(self.board['shots'][:1], 'image', None),
+                            media_source_hash([{**self.board['shots'][0], 'performance': None}], 'image', None))
 
     def test_authored_s_and_v_survive_llm_refresh(self):
         from production_jobs import llm_task
@@ -347,6 +361,29 @@ class ProductionExecutionTests(unittest.TestCase):
         s = self.board['shots'][0]; old_frame = media_source_hash([s], 'image')
         s['prompt_video'] = '新动作写法'; s['prompt_grid'] = '新格序'
         self.assertEqual(old_frame, media_source_hash([s], 'image'))
+
+    def test_consumed_camera_and_performance_fields_invalidate_media(self):
+        from production_prompts import source_hash, media_source_hash
+        shot = copy.deepcopy(self.board['shots'][0])
+        base_source = source_hash([shot])
+        base_image = media_source_hash([shot], 'image')
+        base_video = media_source_hash([shot], 'video', self.board['video_units'][0])
+        for field, value in (('lens', '50mm'), ('pos', [1, 2, 3])):
+            changed = copy.deepcopy(shot); changed[field] = value
+            self.assertNotEqual(base_source, source_hash([changed]), field)
+            self.assertNotEqual(base_image, media_source_hash([changed], 'image'), field)
+            self.assertNotEqual(base_video, media_source_hash([changed], 'video', self.board['video_units'][0]), field)
+        performed = copy.deepcopy(shot)
+        performed['performance'] = {'status': 'ready', 'source_hash': '', 'packet': {'actors': [
+            {'actor_id': 'c', 'beats': [{'at': 0, 'duration': 1, 'visible_action': '握拳'}]},
+        ]}}
+        self.assertNotEqual(base_image, media_source_hash([performed], 'image'))
+        self.assertNotEqual(base_video, media_source_hash([performed], 'video', self.board['video_units'][0]))
+        changed_action = copy.deepcopy(performed)
+        changed_action['performance']['packet']['actors'][0]['beats'][0]['visible_action'] = '松手'
+        self.assertNotEqual(media_source_hash([performed], 'image'), media_source_hash([changed_action], 'image'))
+        self.assertNotEqual(media_source_hash([performed], 'video', self.board['video_units'][0]),
+                            media_source_hash([changed_action], 'video', self.board['video_units'][0]))
 
     def test_changed_provider_stops_before_paid_submission(self):
         from production_jobs import enqueue, execute

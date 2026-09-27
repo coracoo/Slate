@@ -101,7 +101,7 @@ function redoTag(item: ProductionItem) {
 
 <template>
   <div class="page-wide">
-    <header class="mb-5 flex items-end justify-between"><div><h1 class="grad-text text-2xl font-black">片段重拍</h1><p class="mt-1 text-xs text-slate-500">选 V → 选版本 → 抽帧选首尾（可空）→ 重拍 → 一键合并，落库为 V标签_首_尾_vN 新候选；整段 V 重做请走⑦创作生成</p></div></header>
+    <header class="mb-5"><h1 class="grad-text text-2xl font-black">片段重拍</h1><p class="mt-1 text-sm text-slate-400">选择已生成视频的时间范围，重拍后合并为新候选。</p></header>
     <p v-if="error" role="alert" class="mb-4 rounded-lg bg-rose-950/50 p-3 text-rose-200">{{ error }}</p>
     <label class="mb-4 block max-w-md text-xs text-slate-400">分镜<select v-model="board" class="control mt-1"><option v-for="b in boards" :key="b">{{ b }}</option></select></label>
     <div class="grid items-start gap-5 lg:grid-cols-[230px_minmax(0,1fr)]">

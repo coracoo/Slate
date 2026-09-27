@@ -76,21 +76,21 @@ export const routes = [
   },
   {
     path: '/studio/asset/voices', name: 'voiceAssets', component: () => import('./views/VoiceAssetsView.vue'),
-    meta: { title: '角色音色', c1: '#a78bfa', c2: '#ec4899', icon: 'box3d' }
+    meta: { title: '④ 音色绑定', c1: '#a78bfa', c2: '#ec4899', icon: 'box3d' }
   },
   {
     path: '/studio/redo', name: 'shotRedo', component: () => import('./views/ShotRedoView.vue'),
-    meta: { title: '片段重拍', c1: '#f472b6', c2: '#a78bfa', icon: 'frames' }
+    meta: { title: '⑦ 创作生成 · 片段重拍', c1: '#f472b6', c2: '#a78bfa', icon: 'frames' }
   },
   {
     path: '/create/free', name: 'freeCreate', component: () => import('./views/CreateView.vue'),
-    meta: { title: '自由创作与画廊', c1: '#a78bfa', c2: '#ec4899', icon: 'clapper' }
+    meta: { title: '⑧ 自由创作', c1: '#a78bfa', c2: '#ec4899', icon: 'clapper' }
   },
   {
     path: '/blender',
     name: 'blender',
     component: () => import('./views/BlenderView.vue'),
-    meta: { title: '⑤ Blender 配置', c1: '#fb923c', c2: '#fbbf24', icon: 'wrench' }
+    meta: { title: '② 辅助·Blender · 连接配置', c1: '#fb923c', c2: '#fbbf24', icon: 'wrench' }
   },
   {
     path: '/explain',
@@ -114,7 +114,7 @@ export const routes = [
     path: '/billing',
     name: 'billing',
     component: () => import('./views/BillingView.vue'),
-    meta: { title: '用量计费', c1: '#34d399', c2: '#22d3ee', icon: 'chart' }
+    meta: { title: '⑤ 用量计费', c1: '#34d399', c2: '#22d3ee', icon: 'chart' }
   },
   {
     path: '/package',
@@ -138,4 +138,3 @@ export const router = createRouter({
 router.afterEach((to) => {
   document.title = `${(to.meta.title as string) || ''} · AI 短片分析工作台`
 })
-

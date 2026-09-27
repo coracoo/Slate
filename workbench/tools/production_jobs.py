@@ -132,11 +132,13 @@ def compile_grid_request(project, body, cfg):
 
     宫格分两级，各自独立：scope=S = 本镜自己的多格动作板（范围小）；
     scope=V = 整段混排（范围大，覆盖全部 S）。
-    参考图 = 对应范围解析出的身份/场景锚点（去重后最多 4 张），保证格间人物与场景一致；
+    参考图 = 对应范围解析出的身份/场景锚点；按最终路由模型的能力校验，超限明确失败；
     产出登记为图片候选（item.grid=True），供页面预览与视频 ref_mode=grid 复用。
     """
     from prompt_assembler import resolve_shot_refs
     from creation_media import image_route
+    from brief import aspect_ratio_of
+    from reference_limits import reference_limit
     board, revision = read_board(project, body['board'])
     if body.get('revision') and body['revision'] != revision: raise ValueError('分镜已被修改，请刷新后重试')
     target = str(body.get('target') or '')
@@ -179,9 +181,11 @@ def compile_grid_request(project, body, cfg):
                 if nm not in missing: missing.append(nm)
     if missing:
         raise ValueError('引用素材不全：' + '、'.join(missing) + ' 缺少设定图。请在当前 V 的「引用素材」区点「生成」补齐后，再生成宫格图')
-    layout_line = f'布局：{layout}。' if layout else '布局：3×3 九宫格，共 9 格（3 列 × 3 行），格子间细白线分隔，按从左到右、从上到下的顺序叙述。'
+    aspect = aspect_ratio_of(project)
+    layout_line = (f'布局：{layout}。' if layout else
+                   '布局：3×3 九宫格，共 9 格（3 列 × 3 行），格子间细白线分隔，按从左到右、从上到下的顺序叙述。')
     prompt = ('生成一张完整的影视分镜故事板宫格图（一张图内含多个格子）。' + layout_line +
-              '整图为 16:9 横构图（strictly 16:9 landscape aspect ratio），9 个格子按 3 列 × 3 行均匀铺满整幅画面，不多不少正好 9 格。'
+              f'整图画幅严格为 {aspect}，只遵循上面的分格布局，不增减格子。'
               '把以下剧情按时间顺序分到各格，每格一个关键瞬间并轮换景别（远景/中景/近景/特写交替）；'
               '所有格子中人物外貌、发型、服装、体型完全一致，场景空间与色调统一；格内不要任何文字或字幕。\n剧情：' + story)
     negs = []
@@ -191,17 +195,22 @@ def compile_grid_request(project, body, cfg):
     negative = '；'.join(dict.fromkeys([negative_head, '文字、水印、字幕、边框'] + [str(n) for n in negs if n])).strip('；')
     refs, seen = [], set()
     for s in members:
-        for r in resolve_shot_refs(s, str(project), actors=board.get('actors'), board_name=body['board'], max_refs=4, board=board):
+        for r in resolve_shot_refs(s, str(project), actors=board.get('actors'), board_name=body['board'], max_refs=100, board=board):
             if r.get('path') and r['path'] not in seen:
                 seen.add(r['path'])
                 refs.append({'path': r['path'], 'sha256': digest(inside(project, r['path'])), 'purpose': r.get('purpose') or '身份/场景锚点'})
-    refs = refs[:4]
     _, image_mode, model = image_route(cfg, bool(refs))
+    limit = reference_limit(cfg.get('id', ''), model, 'image_edit' if refs else 'image', cfg)
+    if len(refs) > limit:
+        raise ValueError(
+            f'当前模型 {model or "未配置"} 的参考图上限为 {limit} 张，但本宫格需要 {len(refs)} 张；'
+            '请更换支持更多参考图的模型，或拆分创作范围'
+        )
     return {'scope': 'S' if is_shot else 'V', 'target': target, 'label': label, 'board': body['board'], 'board_revision': revision,
             'shots': copy.deepcopy(members), 'unit': copy.deepcopy(unit),
             'source_hash': media_source_hash(members, 'image', unit), 'type': 'image',
             'prompt': prompt, 'negative': negative, 'refs': refs, 'ref_mode': 'reference', 'prompt_grid': layout,
-            'video_options': {}, 'image_options': {'ratio': '16:9'}, 'audio_urls': [], 'video_urls': [],
+            'video_options': {}, 'image_options': {'ratio': aspect}, 'audio_urls': [], 'video_urls': [],
             'audio_media': [], 'video_media': [],
             'duration': unit.get('duration') if unit else members[0].get('dur'), 'continuity': {}, 'vendor_id': cfg['id'],
             'model': model, 'image_mode': image_mode, 'include_voices': False, 'voices': [], 'plan_refs': 0}
@@ -597,16 +606,7 @@ def execute(packet, providers):
         record = register_output(project, {'id': ident, 'type': packet['type'], 'board': packet.get('board', ''),
                                           'shot_id': packet.get('target', ''), 'vendor_id': packet.get('vendor_id', '')}, out)
         if record: update(**record)
-        # 空槽且源未变才自动采用；重跑只产生候选。
-        if action == 'generate':
-            board, rev = read_board(project, packet['board'])
-            target = next((s for s in (board['shots'] if packet['scope'] == 'S' else board.get('video_units', [])) if s['id'] == packet['target']), None)
-            if target:
-                members = [target] if packet['scope'] == 'S' else shot_list(board, target)
-                field = 'keyframe' if packet['type'] == 'image' else 'video_binding'
-                target_unit = target if packet['scope'] == 'V' else shot_unit(board, target)
-                if not target.get(field) and media_source_hash(members, packet['type'], target_unit) == packet['source_hash']:
-                    adopt(project, {**packet, 'item_id': ident, 'revision': rev})
+        # 所有媒体只登记为候选；采用会改变后续参考链，必须由用户在画廊明确触发。
     except Exception as exc:
         if media_done:
             update(archive_error=str(exc)[:2000])

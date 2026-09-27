@@ -2,6 +2,8 @@
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -35,9 +37,9 @@ class _FakeClient:
         Path(out).write_bytes(b"fake-image")
 
 
-def _run_main(gen, project, *extra_args):
+def _run_main(gen, project, *extra_args, client=None):
     """以桩厂商跑 gen_asset_images.main()，返回 (exit_code, fake_client)。"""
-    client = _FakeClient()
+    client = client or _FakeClient()
     argv = ["gen_asset_images.py", str(project)] + list(extra_args)
     with mock.patch.object(gen, "pick_vendor", lambda v=None: client.id), \
          mock.patch.object(gen, "VendorClient", lambda vid: client), \
@@ -97,6 +99,42 @@ class AssetGenerationReferenceTests(unittest.TestCase):
             self.assertEqual(states["S2"]["prompt"], "仅索引持有")
             self.assertEqual(states["S1"]["episodes"], ["E1"], "补缺跳过分支也要带 episodes/camp")
             self.assertEqual(states["S1"]["camp"], "敌")
+
+    def test_existing_images_keep_generation_provenance_and_only_record_new_desired_spec(self):
+        """补缺运行不能把旧像素伪装成由当前提示词和当前 Skill 生成。"""
+        gen = _load_gen()
+        src_file, rows_key, _pfield, zone = gen.KINDS["character"]
+        with tempfile.TemporaryDirectory() as td:
+            project = Path(td)
+            (project / "素材" / zone).mkdir(parents=True)
+            (project / "素材" / src_file).write_text(json.dumps({rows_key: [{
+                "id": "hero", "name": "英雄", "sheet_prompt": "新的全身立绘",
+                "states": [{"id": "S1", "label": "新阶段", "episodes": ["E2"],
+                            "camp": "友", "sheet_prompt": "新的白衬衫"}],
+            }]}, ensure_ascii=False), encoding="utf-8")
+            for name in ("hero.png", "hero__S1.png"):
+                (project / "素材" / zone / name).write_bytes(b"old-pixels")
+            old_skill = {"image": {"id": "old", "sha12": "123"}}
+            (project / "素材" / "素材图.json").write_text(json.dumps({zone: {
+                "hero": {"path": f"素材/{zone}/hero.png", "prompt": "旧母图提示词",
+                         "skill_snapshot": old_skill, "states": {
+                             "S1": {"path": f"素材/{zone}/hero__S1.png", "prompt": "旧状态提示词",
+                                    "skill_snapshot": old_skill, "label": "旧阶段"}
+                         }}
+            }}, ensure_ascii=False), encoding="utf-8")
+            with mock.patch.object(gen.skill_lib, "skill_snapshot_for", return_value={"image": {"id": "new", "sha12": "456"}}):
+                _run_main(gen, project, "--kind", "character", "--id", "hero")
+            saved = json.loads((project / "素材" / "素材图.json").read_text(encoding="utf-8"))[zone]["hero"]
+            self.assertEqual(saved["prompt"], "旧母图提示词")
+            self.assertEqual(saved["skill_snapshot"], old_skill)
+            self.assertIn("新的全身立绘", saved["desired_spec"]["prompt"])
+            self.assertTrue(saved["stale"])
+            state = saved["states"]["S1"]
+            self.assertEqual(state["prompt"], "旧状态提示词")
+            self.assertEqual(state["skill_snapshot"], old_skill)
+            self.assertIn("新的白衬衫", state["desired_spec"]["prompt"])
+            self.assertEqual(state["episodes"], ["E2"])
+            self.assertTrue(state["stale"])
 
     def test_parent_ref_child_uses_parent_image_as_reference(self):
         """子素材口径：parent_ref 以父资产母图为参考改图；related_refs / 提示词 @token 仍不进依赖。"""
@@ -588,6 +626,112 @@ class AssetGenerationReferenceTests(unittest.TestCase):
             self.assertEqual(len(client.calls), 1)
             self.assertTrue(client.calls[0]["out"].endswith("jiuweihu__S2.png"))
             self.assertEqual(client.calls[0]["image_refs"], [str(mother)])
+
+
+class _GateClient(_FakeClient):
+    """带闸门的生图桩：记录并发峰值，用来区分「真并发」和「逐张排队」。"""
+
+    def __init__(self, vendor_id="fake-vendor", hold=0.08):
+        super().__init__(vendor_id)
+        self._lock = threading.Lock()
+        self._live = 0
+        self.peak = 0
+        self.hold = hold
+
+    def generate_image(self, prompt, out, **kw):
+        with self._lock:
+            self._live += 1
+            self.peak = max(self.peak, self._live)
+        time.sleep(self.hold)
+        with self._lock:
+            self._live -= 1
+        return super().generate_image(prompt, out, **kw)
+
+
+def _wave_project(tmp, chars=4, derived=True):
+    """造一个 ② 素材项目：N 个人物母图（+可选 1 个挂父图的角色项圈）。"""
+    project = Path(tmp)
+    (project / "素材" / "人物").mkdir(parents=True)
+    rows = [{"id": f"hero{i}", "name": f"英雄{i}", "gender": "男", "sheet_prompt": f"第 {i} 号青年男子立绘"}
+            for i in range(1, chars + 1)]
+    rows[0]["states"] = [{"id": "S1", "label": "受伤期", "episodes": ["E3"], "sheet_prompt": "左臂缠绷带"}]
+    (project / "素材" / "人物.json").write_text(json.dumps({"characters": rows}, ensure_ascii=False), encoding="utf-8")
+    if derived:
+        (project / "素材" / "道具").mkdir(parents=True)
+        (project / "素材" / "道具.json").write_text(json.dumps({"props": [
+            {"id": "collar", "name": "项圈", "image_prompt": "黑色项圈", "parent_ref": "@character:hero1"}]},
+            ensure_ascii=False), encoding="utf-8")
+    return project
+
+
+class AssetImageWaveTests(unittest.TestCase):
+    def test_plan_waves_groups_independent_assets_and_defers_children(self):
+        from gen_asset_images import plan_waves
+
+        plans = [
+            {"kind": "character", "id": "a", "reference_tokens": []},
+            {"kind": "character", "id": "b", "reference_tokens": []},
+            {"kind": "prop", "id": "collar", "reference_tokens": ["@character:a"]},
+            {"kind": "prop", "id": "bell", "reference_tokens": ["@prop:collar"]},
+        ]
+        waves = plan_waves(plans)
+        self.assertEqual([[p["id"] for p in w] for w in waves], [["a", "b"], ["collar"], ["bell"]],
+                         "无依赖的同一波（可并发），子图往后推一波")
+
+    def test_plan_waves_keeps_parent_outside_batch_at_first_wave(self):
+        """父图不在本批次（已生成或被 --id 过滤）＝沿用旧的「缺父图降级无参考」，不额外排波。"""
+        from gen_asset_images import plan_waves
+
+        waves = plan_waves([{"kind": "prop", "id": "collar", "reference_tokens": ["@character:gone"]}])
+        self.assertEqual(len(waves), 1)
+
+    def test_plan_waves_survives_dependency_cycle(self):
+        from gen_asset_images import plan_waves
+
+        waves = plan_waves([
+            {"kind": "prop", "id": "x", "reference_tokens": ["@prop:y"]},
+            {"kind": "prop", "id": "y", "reference_tokens": ["@prop:x"]},
+        ])
+        self.assertEqual(sorted(p["id"] for w in waves for p in w), ["x", "y"], "有环也不能丢项或死递归")
+
+    def test_cloud_vendor_generates_independent_assets_in_parallel(self):
+        """云端厂商：同波内互不依赖的资产必须并发出图（原来几十张图逐张排队）。"""
+        gen = _load_gen()
+        with tempfile.TemporaryDirectory() as td:
+            project = _wave_project(td, chars=4, derived=False)
+            client = _GateClient()
+            code, _ = _run_main(gen, project, "--workers", "4", client=client)
+            self.assertEqual(code, 0)
+            self.assertGreaterEqual(client.peak, 2, "无依赖的人物母图应并发出图，不再逐张排队")
+            self.assertLessEqual(client.peak, 4, "并发数不得超过 --workers")
+            saved = json.loads((project / "素材" / "素材图.json").read_text(encoding="utf-8"))
+            self.assertEqual(sorted(saved["人物"]), ["hero1", "hero2", "hero3", "hero4"],
+                             "并发写索引不得互相覆盖")
+            self.assertIn("S1", saved["人物"]["hero1"].get("states") or {}, "状态图索引在并发下也要保住")
+            saved = json.loads((project / "素材" / "素材图.json").read_text(encoding="utf-8"))
+            self.assertEqual(sorted(saved["人物"]), ["hero1", "hero2", "hero3", "hero4"],
+                             "并发下索引条目不得互相覆盖")
+
+    def test_parallel_run_still_uses_parent_image_for_derived_child(self):
+        """并发不能把子图抢到父图前面——那样项圈拿不到参考图，身份就散了。"""
+        gen = _load_gen()
+        with tempfile.TemporaryDirectory() as td:
+            project = _wave_project(td, chars=3, derived=True)
+            client = _GateClient()
+            _run_main(gen, project, "--workers", "4", client=client)
+            collar = next(c for c in client.calls
+                          if c["out"].replace("\\", "/").endswith("素材/道具/collar.png"))
+            self.assertEqual([Path(r).name for r in collar["image_refs"]], ["hero1.png"],
+                             "项圈必须以 hero1 母图为参考")
+            self.assertTrue(collar["out"].replace("\\", "/").endswith("素材/道具/collar.png"))
+
+    def test_local_comfyui_batch_stays_serial(self):
+        gen = _load_gen()
+        with tempfile.TemporaryDirectory() as td:
+            project = _wave_project(td, chars=4, derived=False)
+            client = _GateClient(vendor_id="local-comfyui", hold=0.01)
+            _run_main(gen, project, "--workers", "4", client=client)
+            self.assertEqual(client.peak, 1, "本机 ComfyUI 只有一个队列，并发数必须压回 1")
 
 
 if __name__ == "__main__":

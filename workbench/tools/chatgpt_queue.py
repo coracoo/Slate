@@ -232,6 +232,10 @@ def _asset_source(project_dir, row, state_id=""):
                 if not state:
                     raise QueueError(f"人物状态不存在：@{kind}:{ident}#{state_id}")
                 prompt = str(state.get("sheet_prompt") or "").strip()
+                if prompt and "三视图" in prompt and "45度" not in prompt and "45 度" not in prompt:
+                    raise QueueError(
+                        f"@{kind}:{ident}#{state_id} 的状态提示词仍是旧版三视图构图。"
+                        f"请在「② 素材生成」重新生成该角色提示词后，再重新提交本任务")
                 if not prompt:
                     base = str(item.get(prompt_key) or item.get("prompt") or "").strip()
                     diff = str(state.get("look_diff") or state.get("label") or "").strip()

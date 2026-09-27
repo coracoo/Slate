@@ -104,10 +104,10 @@ watch(() => app.current, () => { void load(); void loadSpeechVendors() }, {immed
 
 <template>
   <div class="page-wide">
-    <header class="mb-5 flex items-end justify-between"><div><h1 class="grad-text text-2xl font-black">④ 音色绑定</h1><p class="mt-1 text-xs text-slate-500">流程：拉取云端默认音色 → 生成试听入库 → 试听后绑定为角色全剧默认；分状态音色按素材派生状态单独配置</p></div><RouterLink to="/studio/asset" class="text-sm text-sky-300">返回素材生成</RouterLink></header>
+    <header class="mb-5"><h1 class="grad-text text-2xl font-black">④ 音色绑定</h1><p class="mt-1 text-sm text-slate-400">为角色选择全剧音色，也可为派生状态单独绑定。</p></header>
     <p v-if="error" role="alert" class="mb-4 rounded-lg bg-rose-950/50 p-3 text-rose-200">{{ error }}</p>
     <div class="grid items-start gap-5 lg:grid-cols-[230px_minmax(0,1fr)]">
-      <aside class="glass space-y-2 p-3"><h2 class="mb-4 text-sm font-bold">人物素材</h2><button v-for="a in actors" :key="a.id" class="block w-full rounded-xl border p-3 text-left" :class="a.id === actorId ? 'border-sky-400/50 bg-sky-900/20' : 'border-white/10'" @click="actorId = a.id"><b>{{ a.name }}</b><small class="mt-1 block text-slate-400">{{ a.voice_binding ? '已绑定全剧默认' : '待绑定' }}<template v-if="a.states?.length"> · {{ a.states.length }} 状态</template></small></button><p class="text-xs text-slate-500">子素材沿用母角色音色。旁白是独立说话人、可以绑定音色：<b class="text-slate-400">未绑定则不生成、不注入</b>（旁白留在台词轨，出声由后期人声轨处理）。状态音色在主区分状态区配置。</p></aside>
+      <aside class="glass space-y-2 p-3"><h2 class="mb-4 text-sm font-bold">角色与旁白</h2><button v-for="a in actors" :key="a.id" class="block w-full rounded-xl border p-3 text-left" :class="a.id === actorId ? 'border-sky-400/50 bg-sky-900/20' : 'border-white/10'" @click="actorId = a.id"><b>{{ a.name }}</b><small class="mt-1 block text-slate-300">{{ a.voice_binding ? '已绑定全剧音色' : '待绑定' }}<template v-if="a.states?.length"> · {{ a.states.length }} 状态</template></small></button><p class="text-sm text-slate-400">旁白未绑定音色时不生成配音。</p></aside>
       <main class="space-y-5">
         <div class="grid items-start gap-5 xl:grid-cols-2">
           <section class="glass space-y-3 p-4">
@@ -116,7 +116,7 @@ watch(() => app.current, () => { void load(); void loadSpeechVendors() }, {immed
               <span class="rounded-md border border-white/15 bg-white/5 px-2 py-1 text-xs text-slate-300" title="音色库 / 试听 / 创作 / 复刻当前仅支持 MiniMax；台词配音可在底部选择其他语音厂商">MiniMax</span>
               <button class="btn btn-sm" :disabled="busy" @click="submit('voice_catalog')">{{ catalog.length ? '重新拉取' : '拉取默认音色' }}</button>
             </div>
-            <p class="text-xs text-slate-500">拉取免费（仅缓存音色列表，按厂商账户隔离）。MiniMax 列表接口不返回试听音频：试听需点「生成试听并保存」生成一次样本（调 TTS 计费，一句文本费用极低），样本永久入库后试听不再花钱。</p>
+            <p class="text-sm text-slate-400">云端列表没有试听音频。点「生成试听并保存」调用一次语音合成，保存后可重复播放。</p>
             <div class="flex gap-2"><input v-model="search" class="voice-input" placeholder="搜索名称 / 描述 / ID" /><button class="btn btn-sm btn-ghost shrink-0" :disabled="busy" @click="submit('recover', {}, true)">接管未确认请求</button></div>
             <div class="max-h-[430px] space-y-2 overflow-auto pr-1">
               <article v-for="v in catalog.filter(c => `${c.voice_name} ${c.voice_id} ${c.description?.join(' ')}`.includes(search))" :key="v.voice_id" class="rounded-lg border border-white/10 p-3">
@@ -157,7 +157,7 @@ watch(() => app.current, () => { void load(); void loadSpeechVendors() }, {immed
           </section>
         </div>
         <section class="glass space-y-3 p-4">
-          <h2 class="font-bold text-sky-200">分状态音色 <span class="text-xs font-normal text-slate-500">{{ actor?.name || '请选择角色' }} · 左侧派生状态图，右侧音色参考</span></h2>
+          <h2 class="font-bold text-sky-200">分状态音色 <span class="text-sm font-normal text-slate-400">{{ actor?.name || '请选择角色' }}</span></h2>
           <p v-if="!actor?.states?.length" class="text-xs text-slate-500">该角色暂无派生状态；请到「② 素材提炼」为角色定义状态资产（states），生成状态图后回到这里配音色。</p>
           <div v-for="s in actor?.states || []" :key="s.id" class="grid items-center gap-3 rounded-xl border border-white/10 p-3 md:grid-cols-[120px_minmax(0,1fr)_auto]">
             <div class="flex h-[90px] items-center justify-center overflow-hidden rounded-lg border border-white/10 bg-black/30">
@@ -187,7 +187,7 @@ watch(() => app.current, () => { void load(); void loadSpeechVendors() }, {immed
             <label class="block text-xs text-slate-400">语音厂商（MiniMax 用绑定音色；本地 / OpenAI 兼容 TTS 用厂商配置的默认音色）<select v-model="speechVendor" class="voice-input mt-2"><option v-for="v in speechVendors" :key="v.id" :value="v.id">{{ v.label || v.id }}{{ v.id === 'minimax' ? '' : '（OpenAI 兼容）' }}</option></select></label>
             <label class="block text-xs text-slate-400">本次配音音色<select v-model="speechVoice" class="voice-input mt-2" :disabled="speechVendor !== 'minimax'"><option value="">{{ speechVendor !== 'minimax' ? '厂商默认音色' : '全剧默认音色' }}</option><option v-for="v in actor?.voice_variants || []" :key="v.voice_asset_id" :value="v.voice_asset_id">{{ v.name }}{{ v.state ? '（状态）' : '' }}</option></select></label>
             <div class="flex flex-wrap gap-2"><select v-model="board" class="voice-input max-w-xs"><option v-for="b in boards" :key="b">{{ b }}</option></select><button class="btn" :disabled="busy || !board || (speechVendor === 'minimax' && !actor?.voice_binding)" @click="submit('speech', {board, character_id: actorId, voice_asset_id: speechVoice || undefined}, false, speechVendor)">生成本集角色台词</button></div>
-            <p class="text-xs text-slate-500">台词直接读取分镜 lines，每句单独归档。生成试听、AI 音色创作和台词配音会调用所选厂商；播放已保存样本不调用 API。</p>
+            <p class="text-sm text-slate-400">读取当前分镜台词，按句生成并归档音频。</p>
           </div>
         </details>
       </main>
@@ -195,4 +195,4 @@ watch(() => app.current, () => { void load(); void loadSpeechVendors() }, {immed
   </div>
 </template>
 
-<style scoped>.voice-input{width:100%;border:1px solid #ffffff20;border-radius:8px;background:#0a1522;color:#d9e5f3;padding:10px;font-size:13px}</style>
+<style scoped>.voice-input{width:100%;min-height:40px;border:1px solid #ffffff30;border-radius:8px;background:#0a1522;color:#e2e8f0;padding:10px;font-size:14px;line-height:1.5}.voice-input:focus{outline:2px solid #38bdf8;outline-offset:1px}textarea.voice-input{min-height:104px}</style>
