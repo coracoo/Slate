@@ -21,7 +21,7 @@
 设计口径：跨集坐标（首次出场/关键集次）一律由反查派生，禁止写回素材档案造成多份真相；
 无 anchor_rev 的项目所有注入点返回空串，行为与改造前逐字一致。
 """
-import sys, os, json, re, argparse
+import sys, os, json, re, argparse, hashlib
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -79,10 +79,12 @@ def _snapshot(path):
 
 
 def _write(path, data):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    _snapshot(path)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(data, fh, ensure_ascii=False, indent=1)
+    core = os.path.join(os.path.dirname(__file__), '..', '..', 'previs_system', 'tools')
+    if os.path.abspath(core) not in sys.path:
+        sys.path.insert(0, os.path.abspath(core))
+    import project_store
+    with project_store._exclusive(path):
+        project_store._atomic_write(path, data, _snapshot)
 
 
 # ────────────────────────── 读 ──────────────────────────
@@ -117,7 +119,39 @@ def anchor_rev(proj):
 
 
 def is_anchored(proj):
-    return anchor_rev(proj) > 0
+    outline = _read(path_outline(proj), {})
+    return (int(outline.get("anchor_rev") or 0) > 0 and
+            (not outline.get("anchor_fingerprint") or
+             outline["anchor_fingerprint"] == anchor_fingerprint(proj)))
+
+
+def anchor_fingerprint(proj):
+    """锁定依赖只含故事规划；正文、画风、音色和生成产物不参与。"""
+    from brief import load_brief
+    u = load_units(proj)
+    spec = load_brief(proj)
+    style = _read(_p(proj, "剧本", "style.json"), {})
+    try:
+        with open(_p(proj, "剧本", "构想.txt"), encoding="utf-8") as fh:
+            idea = fh.read().strip()
+    except OSError:
+        idea = ""
+    fields = lambda row, keys: {k: row.get(k) for k in keys}
+    content = {
+        "idea": idea,
+        "brief": fields(spec, ("episode_minutes", "total_episodes", "genre_tone", "dialogue_density",
+                               "max_characters", "max_scenes")),
+        "style": {k: style.get(k) or "auto" for k in
+                  ("script", "script_structure", "script_pacing", "script_continuity")},
+        "outline": fields(u["outline"], OUTLINE_KEYS + ("main_line",)),
+        "episodes": [fields(e, ("id",) + EPISODE_EDIT_KEYS) for e in u["episodes"]],
+        "threads": {k: u[k] for k in ("foreshadows", "hooks")},
+    }
+    for kind, keys in (("characters", CHAR_KEYS), ("scenes", SCENE_KEYS), ("props", PROP_KEYS)):
+        content[kind] = [fields(row, ("id", "name", "aliases", "gender", "role") + keys) for row in u[kind]
+                         if not row.get('parent_ref') and not row.get('derived_from')]
+    raw = json.dumps(content, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
 # ────────────────────────── 反查索引 ──────────────────────────
@@ -211,6 +245,12 @@ def check(proj):
     outline, eps = u["outline"], u["episodes"]
     ep_ids = [str(e.get("id") or "") for e in eps]
     ep_id_set = set(x for x in ep_ids if x)
+    if eps and (outline.get('units_version') or u['episodes_doc'].get('units_version')) and u['episodes_doc'].get('mode') != 'imported':
+        from brief import load_brief
+        target = load_brief(proj).get('total_episodes')
+        if target and int(target) != len(eps):
+            errors.append(_item('SPEC_EP_COUNT', '制作规则.目标集数',
+                                f'目标 {target} 集与当前 {len(eps)} 集不一致，请确认制作规则；补全不会扩增或删除已有分集。', 'error'))
 
     def known_refs():
         # 每次调用都重读六个 json，30 集项目会放大成几百次 IO —— 整个 check 只解析一次。
@@ -501,6 +541,7 @@ def anchor(proj, force=False):
     outline["anchor_rev"] = int(outline.get("anchor_rev") or 0) + 1
     outline["units_version"] = UNITS_VERSION
     outline.update(stamp)
+    outline["anchor_fingerprint"] = anchor_fingerprint(proj)
     _write(path_outline(proj), outline)
     touched.append(path_outline(proj))
 
@@ -529,7 +570,7 @@ def anchor(proj, force=False):
 
 
 def unanchor(proj):
-    """撤锚：抹掉各包 anchor_rev，扩写与 ② 的注入点随即退回改造前行为。"""
+    """解除锁定，规划保留；采用最小单元的项目暂停扩写，等待重新确认。"""
     removed = []
     for path in (path_outline(proj), path_episodes(proj), path_threads(proj)):
         doc = _read(path, {})
@@ -757,7 +798,7 @@ def _same_family(a, b):
     return len(short) >= 3 and (long.endswith(short) or long.startswith(short))
 
 
-def merge_roster(proj, roster):
+def merge_roster(proj, roster, replace_settings=False):
     """名册 -> 素材三件套骨架档案。同名资产沿用既有 id（防 N93 那类换 id 造成的索引孤儿）。
 
     返回 remap：LLM 提议的 ref -> 档案里的真实 ref。后续所有引用必须过一遍它——
@@ -799,6 +840,13 @@ def merge_roster(proj, roster):
                 reused.append(actual)
                 remap[proposed] = actual
                 by_name.setdefault(nk, hit)
+                if replace_settings:
+                    fields = {field: item.get(field) for field in ('role', 'gender', 'is_collective', 'interior', 'time', 'kind')}
+                    fields.update({dst: item.get(src) for src, dst in field_map.items()})
+                    for field, value in fields.items():
+                        if field not in (hit.get('locked_fields') or []) and value not in (None, '', [], {}):
+                            hit[field] = value
+                            changed = True
                 continue
             new_row = {"id": proposed.split(":", 1)[1],
                        "name": str(item["name"]).strip(),
@@ -900,10 +948,12 @@ def _merge_by_id(existing, incoming, key_name="id"):
     return out
 
 
-def apply_story(proj, data):
+def apply_story(proj, data, fill_only=False, replace_roster=False):
     """U1 产物落盘：名册建档 -> 引用转正 -> 大纲加厚键 -> 分集加厚条目（不碰正文）-> 埋线.json。"""
     data = data or {}
-    roster_out = merge_roster(proj, data.get("roster"))
+    def fill_fields(old, new):
+        return {**old, **{k: v for k, v in new.items() if not old.get(k) and k not in (old.get('locked_fields') or [])}}
+    roster_out = merge_roster(proj, data.get("roster"), replace_settings=replace_roster)
     remap = roster_out.get("remap") or {}
     _remap_stored_refs(proj, remap)
     for ep in (data.get("episodes") or []):
@@ -918,7 +968,15 @@ def apply_story(proj, data):
 
     outline = _read(path_outline(proj), {})
     for k in OUTLINE_KEYS:
-        if not data.get(k):
+        if not data.get(k) or k in (outline.get("locked_fields") or []):
+            continue
+        if fill_only and outline.get(k):
+            if k in ('arcs', 'rules', 'taboos', 'sources') and isinstance(outline[k], list):
+                additions = {str(x.get('id') or x.get('item')): x for x in data[k] if isinstance(x, dict)}
+                outline[k] = [fill_fields(x, additions.pop(str(x.get('id') or x.get('item')), {})) if isinstance(x, dict) else x
+                              for x in outline[k]] + list(additions.values())
+            elif isinstance(outline[k], dict) and isinstance(data[k], dict):
+                outline[k] = fill_fields(outline[k], data[k])
             continue
         if k in ("arcs", "rules", "taboos", "sources"):
             outline[k] = _merge_by_id(outline.get(k), data[k])
@@ -936,6 +994,8 @@ def apply_story(proj, data):
         eid = str(ep["id"])
         row = by_id.get(eid)
         if row is None:
+            if fill_only and existing:
+                continue
             row = {"id": eid}
             by_id[eid] = row
             existing.append(row)
@@ -943,6 +1003,8 @@ def apply_story(proj, data):
             if k == "text":
                 continue          # 正文是第二步的产物，第一步永不覆写
             if v is None or v == "" or v == []:
+                continue
+            if k in (row.get("locked_fields") or []) or (fill_only and row.get(k)):
                 continue
             row[k] = v
     eps_doc["episodes"] = existing
@@ -958,19 +1020,20 @@ def apply_story(proj, data):
         old = merged_fs.get(fid)
         if old and str(old.get("status") or "") == "paid":
             fs["status"] = "paid"          # 人工标记的已回收不被生成流程改回 open
-        merged_fs[fid] = {**(old or {}), **fs}
+        merged_fs[fid] = (fill_fields(old or {}, fs) if fill_only else {**(old or {}), **fs})
     threads["foreshadows"] = list(merged_fs.values())
     merged_hk = {str(h.get("id")): h for h in (threads.get("hooks") or []) if isinstance(h, dict)}
     for hk in (data.get("hooks") or []):
         if isinstance(hk, dict) and str(hk.get("id") or ""):
-            merged_hk[str(hk["id"])] = {**(merged_hk.get(str(hk["id"])) or {}), **hk}
+            old = merged_hk.get(str(hk["id"])) or {}
+            merged_hk[str(hk["id"])] = fill_fields(old, hk) if fill_only else {**old, **hk}
     threads["hooks"] = list(merged_hk.values())
     threads.setdefault("units_version", UNITS_VERSION)
     _write(path_threads(proj), threads)
     return roster_out
 
 
-def apply_entities(proj, data):
+def apply_entities(proj, data, fill_only=False):
     """U2 产物落盘：传记五件套 / 场景限制与动作位 / 道具边界 / 关系 / 状态派生。
 
     只认 ref 命中名册的条目；命不中的进 gaps 回第一步，绝不静默新建实体。
@@ -993,13 +1056,16 @@ def apply_entities(proj, data):
         docs[name] = (path, doc_key, rows)
     index = {"character": docs["人物"][2], "scene": docs["场景"][2], "prop": docs["道具"][2]}
 
+    def writable(row, key):
+        return key not in (row.get("locked_fields") or []) and not (fill_only and row.get(key))
+
     for item in (data.get("characters") or []):
         row = find(index["character"], item.get("ref"))
         if row is None:
             gaps.append({"kind": "character", "ref": item.get("ref"), "need": "名册里没有这个人物，设定无处可写"})
             continue
         for k in CHAR_KEYS:
-            if item.get(k):
+            if item.get(k) and writable(row, k):
                 row[k] = item[k]
         applied.append(row.get("id"))
     for item in (data.get("scenes") or []):
@@ -1008,7 +1074,7 @@ def apply_entities(proj, data):
             gaps.append({"kind": "scene", "ref": item.get("ref"), "need": "名册里没有这个场景"})
             continue
         for k in SCENE_KEYS:
-            if item.get(k):
+            if item.get(k) and writable(row, k):
                 row[k] = item[k]
         applied.append(row.get("id"))
     for item in (data.get("props") or []):
@@ -1016,7 +1082,7 @@ def apply_entities(proj, data):
         if row is None:
             gaps.append({"kind": "prop", "ref": item.get("ref"), "need": "名册里没有这个道具"})
             continue
-        if item.get("usage_boundary"):
+        if item.get("usage_boundary") and writable(row, "usage_boundary"):
             row["usage_boundary"] = item["usage_boundary"]
         applied.append(row.get("id"))
 
@@ -1032,6 +1098,8 @@ def apply_entities(proj, data):
             gaps.append({"kind": "character", "ref": ref, "need": "状态派生指向不存在的人物"})
             continue
         states = [s for s in (row.get("states") or []) if isinstance(s, dict)]
+        if "states" in (row.get("locked_fields") or []):
+            continue
         for d in rows:
             sid = str(d.get("state_id") or f"{row.get('id')}_S{len(states) + 1}")
             hit = next((s for s in states if str(s.get("id")) == sid), None)
@@ -1048,7 +1116,7 @@ def apply_entities(proj, data):
                 hit["episodes"] = [ep] if ep else []
                 states.append(hit)
             else:
-                hit.update(payload)
+                hit.update({k: v for k, v in payload.items() if writable(hit, k)})
                 if ep and ep not in (hit.get("episodes") or []):
                     hit.setdefault("episodes", []).append(ep)
         row["states"] = states
@@ -1415,6 +1483,7 @@ def fill_refs_from_text(proj, ep_id=None, apply_changes=False):
             continue
         text = str(ep.get("text") or "")
         if not text.strip():
+            rows_out.append(ep)   # 无正文卡（加厚卡只有 summary/beats）也必须带回：rows_out 是整表覆写，漏卡=删集
             continue
         found_scenes, found_chars, found_props = [], [], []
         for line in text.splitlines():
@@ -1440,10 +1509,12 @@ def fill_refs_from_text(proj, ep_id=None, apply_changes=False):
             if ref and ref not in found_chars:
                 found_chars.append(ref)
         add = {"cast_refs": found_chars, "scene_refs": found_scenes, "key_asset_refs": found_props}
+        def _canon_ref(r): return "".join(ch for ch in str(r) if ch.isalnum()).lower()
         changed = {}
         for key, refs in add.items():
             have = [str(r) for r in (ep.get(key) or [])]
-            new = [r for r in refs if r not in have]
+            have_keys = {_canon_ref(r) for r in have}   # 宽松匹配常命中"同一实体的另一个 id"（连字符/下划线变体），按规范化去重
+            new = [r for r in refs if _canon_ref(r) not in have_keys]
             if new:
                 changed[key] = new
         if changed:
@@ -1473,16 +1544,58 @@ def missing_fields(kind, row):
     return [] if str(row.get("usage_boundary") or "").strip() else ["usage_boundary"]
 
 
-def pending_settings(proj, per_round=24):
+def referenced_assets(proj):
+    """当前分集、伏笔及其父素材依赖所用的资产引用集合。"""
+    refs = set(build_index(proj))
+    u = load_units(proj)
+    rows = [(f'@{kind}:{row.get("id")}', row)
+            for kind, key in (("character", "characters"), ("scene", "scenes"), ("prop", "props"))
+            for row in u[key]]
+    while True:
+        before = len(refs)
+        for ref, row in rows:
+            if ref in refs:
+                refs.update(str(row[k]) for k in ('parent_ref', 'derived_from', 'owner_ref')
+                            if isinstance(row.get(k), str) and row[k].startswith('@'))
+        if len(refs) == before:
+            return refs
+
+
+def reset_referenced_settings(proj):
+    """重规划只重写当前故事用到的设定；历史未引用档案保留。"""
+    refs = referenced_assets(proj)
+    for name, key, kind, fields in (('人物', 'characters', 'character', CHAR_KEYS),
+                                    ('场景', 'scenes', 'scene', SCENE_KEYS),
+                                    ('道具', 'props', 'prop', PROP_KEYS)):
+        path, _, rows = _read_asset(proj, name)
+        changed = False
+        for row in rows:
+            if f'@{kind}:{row.get("id")}' not in refs:
+                continue
+            for field in (*fields, 'states'):
+                if field not in (row.get('locked_fields') or []) and field in row:
+                    row.pop(field)
+                    changed = True
+        if changed:
+            doc = _read(path, {})
+            doc[key] = rows
+            _write(path, doc)
+    return refs
+
+
+def pending_settings(proj, per_round=24, references_only=False):
     """还缺设定层的实体（人物看传记五件套、场景看空间限制与动作位、道具看使用边界）。
 
     U2 一轮写不完 111 个实体是必然的——这个函数就是让 cmd_units 能分批续跑的依据。
     """
     u = load_units(proj)
+    refs = referenced_assets(proj) if references_only else None
     flat = []
     for kind, key in (("character", "characters"), ("scene", "scenes"), ("prop", "props")):
         zone = {"character": "人物", "scene": "场景", "prop": "道具"}[kind]
         for row in u[key]:
+            if refs is not None and f'@{kind}:{row.get("id")}' not in refs:
+                continue
             gaps = missing_fields(kind, row)
             if gaps:
                 flat.append({"ref": f"@{kind}:{row.get('id')}", "kind": zone, "id": str(row.get("id")),
@@ -1496,7 +1609,7 @@ def pending_settings(proj, per_round=24):
     }
     for item in flat[:per_round]:
         batch[key_map[item["_kind"]]].append(rows_by[item["_kind"]][item["id"]])
-    return {"remaining": len(flat), "batch": batch, "targets": [{k: v for k, v in t.items() if k != "_kind"}
+    return {"remaining": len(flat), "missing_count": sum(len(t['missing']) for t in flat), "batch": batch, "targets": [{k: v for k, v in t.items() if k != "_kind"}
                                                                for t in flat[:per_round]]}
 
 
