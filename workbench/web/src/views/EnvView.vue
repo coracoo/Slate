@@ -3,15 +3,16 @@
 /** 环境：本机运行环境检测（python/ffmpeg/blender/MCP/依赖包） + AI 厂商配置（厂商卡片 + 五能力槽编辑/拉取模型/测试/增删/整体保存）。 */
 import { ref, computed, onMounted, watch, onBeforeUnmount } from 'vue'
 import {
-  fetchEnv, fetchEnvConfig, saveEnvConfig, testProvider, fetchEnvModels, fetchComfyWorkflows,
+  fetchEnv, queryVendorBalance, fetchEnvConfig, saveEnvConfig, testProvider, fetchEnvModels, fetchComfyWorkflows,
   MODEL_SLOTS, type EnvInfo, type Vendor, type ModelSlot, type TestResult
 } from '../api'
 import { toast } from '../stores/app'
-import { fetchStudioSettings, saveStudioSettings } from '../utils/productionStudio'
 import StyledSelect from '../components/StyledSelect.vue'
 import EnvironmentInstaller from '../components/EnvironmentInstaller.vue'
 import ChromeUseEnvironment from '../components/ChromeUseEnvironment.vue'
 import MediaGatewayEnvironment from '../components/MediaGatewayEnvironment.vue'
+import RunningHubTools from '../components/RunningHubTools.vue'
+import { fetchRunningHubCatalog } from '../api'
 import { icons } from '../components/icons'
 import { visibleVendors } from '../utils/providerVisibility'
 
@@ -65,17 +66,20 @@ function setPricingVal(v: Vendor, kind: ModelSlot, field: string, raw: string) {
 
 /* ---------- 本机环境 ---------- */
 const env = ref<EnvInfo | null>(null)
-const detecting = ref(false)
-/* 制作默认：V 分组目标生成时长（8/15/30s），分组合法性与主流模型提交能力对齐 */
-const defaultDuration = ref(15)
-const durationSaving = ref(false)
-async function loadStudioSettings() { try { defaultDuration.value = (await fetchStudioSettings()).default_video_duration } catch { /* 保持默认 */ } }
-async function saveDuration() {
-  durationSaving.value = true
-  try { const r = await saveStudioSettings({ default_video_duration: Number(defaultDuration.value) }); defaultDuration.value = r.default_video_duration; toast('制作默认已保存', 'ok') }
-  catch (e) { toast(e instanceof Error ? e.message : '保存失败', 'err') }
-  finally { durationSaving.value = false }
+const modal = ref('')
+const balanceBusy = ref('')
+const balanceText = ref<Record<string, string>>({})
+async function checkBalance(id: string) {
+  if (balanceBusy.value) return
+  balanceBusy.value = id
+  try {
+    const r = await queryVendorBalance(id)
+    balanceText.value[id] = r.text || '无数据'
+  } catch (e) {
+    balanceText.value[id] = e instanceof Error ? e.message : '查询失败'
+  } finally { balanceBusy.value = '' }
 }
+const detecting = ref(false)
 
 async function detect() {
   detecting.value = true
@@ -93,8 +97,27 @@ const pkgList = computed(() => Object.entries(env.value?.packages || {}))
 /* ---------- 厂商 ---------- */
 const vendors = ref<Vendor[]>([])
 const displayedVendors = computed(() => visibleVendors(vendors.value))
-const loadingConfig = ref(false)
-const expanded = ref('')
+function applyDefaultOrder() {
+  // 默认顺序：启用在前 + id 首字母。用户拖拽过的顺序存 localStorage（一次性记录），刷新不再重排。
+  if (localStorage.getItem('wb.env.vendorOrder')) return
+  const ids = vendors.value.map(v => v.id).join(',')
+  vendors.value.sort((a, b) =>
+    Number(b.enabled ?? false) - Number(a.enabled ?? false) || a.id.localeCompare(b.id))
+  if (vendors.value.map(v => v.id).join(',') !== ids) scheduleAutoSave()
+}
+let dragVendor = ''
+function onDragStart(id: string) { dragVendor = id }
+function onDropOn(id: string) {
+  if (!dragVendor || dragVendor === id) return
+  const from = vendors.value.findIndex(v => v.id === dragVendor)
+  const to = vendors.value.findIndex(v => v.id === id)
+  if (from < 0 || to < 0) return
+  const [moved] = vendors.value.splice(from, 1)
+  vendors.value.splice(to, 0, moved)
+  localStorage.setItem('wb.env.vendorOrder', vendors.value.map(v => v.id).join(','))
+}
+const loadingConfig = ref(true)   // 初始即加载态：骨架先占位，数据到达原位填充
+const expanded = ref<Set<string>>(new Set())
 const keyDrafts = ref<Record<string, string>>({})
 const testing = ref<Record<string, boolean>>({})
 const testResults = ref<Record<string, { ok: boolean; text: string }>>({})
@@ -197,11 +220,13 @@ async function loadConfig() {
       models: { ...emptyModels(), ...(v.models || {}) },
       extra: { ...(v.extra || {}) }
     }))
+    applyDefaultOrder()   // 快照前应用默认顺序：启用在前+字母序；用户拖拽过则尊重存储顺序
     keyDrafts.value = {}
     extraDrafts.value = {}
     // 快照须在 keyDrafts 清空后取（草稿为空串 ≡ 保留旧 key）
     pristineListSig.value = JSON.stringify(canonical(vendors.value))
     pristineMap.value = Object.fromEntries(vendors.value.map((v) => [v.id, JSON.stringify(cardCanonical(v))]))
+    if (vendors.value.some(v => v.id === 'runninghub')) void loadRunningHubModels()
   } catch {
     toast('厂商配置加载失败（后端可能未就绪）', 'err')
   } finally {
@@ -210,7 +235,8 @@ async function loadConfig() {
 }
 
 function toggleExpand(id: string) {
-  expanded.value = expanded.value === id ? '' : id
+  // 手风琴：同一时刻只有一张展开（点新卡自动收起其它），再点自己收拢
+  expanded.value = new Set(expanded.value.has(id) ? [] : [id])
 }
 
 function openAdd() {
@@ -239,7 +265,7 @@ function submitAdd() {
   })
   keyDrafts.value[id] = ''
   addVisible.value = false
-  expanded.value = id
+  expanded.value = new Set([id])
   toast('已新增厂商（保存后生效）', 'ok')
 }
 
@@ -294,6 +320,17 @@ async function test(v: Vendor) {
 
 /* ---------- 拉取模型（每能力槽一个按钮，结果全卡共享 datalist） ---------- */
 const modelsMap = ref<Record<string, string[]>>({})
+const modelLabels = ref<Record<string, string>>({})
+async function loadRunningHubModels() {
+  try {
+    const data = await fetchRunningHubCatalog()
+    for (const [kind, rows] of Object.entries(data.models)) {
+      modelsMap.value[`runninghub:${kind}`] = (rows || []).map(r => r.id)
+      for (const row of rows || []) modelLabels.value[row.id] = row.label
+    }
+    if (data.note) toast(data.note, 'info', 7000)
+  } catch { /* 网络失败仍保留当前已选值和手填通道。 */ }
+}
 const fetchingModels = ref<Record<string, boolean>>({})
 const modelMsgs = ref<Record<string, { ok: boolean; text: string }>>({})
 
@@ -302,10 +339,10 @@ async function fetchModels(v: Vendor, slot: ModelSlot) {
   modelMsgs.value[v.id] = { ok: true, text: `正在用草稿值拉取「${MODEL_SLOTS.find((s) => s.key === slot)?.label}」模型列表…` }
   try {
     const d = draftOf(v)
-    const r = await fetchEnvModels({ id: v.id, draft: { base_url: d.base_url, api_key: d.api_key } })
+    const r = await fetchEnvModels({ id: v.id, kind: slot, draft: { base_url: d.base_url, api_key: d.api_key, extra: d.extra } })
     if (r.ok && r.models?.length) {
-      modelsMap.value[v.id] = r.models
-      modelMsgs.value[v.id] = { ok: true, text: `已拉取 ${r.models.length} 个模型，各槽下拉可选` }
+      modelsMap.value[v.id === 'runninghub' ? `${v.id}:${slot}` : v.id] = r.models
+      modelMsgs.value[v.id] = { ok: true, text: `已拉取 ${r.models.length} 个模型` }
       toast(`已拉取 ${r.models.length} 个模型（未保存）`, 'ok')
     } else {
       modelMsgs.value[v.id] = { ok: false, text: r.err || '未获取到模型列表，可手动填写' }
@@ -318,7 +355,6 @@ async function fetchModels(v: Vendor, slot: ModelSlot) {
 }
 
 onMounted(() => {
-  void loadStudioSettings()
   detect()
   loadConfig()
   loadComfyWorkflows()
@@ -327,32 +363,30 @@ onMounted(() => {
 
 <template>
   <div class="page">
-    <header class="mb-6">
-      <h1 class="grad-text text-2xl font-black">④ 环境检查</h1>
-      <p class="mt-1 text-xs text-slate-500">本机运行环境自检 + AI 厂商接入配置（厂商一张卡，七个能力槽填模型；key 只存本机）</p>
+    <header class="mb-6 flex flex-wrap items-center gap-3">
+      <div>
+        <h1 class="grad-text text-2xl font-black">④ 环境检查</h1>
+        <p class="mt-1 text-sm text-slate-400">检查本机依赖，配置生成模型与公网素材出口。</p>
+      </div>
+      <div class="ml-auto flex flex-wrap gap-2">
+        <button class="btn btn-sm" title="安装/补全本机依赖（Python 基础锁文件、深度推理、image-use）" @click="modal = 'installer'">补全缺失环境</button>
+        <button class="btn btn-ghost btn-sm" title="云端厂商读取本地音视频时的限时公网链接（signed URL）配置" @click="modal = 'gateway'">填写公网素材出口</button>
+        <button class="btn btn-ghost btn-sm" title="ChatGPT 网页生图通道的浏览器自动化组件安装" @click="modal = 'chromeuse'">部署 chrome-use</button>
+      </div>
     </header>
 
-    <ChromeUseEnvironment />
-    <MediaGatewayEnvironment />
-
-    <EnvironmentInstaller @installed="detect" />
-    <!-- 制作默认：V 分组目标生成时长 -->
-    <section class="glass mb-5 p-5" :style="{ '--glow': 'rgba(251,191,36,0.22)' }">
-      <div class="mb-3 flex items-center gap-2">
-        <h3 class="text-xs font-bold tracking-wider text-slate-500">制作默认</h3>
+    <!-- 三个功能各独立弹窗：互不占版面，打开才渲染 -->
+    <div v-if="modal" class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" @click.self="modal = ''">
+      <div class="glass max-h-[85vh] w-full max-w-2xl overflow-y-auto p-5">
+        <div class="mb-3 flex items-center justify-between">
+          <h2 class="text-base font-bold text-slate-100">{{ modal === 'installer' ? '补全缺失环境' : modal === 'gateway' ? '公网素材出口' : '部署 chrome-use' }}</h2>
+          <button class="text-slate-400 hover:text-slate-200" @click="modal = ''">✕</button>
+        </div>
+        <EnvironmentInstaller v-if="modal === 'installer'" @installed="detect" />
+        <MediaGatewayEnvironment v-if="modal === 'gateway'" />
+        <ChromeUseEnvironment v-if="modal === 'chromeuse'" />
       </div>
-      <div class="flex flex-wrap items-end gap-3">
-        <label class="text-[10px] text-slate-500">默认生成视频时长（V 分组上限）
-          <select v-model.number="defaultDuration" class="input mt-1 w-36">
-            <option :value="8">8 秒</option>
-            <option :value="15">15 秒（主流）</option>
-            <option :value="30">30 秒（长片段模型）</option>
-          </select>
-        </label>
-        <button class="btn" :disabled="durationSaving" @click="saveDuration">{{ durationSaving ? '保存中…' : '保存' }}</button>
-        <p class="flex-1 text-[10px] leading-relaxed text-slate-500">V 分组与自动拆分按此时长执行；同场景连续镜头超过上限会自动切成多个 V（提示词继承并标记待重写）。个别厂商模型上限更低时以提交阶段的模型校验为准。</p>
-      </div>
-    </section>
+    </div>
 
     <!-- 上半：本机环境 -->
     <section class="glass mb-5 p-5" :style="{ '--glow': GLOW }">
@@ -367,13 +401,24 @@ onMounted(() => {
         </button>
       </div>
 
-      <div v-if="!env && detecting" class="p-10 text-center text-sm text-slate-500">检测中…</div>
-      <div v-else-if="!env" class="p-10 text-center text-sm text-slate-500">环境信息不可用，点「重新检测」重试</div>
+      <div v-if="!env" aria-busy="true">
+        <!-- 占位骨架：与检测完成后同结构同高（四宫格 + 一行依赖 chips），数据到达原位填充不跳动 -->
+        <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
+          <div v-for="n in 4" :key="n" class="min-h-[72px] animate-pulse rounded-xl border border-line-soft bg-black/25 p-3">
+            <div class="h-2 w-14 rounded bg-slate-700/60"></div>
+            <div class="mt-2 h-4 w-24 rounded bg-slate-700/40"></div>
+          </div>
+        </div>
+        <div class="mt-4 flex flex-wrap items-center gap-1.5">
+          <div class="h-3 w-16 animate-pulse rounded bg-slate-700/50"></div>
+          <div v-for="n in 7" :key="n" class="h-5 w-20 animate-pulse rounded-full bg-slate-700/35"></div>
+        </div>
+      </div>
 
       <template v-else>
         <div class="grid grid-cols-2 gap-3 lg:grid-cols-4">
           <!-- Python -->
-          <div class="rounded-xl border border-line-soft bg-black/25 p-3">
+          <div class="min-h-[72px] rounded-xl border border-line-soft bg-black/25 p-3">
             <div class="mb-1 text-2xs tracking-wider text-slate-500">PYTHON</div>
             <div class="flex items-center gap-2">
               <span class="h-2 w-2 rounded-full" :class="env.python ? 'bg-emerald-400' : 'bg-rose-400'"></span>
@@ -381,7 +426,7 @@ onMounted(() => {
             </div>
           </div>
           <!-- ffmpeg -->
-          <div class="rounded-xl border border-line-soft bg-black/25 p-3">
+          <div class="min-h-[72px] rounded-xl border border-line-soft bg-black/25 p-3">
             <div class="mb-1 text-2xs tracking-wider text-slate-500">FFMPEG</div>
             <div class="flex items-center gap-2">
               <span class="h-2 w-2 rounded-full" :class="env.ffmpeg ? 'bg-emerald-400' : 'bg-rose-400'"></span>
@@ -389,7 +434,7 @@ onMounted(() => {
             </div>
           </div>
           <!-- Blender -->
-          <div class="rounded-xl border border-line-soft bg-black/25 p-3">
+          <div class="min-h-[72px] rounded-xl border border-line-soft bg-black/25 p-3">
             <div class="mb-1 text-2xs tracking-wider text-slate-500">BLENDER</div>
             <div class="flex items-center gap-2">
               <span class="h-2 w-2 rounded-full" :class="env.blender ? 'bg-emerald-400' : 'bg-rose-400'"></span>
@@ -397,7 +442,7 @@ onMounted(() => {
             </div>
           </div>
           <!-- Blender MCP -->
-          <div class="rounded-xl border border-line-soft bg-black/25 p-3">
+          <div class="min-h-[72px] rounded-xl border border-line-soft bg-black/25 p-3">
             <div class="mb-1 text-2xs tracking-wider text-slate-500">BLENDER MCP</div>
             <div class="flex items-center gap-2">
               <span class="h-2 w-2 rounded-full" :class="env.mcp ? 'bg-emerald-400 pulse-dot' : 'bg-rose-400'"></span>
@@ -409,32 +454,16 @@ onMounted(() => {
           </div>
         </div>
 
-        <!-- 依赖包 -->
-        <h4 class="mb-2 mt-4 text-2xs font-bold text-slate-500">PYTHON 依赖包</h4>
-        <div class="overflow-hidden rounded-xl border border-line-soft">
-          <table class="w-full text-left text-xs">
-            <thead>
-              <tr class="bg-white/5 text-slate-500">
-                <th class="px-3 py-2 font-semibold">包名</th>
-                <th class="px-3 py-2 font-semibold">状态</th>
-              </tr>
-            </thead>
-            <tbody>
-              <tr v-for="[name, ver] in pkgList" :key="name" class="border-t border-line-soft bg-black/20">
-                <td class="px-3 py-1.5 font-mono text-slate-300">{{ name }}</td>
-                <td class="px-3 py-1.5">
-                  <span
-                    v-if="ver !== '缺失'"
-                    class="rounded-full bg-emerald-400/10 px-2 py-0.5 font-semibold text-emerald-300"
-                  >{{ ver }}</span>
-                  <span v-else class="rounded-full bg-rose-400/10 px-2 py-0.5 font-semibold text-rose-300">缺失</span>
-                </td>
-              </tr>
-              <tr v-if="!pkgList.length" class="border-t border-line-soft bg-black/20">
-                <td colspan="2" class="px-3 py-3 text-center text-slate-500">暂无依赖信息</td>
-              </tr>
-            </tbody>
-          </table>
+        <!-- 依赖包：单行 chips（紧凑，不再用表） -->
+        <div class="mt-4 flex flex-wrap items-center gap-1.5">
+          <span class="text-2xs font-bold text-slate-500">PYTHON 依赖</span>
+          <span
+            v-for="[name, ver] in pkgList" :key="name"
+            class="rounded-full px-2 py-0.5 font-mono text-2xs"
+            :class="ver !== '缺失' ? 'bg-emerald-400/10 text-emerald-300' : 'bg-rose-400/10 text-rose-300'"
+            :title="ver"
+          >{{ name }} {{ ver !== '缺失' ? '' : '✗' }}</span>
+          <span v-if="!pkgList.length" class="text-2xs text-slate-500">暂无依赖信息</span>
         </div>
       </template>
     </section>
@@ -461,20 +490,36 @@ onMounted(() => {
         </button>
       </div>
 
-      <div v-if="loadingConfig" class="p-10 text-center text-sm text-slate-500">加载厂商配置…</div>
+      <!-- 加载骨架：与真实卡片区同网格同卡高，数据到达后原位填充不跳动 -->
+      <div v-if="loadingConfig" class="grid grid-cols-1 items-start gap-3 lg:grid-cols-2" aria-busy="true">
+        <div v-for="n in 6" :key="n" class="glass p-3">
+          <div class="flex items-center gap-2.5">
+            <div class="h-8 w-8 shrink-0 animate-pulse rounded-lg bg-slate-700/50"></div>
+            <div class="flex-1">
+              <div class="h-3.5 w-28 animate-pulse rounded bg-slate-700/50"></div>
+              <div class="mt-1.5 h-2.5 w-44 animate-pulse rounded bg-slate-700/35"></div>
+            </div>
+            <div class="h-4 w-14 animate-pulse rounded-full bg-slate-700/35"></div>
+          </div>
+        </div>
+      </div>
 
       <div v-else-if="!vendors.length" class="p-8 text-center">
         <p class="text-sm text-slate-300">还没有配置任何厂商</p>
         <p class="mt-2 text-xs text-slate-500">修改后自动保存；未启用也可测试和拉取模型，启用只控制生成时是否可选。{{ autoSaveNote }}</p>
       </div>
 
-      <div v-else class="grid grid-cols-1 gap-3 lg:grid-cols-2">
+      <div v-else class="grid grid-cols-1 items-start gap-3 lg:grid-cols-2">
         <article
           v-for="v in displayedVendors"
           :key="v.id"
-          class="glass glass-hover p-3"
-          :class="{ 'ring-1 ring-amber-400/50': expanded === v.id }"
+          class="glass glass-hover relative p-3"
+          :class="expanded.has(v.id) ? 'z-20 ring-1 ring-amber-400/50' : ''"
           :style="{ '--glow': GLOW }"
+          draggable="true"
+          @dragstart="onDragStart(v.id)"
+          @dragover.prevent
+          @drop="onDropOn(v.id)"
         >
           <!-- 卡片头 -->
           <div class="flex cursor-pointer items-center gap-2.5" @click="toggleExpand(v.id)">
@@ -509,14 +554,14 @@ onMounted(() => {
             <svg
               width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#94a3b8" stroke-width="2"
               class="shrink-0 transition-transform duration-200"
-              :class="{ 'rotate-90': expanded === v.id }"
+              :class="{ 'rotate-90': expanded.has(v.id) }"
             >
               <path :d="icons.chevronR" stroke-linecap="round" stroke-linejoin="round" />
             </svg>
           </div>
 
-          <!-- 展开编辑 -->
-          <div v-if="expanded === v.id" class="mt-3 space-y-2 border-t border-line-soft pt-3">
+          <!-- 展开编辑：浮层不占位（撑高卡片会把 grid 行高与同行邻卡拉出大片空白），向下覆盖后续内容 -->
+          <div v-if="expanded.has(v.id)" class="absolute inset-x-0 top-full z-10 mt-1 space-y-2 rounded-xl border border-line bg-[#0b1220] p-3 shadow-2xl shadow-black/50">
             <div class="grid grid-cols-2 gap-2">
               <label class="text-2xs text-slate-500">
                 厂商 ID
@@ -620,7 +665,8 @@ onMounted(() => {
                     v-model="v.models[s.key]"
                     class="flex-1"
                     :class="{ 'opacity-50': !v.models[s.key] }"
-                    :options="modelsMap[v.id] || []"
+                    :options="modelsMap[v.id === 'runninghub' ? `${v.id}:${s.key}` : v.id] || []"
+                    :labels="v.id === 'runninghub' ? modelLabels : undefined"
                     placeholder="未配置"
                   />
                   <button
@@ -648,6 +694,36 @@ onMounted(() => {
               </div>
               <p class="mt-1 text-2xs text-slate-500">下拉选择或手动填写模型后，需点卡片「保存」或顶部「保存全部」才会落盘</p>
               <p v-if="v.id==='doubao'" class="mt-2 rounded-md bg-amber-500/10 p-2 text-xs text-amber-200">视频模型必须属于当前 Agent Plan 套餐。旧 Seedance 1.5 Pro 配置已被接口拒绝，请按控制台填写可用模型 ID；套餐模型列表接口不可用时可直接手填，不会自动切到按量计费接口。</p>
+              <template v-if="v.id === 'runninghub'">
+                <!-- AI 应用通道（个人 Key · 默认入口）：webappId→拉节点→自动表单；模型槽填 workflow:<id> 后生成链自动走 v2 AI App API -->
+                <div class="mt-2 rounded-xl border border-cyan-400/25 bg-cyan-400/5 p-3">
+                  <div class="mb-1 flex flex-wrap items-center gap-2">
+                    <b class="text-xs-plus font-bold text-cyan-200">AI 应用通道</b>
+                    <span class="rounded bg-cyan-400/20 px-1.5 py-0.5 text-2xs font-bold text-cyan-300">默认 · 个人 Key · v2</span>
+                    <span class="text-2xs text-slate-500">填 webappId 拉取节点自动生成表单；模型槽填 <code class="text-cyan-200">workflow:&lt;id&gt;</code> 后 ③/⑦ 生成自动走此通道（按 RH 应用计费，提交前确认余额）</span>
+                  </div>
+                  <RunningHubTools :saved="!cardDirty(v)" />
+                </div>
+                <label class="mt-2 block text-xs text-slate-400">文本/视觉 LLM Base URL
+                  <input v-model="v.extra!.llm_base_url" class="input mt-1 font-mono" placeholder="https://llm.runninghub.ai/v1" />
+                </label>
+                <label class="mt-2 block text-xs text-slate-400">默认语音 voice_id
+                  <input v-model="v.extra!.voice_id" class="input mt-1" placeholder="绑定角色音色时优先使用角色音色" />
+                </label>
+                <details class="mt-2 text-xs text-slate-400">
+                  <summary class="cursor-pointer">标准模型 API（企业共享 Key）· 附加参数与节点映射</summary>
+                  <label class="mt-2 block">按能力槽填写附加参数 JSON（如音乐歌词、语音情绪、视频水印）
+                    <textarea v-model="v.extra!.api_parameters" class="textarea mt-1 min-h-24 w-full font-mono" placeholder='{"speech":{"emotion":"neutral"},"video":{"aigc_watermark":false}}' />
+                  </label>
+                  <div class="mt-2 rounded-lg border border-cyan-400/15 bg-cyan-400/5 p-2.5 text-2xs leading-relaxed text-slate-400">
+                    <b class="text-cyan-200">工作流节点映射</b>——模型槽为 <code class="text-cyan-200">workflow:&lt;webappId&gt;</code> 时生成链的 nodeInfoList 组装规则：
+                    <code class="text-cyan-200">prompt_node</code>（提示词注入）、<code class="text-cyan-200">image_nodes</code>（参考图节点列表，本地文件自动上传）、
+                    <code class="text-cyan-200">extra_fields</code>（开关/数值/COMBO 等任意节点参数）、
+                    <code class="text-cyan-200">instance_type</code>（default 24G / plus 48G / ultra 84G 显存）。
+                    节点的 nodeId/fieldName 从上方「AI 应用通道」面板拉取后复制到对应能力槽的映射里（如 {"image":{"prompt_node":{"nodeId":"39","fieldName":"value"}}}）。
+                  </div>
+                </details>
+              </template>
             </div>
 
             <!-- 单价配置（用量计费）：按已配置模型的能力槽渲染价格输入 -->
@@ -700,6 +776,9 @@ onMounted(() => {
                 </svg>
                 {{ testing[v.id] ? '测试中…' : '测试连接' }}
               </button>
+              <button v-if="v.id !== 'local-comfyui'" class="btn btn-ghost btn-sm" :disabled="balanceBusy === v.id" title="查询该厂商账户余额（仅官方开放余额 API 的厂商返回数值，其余给控制台指引）" @click="checkBalance(v.id)">
+                {{ balanceBusy === v.id ? '查询中…' : '查余额' }}
+              </button>
               <button class="btn btn-danger btn-sm" @click="removeVendor(v)">
                 <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                   <path :d="icons.trash" stroke-linecap="round" stroke-linejoin="round" />
@@ -714,6 +793,13 @@ onMounted(() => {
               :class="testResults[v.id].ok ? 'bg-emerald-400/10 text-emerald-300' : 'bg-rose-400/10 text-rose-300'"
             >
               {{ testResults[v.id].text }}
+            </div>
+            <div
+              v-if="balanceText[v.id]"
+              class="mt-1 rounded-lg px-2.5 py-1.5 text-xs-plus font-semibold"
+              :class="balanceText[v.id].includes('未开放') || balanceText[v.id].includes('失败') ? 'bg-slate-400/10 text-slate-300' : 'bg-sky-400/10 text-sky-200'"
+            >
+              余额：{{ balanceText[v.id] }}
             </div>
           </div>
         </article>
@@ -744,5 +830,3 @@ onMounted(() => {
     </Teleport>
   </div>
 </template>
-
-
