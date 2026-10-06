@@ -12,7 +12,6 @@ import EnvironmentInstaller from '../components/EnvironmentInstaller.vue'
 import ChromeUseEnvironment from '../components/ChromeUseEnvironment.vue'
 import MediaGatewayEnvironment from '../components/MediaGatewayEnvironment.vue'
 import RunningHubTools from '../components/RunningHubTools.vue'
-import { fetchRunningHubCatalog } from '../api'
 import { icons } from '../components/icons'
 import { visibleVendors } from '../utils/providerVisibility'
 
@@ -226,7 +225,6 @@ async function loadConfig() {
     // 快照须在 keyDrafts 清空后取（草稿为空串 ≡ 保留旧 key）
     pristineListSig.value = JSON.stringify(canonical(vendors.value))
     pristineMap.value = Object.fromEntries(vendors.value.map((v) => [v.id, JSON.stringify(cardCanonical(v))]))
-    if (vendors.value.some(v => v.id === 'runninghub')) void loadRunningHubModels()
   } catch {
     toast('厂商配置加载失败（后端可能未就绪）', 'err')
   } finally {
@@ -320,17 +318,6 @@ async function test(v: Vendor) {
 
 /* ---------- 拉取模型（每能力槽一个按钮，结果全卡共享 datalist） ---------- */
 const modelsMap = ref<Record<string, string[]>>({})
-const modelLabels = ref<Record<string, string>>({})
-async function loadRunningHubModels() {
-  try {
-    const data = await fetchRunningHubCatalog()
-    for (const [kind, rows] of Object.entries(data.models)) {
-      modelsMap.value[`runninghub:${kind}`] = (rows || []).map(r => r.id)
-      for (const row of rows || []) modelLabels.value[row.id] = row.label
-    }
-    if (data.note) toast(data.note, 'info', 7000)
-  } catch { /* 网络失败仍保留当前已选值和手填通道。 */ }
-}
 const fetchingModels = ref<Record<string, boolean>>({})
 const modelMsgs = ref<Record<string, { ok: boolean; text: string }>>({})
 
@@ -341,7 +328,7 @@ async function fetchModels(v: Vendor, slot: ModelSlot) {
     const d = draftOf(v)
     const r = await fetchEnvModels({ id: v.id, kind: slot, draft: { base_url: d.base_url, api_key: d.api_key, extra: d.extra } })
     if (r.ok && r.models?.length) {
-      modelsMap.value[v.id === 'runninghub' ? `${v.id}:${slot}` : v.id] = r.models
+      modelsMap.value[v.id] = r.models
       modelMsgs.value[v.id] = { ok: true, text: `已拉取 ${r.models.length} 个模型` }
       toast(`已拉取 ${r.models.length} 个模型（未保存）`, 'ok')
     } else {
@@ -652,8 +639,49 @@ onMounted(() => {
               <p class="mt-1.5 text-2xs text-slate-500">语音模型固定使用 Plan Resource-Id，不通过 Auto 或模型列表切换。</p>
             </div>
 
-            <!-- 六能力槽：生图与改图分开，避免模型/工作流串用 -->
-            <div>
+            <!-- RH 专属区（标准模型 API 前端已下线，10-06 定版）：AI 应用通道 + 工作流槽位 + LLM -->
+            <template v-if="v.id === 'runninghub'">
+              <div class="mt-2 rounded-xl border border-cyan-400/25 bg-cyan-400/5 p-3">
+                <div class="mb-1 flex flex-wrap items-center gap-2">
+                  <b class="text-xs-plus font-bold text-cyan-200">AI 应用通道</b>
+                  <span class="rounded bg-cyan-400/20 px-1.5 py-0.5 text-2xs font-bold text-cyan-300">RH 唯一生成通道 · v2 工作流</span>
+                  <span class="text-2xs text-slate-500">webappId → 拉取节点自动生成表单；提交按 RH 应用计费</span>
+                </div>
+                <RunningHubTools :saved="!cardDirty(v)" />
+              </div>
+              <div class="mt-2 space-y-1.5">
+                <div class="text-2xs text-slate-500">工作流槽位（③/⑦ 生成消费；填 <code class="text-cyan-200">workflow:&lt;webappId&gt;</code>，留空 = 未配置）</div>
+                <div class="flex items-center gap-1.5">
+                  <span class="w-14 shrink-0 rounded-md px-1.5 py-1 text-center text-2xs font-bold text-pink-300 bg-pink-400/10">生图</span>
+                  <input v-model="v.models.image" class="input flex-1 font-mono text-xs" placeholder="workflow:应用页URL长数字" />
+                </div>
+                <div class="flex items-center gap-1.5">
+                  <span class="w-14 shrink-0 rounded-md px-1.5 py-1 text-center text-2xs font-bold text-violet-300 bg-violet-400/10">改图</span>
+                  <input v-model="v.models.image_edit" class="input flex-1 font-mono text-xs" placeholder="workflow:应用页URL长数字" />
+                </div>
+                <div class="flex items-center gap-1.5">
+                  <span class="w-14 shrink-0 rounded-md px-1.5 py-1 text-center text-2xs font-bold text-cyan-300 bg-cyan-400/10">生视频</span>
+                  <input v-model="v.models.video" class="input flex-1 font-mono text-xs" placeholder="workflow:应用页URL长数字" />
+                </div>
+              </div>
+              <label class="mt-2 block text-xs text-slate-400">文本/视觉 LLM Base URL
+                <input v-model="v.extra!.llm_base_url" class="input mt-1 font-mono" placeholder="https://llm.runninghub.ai/v1" />
+              </label>
+              <details class="mt-2 text-xs text-slate-400">
+                <summary class="cursor-pointer">工作流节点映射（api_parameters）</summary>
+                <label class="mt-2 block">按槽位填 JSON（节点 nodeId/fieldName 从上方「AI 应用通道」拉取后填入）
+                  <textarea v-model="v.extra!.api_parameters" class="textarea mt-1 min-h-24 w-full font-mono" placeholder='{"image":{"prompt_node":{"nodeId":"39","fieldName":"value"},"image_nodes":[{"nodeId":"52","fieldName":"image"}]},"video":{"instance_type":"plus"}}' />
+                </label>
+                <div class="mt-2 rounded-lg border border-cyan-400/15 bg-cyan-400/5 p-2.5 text-2xs leading-relaxed text-slate-400">
+                  <b class="text-cyan-200">组装规则</b>——生成链把提示词/参考图自动填进节点：
+                  <code class="text-cyan-200">prompt_node</code>（提示词注入）、<code class="text-cyan-200">image_nodes</code>（参考图节点列表，本地文件自动上传）、
+                  <code class="text-cyan-200">extra_fields</code>（开关/数值/COMBO 等任意节点参数）、
+                  <code class="text-cyan-200">instance_type</code>（default 24G / plus 48G / ultra 84G 显存）。
+                </div>
+              </details>
+            </template>
+            <!-- 六能力槽：生图与改图分开，避免模型/工作流串用（RH 已下线标准 API，走上方工作流槽位） -->
+            <div v-if="v.id !== 'runninghub'">
               <div class="mb-1 text-2xs text-slate-500">能力槽（生图与改图分开填写；留空 = 未配置）</div>
               <div class="space-y-1.5">
                 <div v-for="s in MODEL_SLOTS" :key="s.key" class="flex items-center gap-1.5">
@@ -665,8 +693,7 @@ onMounted(() => {
                     v-model="v.models[s.key]"
                     class="flex-1"
                     :class="{ 'opacity-50': !v.models[s.key] }"
-                    :options="modelsMap[v.id === 'runninghub' ? `${v.id}:${s.key}` : v.id] || []"
-                    :labels="v.id === 'runninghub' ? modelLabels : undefined"
+                    :options="modelsMap[v.id] || []"
                     placeholder="未配置"
                   />
                   <button
@@ -694,36 +721,6 @@ onMounted(() => {
               </div>
               <p class="mt-1 text-2xs text-slate-500">下拉选择或手动填写模型后，需点卡片「保存」或顶部「保存全部」才会落盘</p>
               <p v-if="v.id==='doubao'" class="mt-2 rounded-md bg-amber-500/10 p-2 text-xs text-amber-200">视频模型必须属于当前 Agent Plan 套餐。旧 Seedance 1.5 Pro 配置已被接口拒绝，请按控制台填写可用模型 ID；套餐模型列表接口不可用时可直接手填，不会自动切到按量计费接口。</p>
-              <template v-if="v.id === 'runninghub'">
-                <!-- AI 应用通道（个人 Key · 默认入口）：webappId→拉节点→自动表单；模型槽填 workflow:<id> 后生成链自动走 v2 AI App API -->
-                <div class="mt-2 rounded-xl border border-cyan-400/25 bg-cyan-400/5 p-3">
-                  <div class="mb-1 flex flex-wrap items-center gap-2">
-                    <b class="text-xs-plus font-bold text-cyan-200">AI 应用通道</b>
-                    <span class="rounded bg-cyan-400/20 px-1.5 py-0.5 text-2xs font-bold text-cyan-300">默认 · 个人 Key · v2</span>
-                    <span class="text-2xs text-slate-500">填 webappId 拉取节点自动生成表单；模型槽填 <code class="text-cyan-200">workflow:&lt;id&gt;</code> 后 ③/⑦ 生成自动走此通道（按 RH 应用计费，提交前确认余额）</span>
-                  </div>
-                  <RunningHubTools :saved="!cardDirty(v)" />
-                </div>
-                <label class="mt-2 block text-xs text-slate-400">文本/视觉 LLM Base URL
-                  <input v-model="v.extra!.llm_base_url" class="input mt-1 font-mono" placeholder="https://llm.runninghub.ai/v1" />
-                </label>
-                <label class="mt-2 block text-xs text-slate-400">默认语音 voice_id
-                  <input v-model="v.extra!.voice_id" class="input mt-1" placeholder="绑定角色音色时优先使用角色音色" />
-                </label>
-                <details class="mt-2 text-xs text-slate-400">
-                  <summary class="cursor-pointer">标准模型 API（企业共享 Key）· 附加参数与节点映射</summary>
-                  <label class="mt-2 block">按能力槽填写附加参数 JSON（如音乐歌词、语音情绪、视频水印）
-                    <textarea v-model="v.extra!.api_parameters" class="textarea mt-1 min-h-24 w-full font-mono" placeholder='{"speech":{"emotion":"neutral"},"video":{"aigc_watermark":false}}' />
-                  </label>
-                  <div class="mt-2 rounded-lg border border-cyan-400/15 bg-cyan-400/5 p-2.5 text-2xs leading-relaxed text-slate-400">
-                    <b class="text-cyan-200">工作流节点映射</b>——模型槽为 <code class="text-cyan-200">workflow:&lt;webappId&gt;</code> 时生成链的 nodeInfoList 组装规则：
-                    <code class="text-cyan-200">prompt_node</code>（提示词注入）、<code class="text-cyan-200">image_nodes</code>（参考图节点列表，本地文件自动上传）、
-                    <code class="text-cyan-200">extra_fields</code>（开关/数值/COMBO 等任意节点参数）、
-                    <code class="text-cyan-200">instance_type</code>（default 24G / plus 48G / ultra 84G 显存）。
-                    节点的 nodeId/fieldName 从上方「AI 应用通道」面板拉取后复制到对应能力槽的映射里（如 {"image":{"prompt_node":{"nodeId":"39","fieldName":"value"}}}）。
-                  </div>
-                </details>
-              </template>
             </div>
 
             <!-- 单价配置（用量计费）：按已配置模型的能力槽渲染价格输入 -->
