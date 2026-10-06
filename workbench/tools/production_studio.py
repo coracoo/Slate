@@ -179,6 +179,50 @@ def timeline(board, unit):
     return beats
 
 
+def timing_conflicts(board, unit):
+    """返回会造成台词丢失或视频越界的确定性时间冲突，不修改作者数据。"""
+    shots = shot_list(board, unit)
+    duration = float(unit.get('duration') or sum(float(s.get('dur') or 4) for s in shots))
+    conflicts = []
+    beats = timeline(board, unit)
+    if beats and beats[-1]['end'] > duration + 0.05:
+        conflicts.append(
+            f'台词按自然语速（{SPEECH_RATE:g} 字/s）需要约 {beats[-1]["end"]:.1f}s，'
+            f'超过当前生成时长 {duration:g}s'
+        )
+    for shot in shots:
+        shot_duration = float(shot.get('dur') or 4)
+        need = speech_floor(shot)
+        if need > SHOT_DURATION_MAX + 0.05:
+            conflicts.append(
+                f'{shot["id"]} 台词约需 {need:.1f}s，超过单镜硬顶 {SHOT_DURATION_MAX:g}s，必须拆镜或删词'
+            )
+        for index, line in enumerate(shot.get('lines') or [], 1):
+            if not isinstance(line, dict):
+                continue
+            try:
+                at = float(line.get('at') or 0)
+                line_duration = float(line.get('dur') or 0)
+            except (TypeError, ValueError):
+                conflicts.append(f'{shot["id"]} 第 {index} 条台词时间不是有效数字')
+                continue
+            if at < 0 or line_duration <= 0:
+                conflicts.append(f'{shot["id"]} 第 {index} 条台词时间必须满足 at≥0 且 dur>0')
+            elif at + line_duration > shot_duration + 0.05:
+                conflicts.append(
+                    f'{shot["id"]} 第 {index} 条台词结束于 {at + line_duration:g}s，超过镜长 {shot_duration:g}s'
+                )
+    return conflicts
+
+
+def require_timing_budget(board, unit):
+    """付费生成前的硬门禁：时间预算不成立就拒绝提交。"""
+    conflicts = timing_conflicts(board, unit)
+    if conflicts:
+        raise ValueError('时间预算冲突：' + '；'.join(conflicts))
+    return True
+
+
 def judge_unit(board, unit, cap=None):
     """提示词判官 v1（本地确定性，不硬拦截）：台词语速 vs 节拍时长、时长上限、人物/参考图密度（N84）。"""
     cap = duration_cap() if cap is None else cap
@@ -199,6 +243,12 @@ def judge_unit(board, unit, cap=None):
     if len(actors) > 4: warnings.append(f'本 V 含 {len(actors)} 个角色，动作密度高，建议评估是否拆分')
     refs = sum(1 for s in shots if s.get('keyframe'))
     if refs > 6: warnings.append(f'本 V 引用 {refs} 张关键帧参考图，部分模型参考图上限更低，建议拆分')
+    # N90：多镜单请求的运镜/结构风险——图生视频模型对"X秒后硬切到下一机位"服从度低，
+    # 3 镜及以上单请求大概率被压镜/自由发挥（V01 实证 3 镜压成 2 镜且运镜被无视）。
+    distinct_moves = {str(s.get('camera_move') or '固定') for s in shots}
+    if len(shots) >= 3 and len(distinct_moves) > 1:
+        warnings.append(f'本 V 单请求含 {len(shots)} 个不同运镜的镜头（{"、".join(sorted(distinct_moves))}）——'
+                        '模型大概率无法按分镜切换机位，建议按 S 单拍后拼接，或改用首尾帧锚定')
     return {'ok': not warnings, 'warnings': warnings}
 
 
@@ -257,6 +307,14 @@ def state(project, name):
             u['timeline'] = []
             u['judge'] = {'ok': True, 'warnings': []}
     result = {'board': board, 'revision': revision}
+    episode_path = Path(project) / '剧本/分集.json'
+    if episode_path.is_file():
+        from episode_editor import board_episode, needs_review
+        book, _ = project_store.read_json(episode_path)
+        episode = board_episode(name, board)
+        row = next((e for e in book.get('episodes') or [] if e.get('id') == episode), None)
+        if row and needs_review(project, episode, row, name, board, book=book):
+            result['script_notice'] = '本集正文已修改，当前分镜及已采用产物需复核。请在③分镜生成核对动作与台词，再继续创作。'
     # 制作规格（E05）：V 总时长超过单集目标时长时给出提示；只提示，不改分组算法（E06 另案）
     try:
         from brief import has_brief, load_brief

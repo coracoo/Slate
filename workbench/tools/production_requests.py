@@ -5,8 +5,8 @@ import math
 import os
 import sys
 from pathlib import Path
-from production_studio import read_board, shot_list, shot_unit, timeline, inside
-from production_prompts import source_hash, media_source_hash
+from production_studio import read_board, shot_list, shot_unit, timeline, inside, project_store
+from production_prompts import source_hash, media_source_hash, retime_prompt
 from production_media import bound_path, digest
 from reference_limits import reference_limit
 from brief import aspect_ratio_of
@@ -143,9 +143,26 @@ def compile_request(project, body, cfg):
         if (body.get('ref_mode') or 'keyframes') == 'grid':
             gb = unit.get('grid_binding')
             if not isinstance(gb, dict) or not gb.get('path'):
-                raise ValueError('本 V 尚未采用故事板宫格：请先在①整 V 直出生成宫格图并点「采用为宫格参考」')
+                # 未显式采用时自动降级：取本 V 最新生成成功的宫格候选（用户已生成即视为认可），
+                # 两者皆无才报错。显式「采用为宫格参考」仍是正路（过期校验只对显式绑定生效）。
+                mf = Path(project) / '创作/creation.json'
+                auto = None
+                if mf.exists():
+                    cands = [i for i in project_store.read_json(mf)[0].get('items', [])
+                             if (i.get('action') == 'grid' or i.get('grid')) and i.get('unit_id') == target
+                             and i.get('board') == body['board'] and i.get('status') == 'done']
+                    if cands: auto = cands[-1]
+                if auto:
+                    raw = (auto.get('outputs') or [''])[0]
+                    rel = raw['path'] if isinstance(raw, dict) else raw
+                    if rel.startswith('projects/'): rel = rel.removeprefix('projects/' + Path(project).name + '/')
+                    gb = {'item_id': auto['id'], 'path': rel, 'sha256': digest(inside(project, rel)),
+                          'source_hash': media_source_hash(shots, 'image', unit),
+                          'purpose': '故事板宫格参考（自动选用最新候选）'}
+            if not isinstance(gb, dict) or not gb.get('path'):
+                raise ValueError('本 V 还没有故事板宫格图：请先在①整 V 直出点「生成宫格图」')
             r = copy.deepcopy(gb); bound_path(project, r)
-            if r.get('source_hash') and r['source_hash'] != media_source_hash(shots, 'image', unit):
+            if r.get('source_hash') and r['source_hash'] != media_source_hash(shots, r.get('source_kind') or 'image', unit):
                 # 必须与 adopt_grid 写入侧同公式（都是 shot_list(board, unit)）；此处原写 members，
                 # 该名字在本函数从未定义——走到"已过期"这一支会抛 NameError，友好提示永远出不来。
                 raise ValueError('宫格参考已过期（成员 S 素材变动），请重新生成宫格图并采用')
@@ -171,7 +188,18 @@ def compile_request(project, body, cfg):
             refs.append(r)
         beats = timeline(board, unit)
         if any(not b['prompt'].strip() for b in beats): raise ValueError('成员 S 尚缺视频提示词，请先补全提示词')
-        prompt += '\n时间轴（秒）：\n' + '\n'.join(f"{b['start']:g}–{b['end']:g}｜{b['shot_id']}：{b['prompt']}" for b in beats)
+        for beat in beats:
+            prompt = retime_prompt(prompt, beat['shot_id'], beat['start'], beat['end'])
+        # N90 时间轴瘦身+运镜执行句：unit 正文（authored 字段）不动；时间轴行=起止+运镜执行句
+        # （camera_move 元数据译成可执行动作描述，图生视频模型对「缓推/固定」标签词服从度低——
+        # V01 实证要求固定却持续剧烈运动）——避免同一内容两种措辞重复导致模型自由发挥。
+        from production_prompts import camera_motion_sentence
+        def _beat_line(s, b):
+            motion = camera_motion_sentence(s)
+            digest = str(b['prompt'] or '').strip().split('；')[0].split('。')[0][:36]
+            return f"{b['start']:g}–{b['end']:g}｜{s['id']}｜镜头{motion}｜本镜只演这一镜，节拍：{digest}"
+        details = '\n'.join(_beat_line(s, b) for s, b in zip(shots, beats))
+        prompt = (prompt + '\n' if scope == 'V' else '') + '时间轴（秒，每段只演对应镜头，段间硬切）：\n' + details
     negative = str(unit.get('negative') or '')
     # 风格仍由项目/资产 Skill 提供，避免从旧分镜自由文本带入过期画风。
     # 必须走镜头侧过滤：整篇 skill 正文含「三视图/纯白背景/表情中性」，
@@ -205,9 +233,15 @@ def compile_request(project, body, cfg):
         except Exception as _e:
             print(f"[警告] 平面图参考帧注入失败（忽略，不影响编译）: {_e}")
     negs = []
-    for s in shots:
-        n = s.get('negative') or []
-        negs.extend(n if isinstance(n, list) else [n])
+    if len(shots) == 1:
+        # N90 负面本镜化：单镜请求只带本镜负面+全局通用，不再并邻居镜头的负面——
+        # 跨镜负面稀释本镜真正要防的项（V01 实证 12 条负面里 8 条与 S3 无关）。
+        for n in (shots[0].get('negative') or []):
+            negs.append(n if isinstance(n, str) else str(n))
+    else:
+        for s in shots:
+            n = s.get('negative') or []
+            negs.extend(n if isinstance(n, list) else [n])
     negative = '；'.join(dict.fromkeys([negative, '文字、水印、字幕、边框'] + [str(n) for n in negs if n])).strip('；')
     continuity = body.get('continuity') or {}
     mode = continuity.get('mode', '')
@@ -246,8 +280,28 @@ def compile_request(project, body, cfg):
         if ref_mode == 'grid': check_refs = ['grid']
         validate_media(cap, video_mode, check_refs, first, last, voices + audio_urls, video_urls)
         if cap['transport'] == 'public_url':
-            if mode == 'tail_first_frame' or ref_mode == 'grid': raise ValueError('Agnes 需要成品帧的公网 URL；请先导出该帧后绑定 URL')
-            if any(not r.get('public_url') for r in refs): raise ValueError('Agnes 参考图需要公网 URL，请在参考设置为每张帧填写对应 URL')
+            if mode == 'tail_first_frame': raise ValueError('尾帧强制续接需要成品帧公网 URL，请先导出该帧后绑定 URL')
+            # 公网 URL 自动关联（优先级）：① 公网图床上传直链（长期有效，image_host 配置）；
+            # ② 公网素材出口签名 URL（限时，base_url 配置）；两者皆无才报错指引。
+            from media_gateway import load as gateway_config, signed_url
+            import image_host
+            gw = gateway_config()
+            host = None
+            try:
+                host = image_host.host_config()
+            except Exception:
+                host = None
+            if not host and not gw.get('base_url'):
+                raise ValueError('Agnes 参考素材需要公网 URL：请在环境检查「填写公网素材出口」配置图床（webdav/imgur）或公网出口')
+            for r in refs:
+                if not r.get('public_url') and r.get('path'):
+                    if host:
+                        try:
+                            r['public_url'] = image_host.upload_image(inside(project, r['path']), host)
+                            continue
+                        except Exception as exc:
+                            print(f"[图床上传失败，回落签名URL] {str(exc)[:120]}", file=sys.stderr)
+                    r['public_url'] = signed_url(project, r['path'])
         if voices and cfg['id'] in ('agnes','aliyun'): raise ValueError('此接口音频需要公网 URL，请取消本地音色引用，填写参考音频 URL')
     count = 1 if ref_mode == 'grid' and refs else len(refs)
     model = (cfg.get('models') or {}).get(kind)
