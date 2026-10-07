@@ -2,7 +2,7 @@
 """资产设定图生图：人物五视图设定图 / 场景概念图 / 道具设定图（跨镜头一致性参考图）
 
 提炼（LLM）→ 生图（image 厂商）。
-- 人物：characters[].sheet_prompt（五视图设定图：脸部正面/45度侧特写 + 不带头部正面/侧面全身 + 背面全身，纯白背景）→ 素材/人物/<id>.png
+- 人物：characters[].sheet_prompt（五视图设定图：脸部正面/45度侧特写 + 从颈部到脚底的正面/侧面全身 + 含头部的背面全身，纯白背景）→ 素材/人物/<id>.png
 - 场景：scenes[].image_prompt → 素材/场景/<id>.png
 - 道具：props[].image_prompt → 素材/道具/<id>.png
 索引：素材/素材图.json {人物:{id:{path,prompt}},场景:{...},道具:{...}} —— 供前端展示与
@@ -30,6 +30,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from llm_openai import VendorClient, load_vendors, VendorError, set_billing_project
 from reference_limits import reference_limit
 import skill_lib
+from visual_asset_prompt import subject_prompt, generation_kind, state_output_notice
+from character_sheet_mask import mask_character_sheet
 
 _FEMALE_MARKERS = ("少女", "女性", "女孩", "女生", "女子", "woman", "girl", "female")
 _MALE_MARKERS = ("少年", "男性", "男孩", "男生", "男子", "man", "boy", "male")
@@ -193,7 +195,6 @@ def find_orphan_index_rows(project):
 def report_orphan_index_rows(project):
     """提炼收尾的确定性体检：只报不改（删图/补档都归用户判断）。"""
     orphans = find_orphan_index_rows(project)
-    orphans = find_orphan_index_rows(project)
     for row in orphans:
         print(f"[警告] 素材图索引孤儿：{row['path']} 对应的{row['zone']}档案已不存在"
               f"（重跑提炼换过 id？分镜若仍引用 @{row['kind']}:{row['id']} 将拿不到身份锚点）")
@@ -248,7 +249,7 @@ def delete_asset_image(project, kind, asset_id):
 
 
 def collect_asset_image_plan(project, kind="all", asset_id=None, vendor_id="",
-                             strict_dependencies=False):
+                             strict_dependencies=False, asset_refs=None):
     """收集待生成资产及其派生参考图，供 CLI 与 HTTP 前置校验共用。
 
     该函数只读取剧本资产档案和已有索引，不会创建目录、快照或调用模型。
@@ -282,13 +283,23 @@ def collect_asset_image_plan(project, kind="all", asset_id=None, vendor_id="",
             if not ident or (asset_id and ident != str(asset_id)):
                 continue
             current_ref = f"@{item_kind}:{ident}"
+            if asset_refs is not None and current_ref not in asset_refs:
+                continue
             reference_tokens = _derived_reference_tokens(index, item, current_ref)
             refs = _derived_refs(proj, index, item, current_ref)
             missing_refs = [ref for ref in reference_tokens if not _ref_path(proj, index, ref)]
+            from visual_asset_prompt import visual_contract
+            visual = visual_contract(item_kind, item, project=proj)
+            generation_prompt = visual['subject']
             plans.append({"kind": item_kind, "id": ident, "refs": refs,
                           "reference_tokens": reference_tokens,
                           "missing_refs": missing_refs,
-                          "can_generate": bool(str(item.get(_pfield) or "").strip())})
+                          "visual_validation": visual,
+                          "can_generate": bool(generation_prompt) and visual['ready']})
+    if asset_refs is not None:
+        missing = set(asset_refs) - {f"@{p['kind']}:{p['id']}" for p in plans}
+        if missing:
+            raise ValueError("素材不存在或不在生成范围：" + "、".join(sorted(missing)))
     # 批量生成时先产出父资产，再产出子图；同层无依赖时保持档案原顺序。
     # 按 parent_ref + derived_from 建边（均为父子层级边）；related_refs 互指不成环。
     by_ref = {f"@{item['kind']}:{item['id']}": i for i, item in enumerate(plans)}
@@ -307,7 +318,7 @@ def collect_asset_image_plan(project, kind="all", asset_id=None, vendor_id="",
             return
         visiting.add(index)
         for ref in plans[index].get("reference_tokens") or []:
-            dependency = by_ref.get(str(ref))
+            dependency = by_ref.get(str(ref).split('#', 1)[0])
             if dependency is not None:
                 visit(dependency)
         visiting.discard(index)
@@ -320,13 +331,14 @@ def collect_asset_image_plan(project, kind="all", asset_id=None, vendor_id="",
     # （生成端按拓扑序先产父图）。两者都不满足的派生子图降级为无参考生成。
     for plan in ordered:
         has_ref = bool(plan["refs"]) or any(
-            str(ref) in planned_refs for ref in plan["reference_tokens"]
+            str(ref).split('#', 1)[0] in planned_refs for ref in plan["reference_tokens"]
         )
         plan["mode"] = asset_image_mode(vendor_id, plan["refs"], has_ref)
         # 旧本地生成保持“缺父图可降级”的口径；浏览器自动执行采用严格模式，
         # 防止身份敏感派生素材在没有实际父图时退化为文生图。
-        plan["can_execute"] = not (strict_dependencies and bool(plan["missing_refs"]))
-        plan["execution_state"] = "ready" if plan["can_execute"] else "waiting_dependencies"
+        plan["can_execute"] = plan['can_generate'] and not (strict_dependencies and bool(plan["missing_refs"]))
+        plan["execution_state"] = ('waiting_settings' if not plan['can_generate'] else
+                                   'ready' if plan['can_execute'] else 'waiting_dependencies')
     return ordered
 
 
@@ -349,7 +361,7 @@ def plan_waves(plans):
         stack.add(key)
         value = 0
         for ref in plan.get("reference_tokens") or []:
-            parent = by_key.get(str(ref).lstrip("@"))
+            parent = by_key.get(str(ref).lstrip("@").split('#', 1)[0])
             if parent is not None and parent is not plan:
                 value = max(value, depth_of(parent, stack) + 1)
         stack.discard(key)
@@ -368,62 +380,43 @@ def asset_image_needs_generation(path, force=False):
 
 
 def _ref_path(project, index, ref):
-    """把 @kind:id 解析为已生成的母素材图片路径。"""
+    """解析母图或 @kind:id#state_id 派生图的实际路径。"""
     raw = str(ref or "").strip().lstrip("@")
     if ":" not in raw:
         return ""
     kind, ident = raw.split(":", 1)
+    ident, separator, state_id = ident.partition('#')
     zone = KIND_ZONES.get(kind)
     if not zone or not ident:
         return ""
     record = (index.get(zone) or {}).get(ident) if isinstance(index.get(zone), dict) else None
+    if separator:
+        record = (record.get('states') or {}).get(state_id) if isinstance(record, dict) else None
     rel = record.get("path") if isinstance(record, dict) else ""
     candidate = os.path.join(project, rel.replace("/", os.sep)) if rel else ""
     if candidate and os.path.isfile(candidate):
         return candidate
     for ext in (".png", ".jpg", ".jpeg", ".webp"):
-        candidate = os.path.join(project, "素材", zone, ident + ext)
+        filename = ident + '__' + state_id if separator else ident
+        candidate = os.path.join(project, "素材", zone, filename + ext)
         if os.path.isfile(candidate):
             return candidate
     return ""
 
 
 def _derived_reference_tokens(index, item, current_ref=""):
-    """收集子图依赖引用 token：parent_ref（子素材父级）+ derived_from 派生链。
-
-    参考图规则：
-    - 母素材（无 parent_ref/derived_from）：母图零参考文生图（三视图/纯场景/纯道具）；
-    - 子素材（parent_ref，如道具 component_of 角色）：以父资产母图为参考改图；
-    - derived_from 派生子图：以父资产母图为参考改图；
-    - related_refs / 提示词 @token：仅叙事关联，永不进入生图依赖（防环）。
-    """
+    """明确生成来源优先；未单独指定时跟随展示母图，不递归注入展示祖先。"""
+    exact_source = str(item.get('derived_from') or '').strip()
+    if exact_source:
+        return [exact_source] if exact_source != current_ref else []
     roots = []
-    for key in ("derived_from", "parent_ref"):
-        value = item.get(key)
-        if value:
-            roots.append(value)
-    tokens = []
-    seen = set()
-    queue = list(roots)
-    while queue:
-        normalized = str(queue.pop(0) or "").strip()
-        if not normalized or normalized == current_ref or normalized in seen:
-            continue
-        seen.add(normalized)
-        tokens.append(normalized)
-        raw = normalized.lstrip("@")
-        record = None
-        if ":" in raw:
-            kind, ident = raw.split(":", 1)
-            zone = KIND_ZONES.get(kind)
-            records = index.get(zone) if zone else None
-            record = records.get(ident) if isinstance(records, dict) else None
-        if isinstance(record, dict):
-            for key in ("derived_from", "parent_ref"):
-                parent = record.get(key)
-                if parent:
-                    queue.append(parent)
-    return tokens
+    parent = str(item.get('parent_ref') or '').strip()
+    if parent and not (item.get('kind') == '显现/特效' and parent.startswith('@character:')):
+        roots.append(parent)
+    # 场景中明确关联的常驻主体仍可作为辅助参考，人物与道具不隐式互拉图片。
+    if item.get('kind') == 'scene':
+        roots.extend(str(ref) for ref in item.get('related_refs') or [] if ref)
+    return list(dict.fromkeys(ref for ref in roots if ref and ref != current_ref))
 
 
 def _derived_refs(project, index, item, current_ref=""):
@@ -461,7 +454,8 @@ def pick_vendor(vendor_id=None):
     vs = [v for v in load_vendors() if v.get("enabled") and (v.get("models") or {}).get("image")]
     if vendor_id:
         vs = [v for v in vs if v["id"] == vendor_id]
-    vs.sort(key=lambda v: not v.get("api_key"))
+    # 不再按"有 api_key 优先"排序：local-comfyui 这类本地通道天然无 key，旧排序把它沉底、
+    # 把付费云端顶成默认（用户选 comfyui 却跑到 RunningHub 即此）。默认取环境页启用顺序的第一家。
     if not vs:
         raise VendorError("没有已启用且配置 image 模型的厂商（环境页配置生图模型）")
     return vs[0]["id"]
@@ -472,6 +466,7 @@ def main():
     ap.add_argument("project")
     ap.add_argument("--kind", default="all", choices=["character", "scene", "prop", "all"])
     ap.add_argument("--id", default=None, help="只生成指定资产 id")
+    ap.add_argument("--asset-ref", action="append", default=None, help="本批生成的素材引用，可重复指定")
     ap.add_argument("--vendor", default=None)
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--workers", type=int, default=4,
@@ -495,6 +490,7 @@ def main():
     idx_path = os.path.join(out_root, "素材图.json")
     index = load_asset_index(proj)
     cli = VendorClient(pick_vendor(a.vendor))
+    cli.billing_project = os.path.basename(proj)
     edit_model = (cli.models or {}).get("image_edit") or "未配置"
     print(f"[信息] 生图厂商: {cli.id} / 生图 {cli.model('image')} / 改图 {edit_model}")
     try:
@@ -502,7 +498,7 @@ def main():
     except Exception:
         edit_ref_limit = 3
     kinds = list(KINDS) if a.kind == "all" else [a.kind]
-    plans = collect_asset_image_plan(proj, a.kind, a.id, cli.id)
+    plans = collect_asset_image_plan(proj, a.kind, a.id, cli.id, asset_refs=a.asset_ref)
     # 先把本次任务涉及的资产读入内存，再按规划器给出的派生拓扑顺序
     # 处理（derived_from 父资产先于子图生成，跨类型派生也能先产父图）。
     source_items = {}
@@ -535,10 +531,12 @@ def main():
             return
         index.setdefault(zone, {})
         aid = str(it.get("id") or "").strip()
-        prompt = str(it.get(pfield) or "").strip()
+        from visual_asset_prompt import require_visual_settings
+        visual = require_visual_settings(kind, it, project=proj)
+        prompt = visual['subject']
         if not aid or not prompt:
             if aid:
-                print(f"[跳过] {zone}/{aid} 无 {pfield}（重新提炼可补）")
+                print(f"[跳过] {zone}/{aid} 缺少可用外观设定，请在角色设定或视觉素材中补充")
             return
         prompt, guard_notes = _gender_guard(it, prompt)
         for note in guard_notes:
@@ -555,7 +553,7 @@ def main():
                                                               overrides={"image": asset_style or ""}))
         # 三层组装唯一入口（母图/状态图同路）：外观事实 → 画风层 → 类别硬约束；负面=全局基础 ∪ skill 定制
         prompt, negative = skill_lib.compose_asset_image_prompt(
-            proj, prompt, skill_id=asset_style, kind=kind, style_prompt=it.get("style_prompt"))
+            proj, prompt, skill_id=asset_style, kind=generation_kind(kind, it), style_prompt=it.get("style_prompt"))
         current_ref = f"@{kind}:{aid}"
         # 母图无参考生成：只有 derived_from 派生链进入参考；parent_ref /
         # related_refs / 提示词 @token 只是关联信息，不影响生图。
@@ -582,6 +580,8 @@ def main():
         mother_needed = asset_image_needs_generation(out, a.force)
         if (a.states == "only" or a.state_id) and os.path.isfile(out):
             mother_needed = False
+        if mother_needed and any('#' in ref for ref in missing_refs):
+            raise ValueError('指定的派生参考图尚未生成：' + '、'.join(missing_refs) + '；请先生成对应派生图')
         if not mother_needed:
             # 图片已存在时不得把旧像素伪装成由当前提示词/Skill 生成；当前目标单列为 desired_spec。
             index[zone][aid] = skipped_image_entry(
@@ -590,7 +590,7 @@ def main():
                  "parent_ref": it.get("parent_ref"), "relation": it.get("relation"),
                  "derived_from": it.get("derived_from"), "related_refs": it.get("related_refs") or [],
                  **({"states": _kept_states} if _kept_states else {})},
-                {"prompt": prompt, "reference_refs": reference_tokens,
+                {"prompt": prompt, "visual_source_hash": visual['source_hash'], "reference_refs": reference_tokens,
                  "skill_snapshot": asset_skill_snap},
             )
             print(f"[跳过] {zone}/{aid} 已存在（补缺模式）")
@@ -602,6 +602,10 @@ def main():
             if image_refs:
                 prompt = ("以关联资产参考图作为身份、结构、材质和画风锚点，只生成当前素材本身，"
                           "不要复制参考图中的其它动作或额外对象。" + chr(10) + prompt)
+            # 引用 tag：related_refs 的 @ 引用显式写进提示词（审计可读 + 模型感知关联物身份）
+            related_tokens = [str(r) for r in (it.get("related_refs") or []) if str(r).strip()]
+            if related_tokens and related_tokens != reference_tokens:
+                prompt = _with_reference_mentions(prompt, related_tokens)
             if len(all_image_refs) > edit_ref_limit:
                 print(f"[提示] {zone}/{aid} 关系参考图 {len(all_image_refs)} 张，按 {cli.id} 改图输入上限 {edit_ref_limit} 张取前 {edit_ref_limit} 张", flush=True)
             import versions as _V; _V.snapshot(out)
@@ -612,7 +616,11 @@ def main():
                                     image_refs=image_refs,
                                     mode=image_mode,
                                     extra={"size": image_size_for_aspect(_aspect), "ratio": image_ratio_for_aspect(_aspect)})
+                head_mask = mask_character_sheet(out) if kind == 'character' else None
                 index[zone][aid] = {"path": f"素材/{zone}/{aid}.png", "prompt": prompt,
+                                    "settings_revision": it.get('asset_revision', 1),
+                                    "visual_source_hash": visual['source_hash'],
+                                    **({'head_mask': head_mask} if head_mask else {}),
                                     "name": it.get("name", aid),
                                     "parent_ref": it.get("parent_ref"),
                                     "relation": it.get("relation"),
@@ -636,18 +644,28 @@ def main():
             except Exception as _e:
                 print(f"[告警] 场景「{aid}」平面图派生失败（不影响资产生图）: {_e}")
         # ---- 状态资产图：同一角色的剧情阶段变体（锚点+差异），文件 <aid>__<状态id>.png ----
-        if kind != "character" or plan.get("skip_states"):
+        if plan.get("skip_states"):
             return
         states_entry = {}
         for st_item in (it.get("states") or []):
             if not isinstance(st_item, dict):
                 continue
+            if st_item.get('output_asset_ref'):
+                if a.state_id == str(st_item.get('id')):
+                    raise ValueError(state_output_notice(it, st_item))
+                continue
             sid = str(st_item.get("id") or "").strip()
             if a.state_id and sid != a.state_id:
                 continue
-            s_prompt = str(st_item.get("sheet_prompt") or "").strip()
-            if not sid or not s_prompt:
+            if not sid or not (st_item.get('look_diff') or st_item.get('sheet_prompt') or st_item.get('label')):
                 continue
+            try:
+                state_visual = require_visual_settings(kind, it, st_item, project=proj)
+            except ValueError as exc:
+                fail.append(f"{zone}/{aid}#{sid}: {exc}")
+                print(f"[派生待修改] {exc}", flush=True)
+                continue
+            s_prompt = state_visual['subject']
             s_prompt, s_notes = _gender_guard(it, s_prompt)
             for note in s_notes:
                 print(f"[告警] {zone}/{aid}#{sid} {note}")
@@ -662,7 +680,7 @@ def main():
                     previous_state,
                     {"path": f"素材/{zone}/{aid}__{sid}.png", "label": st_item.get("label", sid),
                      "episodes": st_item.get("episodes") or [], "camp": st_item.get("camp", "")},
-                    {"prompt": s_prompt, "reference_refs": [current_ref],
+                    {"prompt": s_prompt, "visual_source_hash": state_visual['source_hash'], "reference_refs": [current_ref],
                      "skill_snapshot": asset_skill_snap},
                 )
                 continue
@@ -675,7 +693,11 @@ def main():
                 cli.generate_image(s_prompt, s_out, timeout=a.timeout, negative_prompt=negative,
                                    image_refs=s_refs, mode=s_mode,
                                    extra={"size": image_size_for_aspect(_aspect), "ratio": image_ratio_for_aspect(_aspect)})
+                head_mask = mask_character_sheet(s_out) if kind == 'character' else None
                 states_entry[sid] = {"path": f"素材/{zone}/{aid}__{sid}.png",
+                                     "settings_revision": it.get('asset_revision', 1),
+                                     "visual_source_hash": state_visual['source_hash'],
+                                     'head_mask': head_mask,
                                      "prompt": s_prompt, "label": st_item.get("label", sid),
                                      "episodes": st_item.get("episodes") or [],
                                      "camp": st_item.get("camp", ""),
@@ -698,6 +720,8 @@ def main():
     waves = plan_waves(plans)
 
     def _run_one(plan):
+        # 线程局部记账上下文不会由主线程继承；场景平面图等派生调用也需要项目归属。
+        set_billing_project(os.path.basename(proj))
         try:
             do_plan(plan)
         except Exception as e:
@@ -705,6 +729,8 @@ def main():
             zone = KINDS[plan["kind"]][3]
             fail.append(f"{zone}/{plan['id']}: {e}")
             print(f"[失败] {zone}/{plan['id']} 意外中断：{e}", flush=True)
+        finally:
+            set_billing_project("")
 
     cap = parallel_cap(cli.id, a.workers)
     print(f"[信息] 生图并发 {cap} 路（厂商 {cli.id}；本机 ComfyUI 与 ChatGPT 网页队列恒为 1 路）"

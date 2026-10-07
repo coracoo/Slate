@@ -3,17 +3,20 @@ import { useBoardSelection } from '../utils/useBoardSelection'
 // -*- coding: utf-8 -*-
 /** ② 分镜生成：按集生成分镜（知识注入）→ 逐镜明细；生成拍摄资料包 → 包明细 */
 import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
-import { useRouter } from 'vue-router'
 import {
-  fetchScriptData, fetchWhiteBoard, fetchCreate, scriptStoryboard,
+  fetchScriptData, fetchCreate, scriptStoryboard,
   previewKnowledge, saveStoryboardShots, exportStoryboardXlsx, deleteStoryboard, compileActingPrompt, runActing, fetchEnvConfig,
-  rebuildProductionPrompts, rebuildProductionEpisode, fetchStoryboardRevision,
+  rebuildProductionPrompts, fetchStoryboardReview,
   mediaUrl, type ScriptBundle, type WhiteBoard, type KnowledgeSkill, type CreateItem
 } from '../api'
-import { conflictNotice, isRevisionConflict, overwriteAllowed } from '../utils/boardRevision'
+import { conflictNotice, isRevisionConflict } from '../utils/boardRevision'
+import BatchDiffReview from '../components/BatchDiffReview.vue'
+import { changedGroups, mergeReviewedRows, type ReviewItem } from '../utils/reviewDiff'
 import { sceneLabel, speakerName } from '../utils/assetNames'
 import { app, projectFiles, toast, currentProject } from '../stores/app'
 import { trackJob } from '../stores/jobs'
+import { submitStudioJob } from '../utils/productionStudio'
+import { runSelectedBatch, type BatchResult } from '../utils/selectedBatch'
 import StyledSelect from '../components/StyledSelect.vue'
 import StyleSelect from '../components/StyleSelect.vue'
 import Versions from '../components/Versions.vue'
@@ -48,14 +51,14 @@ function toggleAllEpisodes() {
   epsTouched.value = true
   epsSel.value = allReadySelected.value ? [] : [...readyEpisodeIds.value]
 }
-const router = useRouter()
 const busy = ref('')
 const boards = ref<string[]>([])
 const board = ref('')
 const boardRev = ref<number | null>(null)
 /** 剧本修订号（①剧本分集每次变更 +1）；分镜低于它说明是旧剧本生成的。 */
 const scriptRev = computed(() => Number(data.value?.script_rev || 0))
-const boardStale = computed(() => boardRev.value !== null && scriptRev.value > boardRev.value)
+const boardStale = computed(() => data.value?.production_progress?.episodes.find(row => row.board === board.value)?.storyboard_review
+  ?? (boardRev.value !== null && scriptRev.value > boardRev.value))
 /** 分镜文件自身的 revision：③ 是整组回写，回写必须带它，否则会把 ⑦/⑤ 期间的改动静默盖掉。
  *  与上面的 boardRev（= 剧本 script_rev）不是一回事，别混用。 */
 const boardFileRev = ref('')
@@ -63,9 +66,11 @@ const boardFileRev = ref('')
 const boardActors = ref<Record<string, { name?: string }>>({})
 /** 非空 = 上一次保存被服务端判为过期基线拒掉；表格内容仍留在页面上，等用户决策。 */
 const boardConflict = ref('')
-const overwriteConfirmed = ref(false)
 let boardLoadSeq = 0
 const shots = ref<Shot[]>([])
+const missingPrompts = computed(() => shots.value.filter(s => !s.prompt_image?.trim() || !s.prompt_video?.trim() || !s.prompt_grid?.trim()).length)
+const originalShots=ref<Shot[]>([]), reviewOpen=ref(false), reviewItems=ref<ReviewItem[]>([]), reviewError=ref('')
+let reviewProject='', reviewBoard='', reviewRevision='', reviewBefore:Shot[]=[], reviewAfter:Shot[]=[], reviewEdits=0
 const shotOutputs = ref<Record<string, { status: CreateItem['status']; count: number; image?: string }>>({})
 const detail = ref<Shot | null>(null)
 const actingPrompt = ref('')
@@ -88,10 +93,15 @@ function sceneCell(s: Shot): { label: string; cls: string; title: string } {
   return { label: '—', cls: 'bg-white/5 text-slate-500', title: '未设置场景' }
 }
 
+let loadSeq = 0
 async function load() {
-  if (!app.current) return
-  try { data.value = await fetchScriptData(app.current) } catch { data.value = null }
-  try { vendors.value = (await fetchEnvConfig()).vendors || [] } catch { vendors.value = [] }
+  const project = app.current, seq = ++loadSeq
+  if (!project) return
+  const [script, config] = await Promise.allSettled([fetchScriptData(project), fetchEnvConfig()])
+  if (seq !== loadSeq || project !== app.current) return
+  data.value = script.status === 'fulfilled' ? script.value : null
+  vendors.value = config.status === 'fulfilled' ? config.value.vendors || [] : []
+  if (script.status === 'rejected') toast('分镜资料载入失败，请刷新重试', 'err')
   boards.value = (projectFiles('分镜') || []).filter((f) => f.endsWith('.json') && f.startsWith('剧本_') && !f.includes('/') && !f.startsWith('.'))
 
   if (board.value) void loadBoard()
@@ -101,30 +111,25 @@ async function loadBoard() {
   const project = app.current
   const name = board.value
   shots.value = []
+  originalShots.value=[]; reviewOpen.value=false
   shotOutputs.value = {}
   boardRev.value = null
   boardFileRev.value = ''
   boardActors.value = {}
   boardConflict.value = ''
-  overwriteConfirmed.value = false
   detail.value = null
   if (!project || !name) return
   try {
-    const b: WhiteBoard = await fetchWhiteBoard(project, name)
+    const reviewed = await fetchStoryboardReview(project,name)
+    const b: WhiteBoard = reviewed.board
     if (seq !== boardLoadSeq) return
     boardActors.value = (b.actors || {}) as Record<string, { name?: string }>
     shots.value = ((b.shots || []) as unknown as Shot[]).map(s => ({...s, prompt_image: s.prompt_image || s.prompt || '', dur: Number(s.dur) > 0 ? Number(s.dur) : 4}))
+    originalShots.value=JSON.parse(JSON.stringify(shots.value))
+    boardFileRev.value=reviewed.revision
     boardRev.value = typeof b.script_rev === 'number' ? b.script_rev : null
   } catch {
     if (seq === boardLoadSeq) shots.value = []
-  }
-  // 乐观锁基线单独取：/api/white/board 是白模页共用的「原文件直出」，不能往里塞元信息；
-  // 取不到基线时宁可让保存被 400 挡下，也不能退化成无锁整组覆盖。
-  try {
-    const r = await fetchStoryboardRevision(project, name)
-    if (seq === boardLoadSeq) boardFileRev.value = r.revision || ''
-  } catch {
-    if (seq === boardLoadSeq) boardFileRev.value = ''
   }
   try {
     const created = await fetchCreate(project)
@@ -188,33 +193,60 @@ const savingGrid = ref(false)
 // 编辑计数：用于识别「保存请求在途期间用户又改了格子」——那时不得用服务端回读覆盖在途编辑
 let gridEdits = 0
 // 切分镜表必须复位脏标记：否则仍显示「有未保存修改」，点保存会把新表整组回写并生成多余 .versions 快照
-watch(board, () => { gridDirty.value = false; gridEdits++; boardConflict.value = ''; overwriteConfirmed.value = false })
+watch(board, () => { gridDirty.value = false; gridEdits++; boardConflict.value = '' })
 
 /** 汇总表格：行内编辑 内容/动作/声音/光影/三提示词（时长/器械/镜头只读，调整在⑦创作生成），整组回写（版本快照保护） */
 function markDirty() { gridEdits++; gridDirty.value = true }
-async function saveGrid() {
+const shotLabels={dur:'时长（秒）',scene_ref:'场景引用',shot_size:'景别',camera_move:'运镜',angle:'角度',transition:'转场',content:'画面内容',action:'动作',sound:'声音',lighting:'光影',lines:'台词',prompt_image:'参考帧提示词',prompt_video:'视频提示词',prompt_grid:'宫格提示词',prompt:'镜头提示词',rig:'器械',lens:'镜头',actor_refs:'人物引用',prop_refs:'道具引用',asset_refs:'素材引用'}
+async function openReview(useLatest=false) {
+  if(!app.current || !board.value || savingGrid.value) return
+  reviewProject=app.current;reviewBoard=board.value;reviewAfter=JSON.parse(JSON.stringify(shots.value));reviewEdits=gridEdits
+  reviewError.value=''
+  try {
+    if(useLatest) {
+      const latest=await fetchStoryboardReview(reviewProject,reviewBoard)
+      if(reviewProject!==app.current || reviewBoard!==board.value) return
+      reviewBefore=((latest.board.shots || []) as unknown as Shot[]).map(s=>({...s,prompt_image:s.prompt_image || s.prompt || '',dur:Number(s.dur)>0?Number(s.dur):4}))
+      if(reviewBefore.length!==reviewAfter.length || reviewBefore.some(s=>!reviewAfter.some(r=>r.id===s.id))) throw new Error('镜头列表已变化，请重新载入后合并编辑。')
+      reviewRevision=latest.revision
+    } else {reviewBefore=JSON.parse(JSON.stringify(originalShots.value));reviewRevision=boardFileRev.value}
+    if(!reviewRevision) throw new Error('未取得分镜版本，请重新载入。')
+    reviewItems.value=reviewAfter.map(shot=>({id:shot.id,title:shot.id,groups:changedGroups((reviewBefore.find(s=>s.id===shot.id) || {}) as Record<string,unknown>,shot as unknown as Record<string,unknown>,shotLabels)})).filter(item=>item.groups.length)
+    reviewOpen.value=true
+  } catch(e) {toast(e instanceof Error?e.message:'读取分镜审核失败','err')}
+}
+async function saveGrid(ids:string[]) {
   if (!app.current || !board.value || !shots.value.length) return
   // 拿不到基线就不发写请求：整组回写一旦失去基线就退化成"最后写入者赢"，正是这次要堵的洞
-  if (!boardFileRev.value) {
+  if (!reviewRevision || reviewProject!==app.current || reviewBoard!==board.value) {
     boardConflict.value = '没拿到这份分镜的基线版本（服务在重启、或文件刚被换过），已拦住保存。点「重新载入最新版」后再试。'
     return
   }
   savingGrid.value = true
-  const editsAtSave = gridEdits
+  const editsAtSave = reviewEdits
+  const submitted=mergeReviewedRows(reviewBefore,reviewAfter,ids)
   try {
-    const r = await saveStoryboardShots(app.current, board.value, shots.value, boardFileRev.value)
+    const r = await saveStoryboardShots(reviewProject, reviewBoard, submitted, reviewRevision)
+    reviewOpen.value=false
+    if(reviewProject!==app.current || reviewBoard!==board.value) {toast('分镜修改已提交','ok');return}
     if (r.revision) boardFileRev.value = r.revision
     boardConflict.value = ''
-    overwriteConfirmed.value = false
-    toast(`已保存 ${r.shots} 镜（旧版自动进 .versions）`, 'ok')
+    toast(`已提交 ${ids.length} 镜修改，旧版已保存`, 'ok')
     if (r.unit_warnings?.length) {
       // ① 锚定的创作禁区命中：只提醒不拦保存（分镜是给人改的工作件，拦了等于抽奖）
       const first = r.unit_warnings[0]
       toast(`创作禁区告警 ${r.unit_warnings.length} 镜：${first.shot_id} 违反 ${first.taboo_id}（${first.rule}）`, 'info', 8000)
     }
-    if (editsAtSave === gridEdits) { gridDirty.value = false; loadBoard() }
+    const stored=r.board ? ((r.board.shots || []) as unknown as Shot[]).map(s=>({...s,prompt_image:s.prompt_image || s.prompt || '',dur:Number(s.dur)>0?Number(s.dur):4})) : submitted
+    originalShots.value=JSON.parse(JSON.stringify(stored))
+    if (editsAtSave === gridEdits) {
+      shots.value=shots.value.map(shot=>ids.includes(shot.id) ? stored.find(saved=>saved.id===shot.id) || shot : shot)
+      gridDirty.value=JSON.stringify(shots.value)!==JSON.stringify(stored)
+      if(!gridDirty.value) void loadBoard()
+    }
     else { gridDirty.value = true; toast('保存期间你又改了内容：已保留你的编辑，暂不重载服务端版本', 'info') }
   } catch (e) {
+    reviewError.value=e instanceof Error?e.message:'分镜提交失败，编辑已保留'
     if (isRevisionConflict(e)) { boardConflict.value = conflictNotice(e); toast('分镜已被别处改动：本次保存没有写下去', 'err') }
     else toast(e instanceof Error ? e.message : '保存失败', 'err')
   }
@@ -223,21 +255,8 @@ async function saveGrid() {
 /** 冲突后先看再决定：重载会丢页面未保存的编辑，所以只在用户显式点击时做。 */
 async function reloadLatest() {
   boardConflict.value = ''
-  overwriteConfirmed.value = false
   await loadBoard()
   toast('已重载服务端最新版，你的表格编辑被替换', 'info')
-}
-/** 「仍用我的版本覆盖」= 重取基线后立刻把页面这份整组写回（旧版仍进 .versions，可回滚）。 */
-async function overwriteLatest() {
-  if (!app.current || !board.value) return
-  try {
-    const r = await fetchStoryboardRevision(app.current, board.value)
-    if (!overwriteAllowed(overwriteConfirmed.value, r.revision || '')) {
-      toast('请先勾选「确认以我这版为准」再点覆盖', 'err'); return
-    }
-    boardFileRev.value = r.revision
-    await saveGrid()
-  } catch (e) { toast(e instanceof Error ? e.message : '取基线失败，未覆盖', 'err') }
 }
 async function doXlsx() {
   if (!app.current || !board.value) return
@@ -320,44 +339,41 @@ watch(readyEpisodeIds, (ids) => {
   if (next.length !== epsSel.value.length) epsSel.value = next
 }, { immediate: true })
 async function doSb() {
-  if (!app.current || busy.value) return
+  await runBatch('storyboard')
+}
+const batchResults=ref<BatchResult[]>([]), batchTotal=ref(0)
+const batchAction=ref<'storyboard'|'prompts'|'references'>('storyboard')
+const batchProject=ref('')
+async function runBatch(action:typeof batchAction.value, retry=false) {
+  if(!app.current || busy.value || sbRunning.value.length) return
+  if(gridDirty.value) {toast('请先提交当前分镜编辑，再执行批量任务','err');return}
+  const project=app.current, vendor=actingVendor.value?.id
+  if(action==='prompts' && !vendor) {toast('请先启用文字模型','err');return}
   const readyIds = new Set(readyEpisodeIds.value)
-  const skipped = epsSel.value.filter((id) => !readyIds.has(id))
-  const selected = epsSel.value.length ? epsSel.value.filter((id) => readyIds.has(id)) : []
-  if (skipped.length) {
-    epsSel.value = selected
-    toast(`已跳过 ${skipped.join('、')}：暂无剧本文本，请先扩写`, 'info', 5000)
-  }
-  const targets = selected.length ? selected : ['']
-  sbRunning.value = targets.map((e) => e || '全本')
-  const results = await Promise.allSettled(
-    targets.map(async (ep) => {
-      const r = await scriptStoryboard(app.current!, ep || undefined)
-      if (!r.id) throw new Error(r.err || '任务未启动')
-      return trackJob(r.id, `分镜 ${ep || '全本'}`)
-    })
-  )
-  const ok = results.filter((r) => r.status === 'fulfilled' && (r.value as { success?: boolean }).success).length
-  const fail = results.length - ok
-  const failures = results.flatMap((result) => {
-    if (result.status === 'rejected') {
-      return [result.reason instanceof Error ? result.reason.message : String(result.reason)]
-    }
-    const value = result.value as { success?: boolean; err?: string }
-    return value.success ? [] : [value.err || '任务失败']
-  })
-  if (fail === 0) toast(`分镜生成完成：${ok} 个任务`, 'ok', 5000)
-  else toast(`完成 ${ok} / 失败 ${fail}：${failures.slice(0, 2).join('；')}`, 'err', 7000)
-  sbRunning.value = []
-  load()
+  const targets=retry && batchProject.value===project ? batchResults.value.filter(r=>!r.ok).map(r=>r.id) : epsSel.value.filter(id=>readyIds.has(id))
+  if(!targets.length) {toast('请先选择有正文的分集','err');return}
+  batchAction.value=action;batchProject.value=project;batchTotal.value=targets.length;batchResults.value=[]
+  busy.value='批量处理中'
+  try {
+    const results=await runSelectedBatch(targets,async ep=>{
+      const name=`剧本_${ep}.json`
+      if(action==='references') {await fetchStoryboardReview(project,name);await rebuildProductionPrompts({project,episode:ep});return}
+      const response=action==='storyboard' ? await scriptStoryboard(project,ep)
+        : await submitStudioJob({project,board:name,action:'prompts',only_missing:true,vendor_id:vendor!,revision:(await fetchStoryboardReview(project,name)).revision})
+      if(!response.id) throw new Error('任务未启动；已有分镜缺失时请先生成分镜')
+      const job=await trackJob(response.id,`${ep} · ${action==='storyboard'?'生成分镜':'补齐三类提示词'}`)
+      if(!job.success) throw new Error(job.err || '任务失败，请查看日志')
+    },results=>{batchResults.value=results})
+    const failed=results.filter(r=>!r.ok).length
+    toast(`批量结束：完成 ${results.length-failed} / 失败 ${failed}`,failed?'err':'ok',6000)
+    if(project===app.current) await load()
+  } finally {busy.value=''}
 }
 /** 说话人显示名：板内 actors（分镜自带的名字表）优先，其次 ② 提炼的人物档案，最后才退回 id。
  *  与 `export_storyboard_xlsx.speaker_name` 同一条链（共用 utils/assetNames）。 */
 function spk(id?: string) {
   return speakerName(id, boardActors.value, chars.value)
 }
-
-function goPackage() { router.push('/package') }
 
 function boardEpisode(name: string): string {
   const match = String(name || '').match(/^剧本_(.+)\.json$/)
@@ -366,24 +382,25 @@ function boardEpisode(name: string): string {
 }
 async function doRebuildPrompts() {
   if (!app.current || !board.value || busy.value) return
-  busy.value = '只更新提示词'
+  busy.value = '同步提示词'
   try {
     const r = await rebuildProductionPrompts({ project: app.current, episode: boardEpisode(board.value) || undefined })
-    toast(`已更新 ${r.updated_prompts || 0} 镜提示词；未调用媒体模型`, 'ok', 5000)
+    toast(`已同步 ${r.updated_prompts || 0} 镜提示词与素材引用`, 'ok', 5000)
     await loadBoard()
   } catch (e) { toast(e instanceof Error ? e.message : '提示词重建失败', 'err', 6000) }
   finally { busy.value = '' }
 }
-async function doRebuildEpisode() {
-  if (!app.current || !board.value || busy.value) return
-  const episode = boardEpisode(board.value)
-  if (!episode) { toast('当前是全本分镜，无法按集重建；请使用“只更新提示词”', 'info', 4500); return }
-  busy.value = '重建本集提示词'
+async function fillMissingPrompts() {
+  if (!app.current || !board.value || !actingVendor.value || busy.value || gridDirty.value) return
+  const project = app.current, name = board.value
+  busy.value = '补齐提示词'
   try {
-    const r = await rebuildProductionEpisode({ project: app.current, episode })
-    toast(`已重建 ${episode}：${r.updated_prompts || 0} 镜；未调用媒体模型`, 'ok', 5000)
-    await loadBoard()
-  } catch (e) { toast(e instanceof Error ? e.message : '本集重建失败', 'err', 6000) }
+    const r = await submitStudioJob({project, board:name, action:'prompts', only_missing:true, vendor_id:actingVendor.value.id, revision:boardFileRev.value})
+    if (!r.id) throw new Error('补齐任务未启动')
+    const job=await trackJob(r.id, '补齐分镜提示词')
+    if(!job.success) throw new Error(job.err || '提示词补全失败')
+    if (project === app.current && name === board.value) await loadBoard()
+  } catch (e) { toast(e instanceof Error ? e.message : '提示词补全失败', 'err') }
   finally { busy.value = '' }
 }
 async function doActingPrompt(s: Shot) {
@@ -417,8 +434,8 @@ useBoardSelection(board, boards, 'shots')
 <template>
   <div class="page">
     <header class="mb-6">
-      <h1 class="grad-text text-2xl font-black">③ 分镜生成</h1>
-      <p class="mt-1 text-xs text-slate-500">LLM 同时生成转场镜头的参考帧、视频、宫格提示词及 V 分组。三类提示词可分别编辑，创作台使用同一份分镜。</p>
+      <h1 class="grad-text text-2xl font-black">分镜设计</h1>
+      <p class="mt-1 text-sm text-slate-400">生成并编辑 S 转场镜头，创作生成会沿用这里的提示词与素材引用。</p>
     </header>
 
     <EmptyState v-if="!app.current" title="请先在左侧选择项目" />
@@ -430,7 +447,7 @@ useBoardSelection(board, boards, 'shots')
         <div class="mb-3 rounded-xl border border-pink-400/25 bg-pink-400/5 p-3">
           <div class="flex flex-wrap items-center gap-2">
             <h3 class="shrink-0 text-sm font-black text-pink-200">选择集</h3>
-            <span class="shrink-0 text-xs text-slate-400">可多选 · 有正文 {{ readyEpisodes.length }}/{{ episodes.length }} · 默认已全选可生成集</span>
+            <span class="shrink-0 text-xs text-slate-300">有正文 {{ readyEpisodes.length }}/{{ episodes.length }} · 可多选</span>
             <span class="flex-1"></span>
             <button v-if="readyEpisodes.length" class="shrink-0 rounded-full px-2.5 py-0.5 text-2xs font-bold"
               :class="allReadySelected ? 'bg-pink-400/25 text-pink-200' : 'bg-white/10 text-slate-300 hover:bg-white/20'"
@@ -454,17 +471,21 @@ useBoardSelection(board, boards, 'shots')
           <span v-if="epsSel.length" class="shrink-0 text-2xs text-slate-500">将生成：{{ epsSel.join('、') }}</span>
           <span class="flex-1"></span>
           <button class="btn shrink-0" :disabled="!!busy || !!sbRunning.length || !epsSel.length" @click="doSb" title="按选中的分集生成分镜 JSON；会更新镜头动作、机位和提示词">
-            {{ sbRunning.length ? `生成中（${sbRunning.join(' ')}）…` : epsSel.length > 1 ? `LLM 生成分镜（${epsSel.length} 集并行）` : 'LLM 生成分镜' }}
+            批量生成分镜（{{epsSel.length}} 集）
           </button>
+          <button class="btn btn-ghost" :disabled="!!busy || !epsSel.length || !actingVendor || gridDirty" @click="runBatch('prompts')">批量补齐三类提示词</button>
+          <button class="btn btn-ghost" :disabled="!!busy || !epsSel.length || gridDirty" @click="runBatch('references')">批量同步素材引用</button>
+        </div>
+        <div v-if="batchTotal && batchProject===app.current" class="mt-3 rounded-lg border border-white/15 p-3 text-sm">
+          <p>本批进度 {{batchResults.length}} / {{batchTotal}}<button v-if="batchResults.some(r=>!r.ok)" class="btn btn-ghost ml-3" :disabled="!!busy" @click="runBatch(batchAction,true)">只重试失败项</button></p>
+          <p v-for="result in batchResults" :key="result.id" :class="result.ok?'text-emerald-300':'text-rose-200'">{{result.id}} · {{result.ok?'完成':result.error}}</p>
         </div>
         <!-- 行 2：已有分镜与操作（槽位固定，控件底部对齐，不随上行换行偏移） -->
         <div class="mt-3 flex flex-wrap items-end gap-2 border-t border-line-soft pt-3">
           <label class="w-56 shrink-0 text-xs text-slate-400">已有分镜
             <StyledSelect v-model="board" class="mt-1" :options="boards" :storage-key="`wb.${app.current}.shots.board`" placeholder="— 选择 —" />
           </label>
-          <button class="btn shrink-0" :disabled="!board" title="走位战略图 / 平面图 / 预演包 / 逐镜包——分镜定稿后的组装产物都在平面推演页" @click="goPackage">去平面推演 →</button>
-          <button class="btn btn-ghost shrink-0" :disabled="!!busy || !board" @click="doRebuildPrompts" title="只按当前全局资产和分镜事实重建静态参考图/生视频提示词，不调用模型，不生成媒体">只更新提示词</button>
-          <button class="btn btn-ghost shrink-0" :disabled="!!busy || !board || !boardEpisode(board)" @click="doRebuildEpisode" title="重建当前分集的全部分镜提示词；不修改分集正文、大纲或已有图片视频">重建本集</button>
+          <button class="btn btn-ghost shrink-0" :disabled="!!busy || !board" @click="doRebuildPrompts" title="根据当前分镜和素材更新编译提示词及引用，不调用生成模型">同步提示词与素材引用</button>
           <Versions v-if="board" :path="`projects/${app.current}/分镜/${board}`" kind="file" @restored="loadBoard" />
           <span v-if="board && boardRev !== null"
             class="shrink-0 rounded-full px-2.5 py-0.5 text-2xs"
@@ -476,18 +497,15 @@ useBoardSelection(board, boards, 'shots')
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path :d="icons.trash" stroke-linecap="round" stroke-linejoin="round"/></svg>
           </button>
           <span class="flex-1"></span>
-          <StyleSelect target="storyboard" label="导演风格" />
+          <StyleSelect target="storyboard_camera" label="镜头语言" />
+          <StyleSelect target="storyboard_keyframe" label="关键帧方法" />
+          <StyleSelect target="storyboard_motion" label="运动提示方法" />
           <StyleSelect target="acting" label="演员风格" />
         </div>
         <!-- 资产前置提示（非阻断）：scene_ref 是平面图/空间一致性链路的根基，提炼应在分镜生成之前 -->
-        <div v-if="!chars.length || !scenesAssets.length" class="mb-3 rounded-xl border border-amber-400/25 bg-amber-400/5 p-3 text-xs-plus leading-relaxed text-amber-200/90">
-          <b>资产未提炼。</b>正确顺序：① 剧本生成 → <b>② 素材提炼（人物/场景/道具）</b> → 回本页生成分镜——分镜会自动关联场景资产（scene_ref）与人物/道具引用，是平面推演与视频空间一致性的根基，无需任何手动绑定。
-          <template v-if="shots.length">
-            当前分镜已生成但未关联场景——<b>提炼后回到本页重新生成分镜即可自动补上</b>（已采用的关键帧/视频会保留）。
-          </template>
-          <template v-else>纯对白/白模用法可以不提炼直接生成，但平面推演与参考帧回流将不可用。</template>
+        <div v-if="!chars.length || !scenesAssets.length" class="mb-3 rounded-xl border border-amber-400/25 bg-amber-400/5 p-3 text-sm leading-relaxed text-amber-100">
+          缺少人物或场景设定。先在剧本页补全规划，素材页会继承已保存设定。
         </div>
-        <p v-if="!chars.length && false" class="mt-2 text-xs-plus text-amber-300/80"></p>
         <div v-if="kbHits.length" class="mt-2 flex flex-wrap items-center gap-1.5">
           <span class="text-2xs font-bold text-emerald-400/80">将垫入上下文的拉片卡片</span>
           <span v-for="h in kbHits" :key="h.id"
@@ -509,16 +527,17 @@ useBoardSelection(board, boards, 'shots')
             :class="viewTab === 'cards' ? 'chip-active' : 'chip'"
             @click="viewTab = 'cards'">逐镜明细</button>
           <span class="text-xs-plus text-slate-500">{{ shots.length }} 镜</span>
+          <button v-if="missingPrompts" class="btn" :disabled="!!busy || gridDirty || !actingVendor" @click="fillMissingPrompts" title="使用已启用文字模型补齐空白的参考帧、视频和宫格提示词，保留已有内容；请先保存修改">补齐提示词（{{ missingPrompts }} 镜）</button>
           <span class="flex-1"></span>
           <template v-if="viewTab === 'grid'">
             <span v-if="gridDirty" class="text-xs-plus text-amber-300">有未保存修改</span>
             <button class="btn btn-ghost" :disabled="!shots.length"
               @click="gridFullscreen = !gridFullscreen">{{ gridFullscreen ? '退出全屏 (Esc)' : '全屏' }}</button>
             <button class="btn btn-ghost" :disabled="!shots.length" title="按景别/运镜为空白格填默认镜头焦距与器械"
-              @click="fillDefaults">补默认</button>
+              @click="fillDefaults">补齐机位参数</button>
             <button class="btn btn-ghost" :disabled="savingGrid" @click="doXlsx">导出 Excel</button>
-            <button class="btn" :disabled="!gridDirty || savingGrid" @click="saveGrid">
-              {{ savingGrid ? '保存中…' : '保存修改' }}
+            <button class="btn" :disabled="!gridDirty || savingGrid" @click="openReview()">
+              {{ savingGrid ? '提交中…' : '批量审核修改' }}
             </button>
           </template>
         </div>
@@ -528,11 +547,8 @@ useBoardSelection(board, boards, 'shots')
           <b class="font-bold">这份分镜被别处改动过，本次保存没有写下去</b>
           <p class="mt-1 leading-relaxed">{{ boardConflict }}</p>
           <div class="mt-2 flex flex-wrap items-center gap-3">
-            <label class="flex items-center gap-1.5 text-2xs">
-              <input v-model="overwriteConfirmed" type="checkbox" /> 确认以我这版为准（会覆盖 ⑦/⑤ 改的提示词）
-            </label>
             <button class="btn btn-ghost" @click="reloadLatest">重新载入最新版</button>
-            <button class="btn" :disabled="!overwriteConfirmed || savingGrid" @click="overwriteLatest">仍用我的版本覆盖</button>
+            <button class="btn" :disabled="savingGrid" @click="openReview(true)">对比最新版本并合并</button>
           </div>
         </div>
 
@@ -578,9 +594,9 @@ useBoardSelection(board, boards, 'shots')
                   <td><textarea v-model="s.sound" rows="2" class="cell-input text-slate-400" @input="markDirty"></textarea></td>
                   <td><textarea v-model="s.lighting" rows="2" class="cell-input text-slate-400" @input="markDirty"></textarea></td>
                   <td class="max-w-56 text-slate-400">{{ linesOf(s) || '—' }}</td>
-                  <td><textarea v-model="s.prompt_image" rows="3" class="cell-input text-slate-300" @input="markDirty"></textarea></td>
-                  <td><textarea v-model="s.prompt_video" rows="3" class="cell-input text-slate-300" @input="markDirty"></textarea></td>
-                  <td><textarea v-model="s.prompt_grid" rows="3" class="cell-input text-slate-300" @input="markDirty"></textarea></td>
+                  <td><textarea v-model="s.prompt_image" rows="4" class="cell-input min-h-24 min-w-64 text-slate-200" @input="markDirty"></textarea></td>
+                  <td><textarea v-model="s.prompt_video" rows="4" class="cell-input min-h-24 min-w-64 text-slate-200" @input="markDirty"></textarea></td>
+                  <td><textarea v-model="s.prompt_grid" rows="4" class="cell-input min-h-24 min-w-64 text-slate-200" @input="markDirty"></textarea></td>
                 </tr>
               </tbody>
             </table>
@@ -672,6 +688,5 @@ useBoardSelection(board, boards, 'shots')
     </template>
 
   </div>
+  <BatchDiffReview v-model:open="reviewOpen" title="批量审核分镜修改" :items="reviewItems" :busy="savingGrid" :error="reviewError" submit-label="确认保存" @confirm="saveGrid" />
 </template>
-
-

@@ -1,5 +1,10 @@
 # -*- coding: utf-8 -*-
-"""按 storyboard 串行执行创作任务，每个镜头对应一个 creation.json 条目。"""
+"""按 storyboard 批量执行创作任务，每个镜头对应一个 creation.json 条目。
+
+备料（读盘 + 提示词编译）串行按镜号顺序做，网络阻塞的生图/生视频子进程并发跑；
+并发数由 vendor_concurrency.parallel_cap 决定：云端厂商按 --workers，
+本机 ComfyUI 与 ChatGPT 网页队列压回 1 路（前者只有一个队列，后者是浏览器自动化）。
+"""
 import argparse
 import json
 import os
@@ -18,6 +23,26 @@ import prompt_assembler
 import prompt_compiler
 import project_store
 from reference_limits import reference_limit
+
+
+def run_prepared(prepared, vendor, workers=4, cwd=None):
+    """并发执行备料好的子进程命令，返回失败数。串行厂商（本机 ComfyUI/ChatGPT 网页队列）自动降为 1。"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    from vendor_concurrency import parallel_cap
+    cap = parallel_cap(vendor, workers)
+    if cap <= 1:
+        done = [(sid, subprocess.run(cmd, cwd=cwd, check=False).returncode) for sid, cmd in prepared]
+    else:
+        print(f"[批量] 并发 {cap} 路（厂商 {vendor}；--workers 可调，429 由退避重试兜底）", flush=True)
+        with ThreadPoolExecutor(max_workers=cap) as ex:
+            futs = {ex.submit(subprocess.run, cmd, cwd=cwd, check=False): sid for sid, cmd in prepared}
+            done = [(futs[f], f.result().returncode) for f in as_completed(futs)]
+    failed = 0
+    for sid, rc in done:
+        if rc != 0:
+            failed += 1
+            print(f"[批量] {sid} 失败，继续后续镜头", flush=True)
+    return failed
 
 
 def _board(project, name):
@@ -49,10 +74,11 @@ def main():
     ap.add_argument("--mode", choices=["generate", "edit"], default="generate", help="图片模式")
     ap.add_argument("--vendor", required=True)
     ap.add_argument("--providers", required=True)
+    ap.add_argument("--workers", type=int, default=4,
+                    help="云端厂商并发数（默认 4，上限 8；本机 ComfyUI 与 ChatGPT 网页队列自动降为 1）")
     ap.add_argument("--shot-id", action="append", default=[], help="只执行指定镜头，可重复；"
                     "整板执行必须同时给 --all（不给又不用 --all 会直接拒绝，避免误烧全板）")
-    ap.add_argument("--all", action="store_true", dest="all_shots",
-                    help="显式声明整板执行（与 --shot-id 二选一）")
+    ap.add_argument("--all", action="store_true", dest="all_shots",                    help="显式声明整板执行（与 --shot-id 二选一）")
     a = ap.parse_args()
     project = os.path.abspath(a.project)
     board_name, board = _board(project, a.board)
@@ -80,7 +106,9 @@ def main():
         from llm_openai import VendorClient
         VendorClient.from_config(vendor_cfg or {}).validate_video_config(vendor_model)
     ref_cap = reference_limit(a.vendor, vendor_model, a.type, vendor_cfg)
-    failed = 0
+    # 先串行备料（读盘与提示词编译，顺序与 manifest 条目顺序一致），再把网络阻塞的
+    # 生图/生视频子进程并发跑；本机 ComfyUI 与 ChatGPT 网页队列由并发口径压回 1。
+    prepared = []
     for idx, shot in enumerate(shots, 1):
         if not isinstance(shot, dict) or not shot.get("id"):
             continue
@@ -133,11 +161,9 @@ def main():
             cmd += ["--ref-role", str(ref.get("reference_role") or "unspecified")]
             if ref.get("target_time_seconds") is not None:
                 cmd += ["--ref-time", str(ref.get("target_time_seconds"))]
-        print(f"[批量] {idx}/{len(shots)} {shot['id']}", flush=True)
-        result = subprocess.run(cmd, cwd=project, check=False)
-        if result.returncode != 0:
-            failed += 1
-            print(f"[批量] {shot['id']} 失败，继续后续镜头", flush=True)
+        print(f"[批量] 备料 {idx}/{len(shots)} {shot['id']}", flush=True)
+        prepared.append((str(shot["id"]), cmd))
+    failed = run_prepared(prepared, a.vendor, a.workers, cwd=project)
     print(f"BATCH_DONE failed={failed} total={len(shots)}")
     if failed:
         return 1

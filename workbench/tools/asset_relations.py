@@ -67,6 +67,10 @@ def _make_lookup(rows):
             ident = str(item.get("id") or "").strip()
             ref = asset_ref(kind, ident)
             exact[ref] = ref
+            for state in item.get('states') or []:
+                if isinstance(state, dict) and state.get('id') and not state.get('output_asset_ref'):
+                    state_ref = ref + '#' + str(state['id'])
+                    exact[state_ref] = state_ref
             names = [ident, item.get("name"), item.get("display_name")]
             aliases = item.get("aliases") or item.get("alias") or []
             names.extend(aliases if isinstance(aliases, list) else [aliases])
@@ -105,6 +109,8 @@ def _resolve(value, lookup, default_kind=None):
         direct = asset_ref(kind, ident)
         if direct in lookup[0]:
             return direct, None
+        if '#' in ident:
+            return None, f"找不到派生状态：{value}"
         matches = lookup[1].get((kind, _canon(ident)), set())
     else:
         matches = lookup[1].get((None, _canon(ident)), set())
@@ -163,13 +169,17 @@ def normalize_asset_relations(data):
             ident = str(item.get("id") or "").strip()
             self_ref = asset_ref(kind, ident)
             parent_value = item.get("parent_ref")
-            if parent_value in (None, ""):
+            parent_cleared = 'parent_ref' in item and parent_value in (None, '')
+            display_locked = parent_cleared or 'parent_ref' in (item.get('locked_fields') or [])
+            if parent_value in (None, "") and not parent_cleared:
                 parent_value = item.get("owner_ref")
-            if parent_value in (None, ""):
+            if parent_value in (None, "") and not parent_cleared:
                 parent_value = item.get("parent")
-            if parent_value in (None, "") and kind == "prop":
+            if parent_value in (None, "") and kind == "prop" and not parent_cleared:
                 parent_value = item.get("owner")
             parent, reason = _resolve(parent_value, lookup, "character" if kind == "prop" else None)
+            if parent and '#' in parent:
+                reason = "展示归属应选择母素材；派生图请填入生成参考"
             # 道具 owner 既可能是角色，也可能是场景陈设；先按角色解析，失败后再按场景解析。
             if reason and kind == "prop" and parent_value not in (None, ""):
                 parent, reason = _resolve(parent_value, lookup, "scene")
@@ -185,7 +195,10 @@ def normalize_asset_relations(data):
                 default_relation = "located_in" if parent.startswith("@scene:") else ("component_of" if kind == "prop" else "contains")
                 item["relation"] = relation if relation in RELATIONS else default_relation
             elif "parent_ref" in item:
-                item.pop("parent_ref", None)
+                if parent_cleared:
+                    item['parent_ref'] = None
+                else:
+                    item.pop("parent_ref", None)
                 if item.get("relation") in ("component_of", "contains", "located_in"):
                     item.pop("relation", None)
 
@@ -198,26 +211,21 @@ def normalize_asset_relations(data):
             if reason:
                 issues.append({"ref": self_ref, "field": "derived_from", "message": reason})
                 derived = None
-            if derived == self_ref:
+            if derived and derived.split('#', 1)[0] == self_ref:
                 issues.append({"ref": self_ref, "field": "derived_from", "message": "资产不能派生自自身"})
                 derived = None
             if derived:
                 item["derived_from"] = derived
-                # 派生道具的母节点必须是它实际派生的道具。LLM 常会把
-                # “白咲蛛绪用蛛丝包住炸弹”误写成 parent_ref=女主，
-                # 同时又写 derived_from=遥控炸弹，结果复合道具会错误地
-                # 出现在角色子素材下。角色是动作发起者，不是该复合道具
-                # 的层级母素材；角色归属仍可保留在 owner 字段中。
-                # 只有当前父级为空或错误挂到角色时才自动纠正，用户把
-                # 派生物放入场景/其它母素材的显式层级仍予以保留。
-                if kind == "scene" and derived.startswith("@scene:") and not parent:
+                derived_parent = derived.split('#', 1)[0]
+                # 旧档案可由派生来源推导默认层级；人工明确的展示归属独立保留。
+                if kind == "scene" and derived.startswith("@scene:") and not parent and not display_locked:
                     # 场景派生状态与人物子素材使用相同层级，保留原 ID 和引用。
-                    parent = derived
+                    parent = derived_parent
                     item["parent_ref"] = parent
                     item["relation"] = "derived_from"
                 elif (kind == "prop" and derived.startswith("@prop:")
-                        and (not parent or parent.startswith("@character:"))):
-                    parent = derived
+                        and (not parent or parent.startswith("@character:")) and not display_locked):
+                    parent = derived_parent
                     item["parent_ref"] = parent
                     item["relation"] = "derived_from"
                 elif not item.get("relation"):

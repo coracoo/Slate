@@ -8,12 +8,185 @@ import threading
 import os as _os, unittest
 _os.environ.setdefault('SLATE_NO_AUTH', '1')   # HTTP 边界测试不做口令认证
 from pathlib import Path
-from unittest.mock import patch
+from urllib.parse import quote
+from unittest.mock import patch, MagicMock
 from http.server import ThreadingHTTPServer
 import workbench.server as server
 
 
 class HttpRouteTests(unittest.TestCase):
+    def test_runninghub_catalog_and_task_query_keep_secret_on_server(self):
+        import os
+        os.environ['SLATE_RUNNINGHUB_KEY_TYPE'] = 'SHARED'   # 固定企业 key 语境，避免测试依赖真网探测
+        try:
+            code, _, payload = self.request('/api/runninghub/catalog')
+        finally:
+            os.environ.pop('SLATE_RUNNINGHUB_KEY_TYPE', None)
+        self.assertEqual(code, 200, payload)
+        data = json.loads(payload)
+        self.assertGreater(len(data['apis']), 300)
+        self.assertIn('seedream-v5-pro/image-to-image', [r['id'] for r in data['models']['image_edit']])
+        cfg = dict(id='runninghub', enabled=True, api_key='saved-secret', base_url='https://www.runninghub.ai', models={})
+        with patch.object(server, 'load_vendors', return_value=[cfg]):
+            from runninghub_client import RunningHubClient
+            with patch.object(RunningHubClient, 'query', return_value={'taskId':'t', 'status':'RUNNING'}) as query:
+                code, _, payload = self.request('/api/runninghub/query', 'POST', b'{"task_id":"t"}')
+                self.assertEqual(code, 200, payload)
+                self.assertNotIn(b'saved-secret', payload)
+                query.assert_called_once()
+            with patch.object(RunningHubClient, 'call', return_value={'taskId':'t', 'status':'RUNNING'}) as call:
+                code, _, payload = self.request('/api/runninghub/submit', 'POST', b'{"endpoint":"minimax/hailuo-h3/text-to-video", "payload":{"prompt":"hello"}}')
+                self.assertEqual(code, 200, payload)
+                self.assertNotIn(b'saved-secret', payload)
+                self.assertEqual(call.call_count, 1)
+        code, _, _ = self.request('/api/runninghub/query', 'POST', b'{"task_id":"../escape"}')
+        self.assertEqual(code, 400)
+
+    def test_runninghub_query_downloads_all_outputs_and_serves_only_result_files(self):
+        from runninghub_client import RunningHubClient
+        cfg=dict(id='runninghub', enabled=False, api_key='secret', base_url='https://www.runninghub.ai', models={})
+        result={'taskId':'t','status':'SUCCESS','results':[{'url':'https://example.test/result.glb','outputType':'glb'}]}
+        with tempfile.TemporaryDirectory() as tmp, patch.object(server,'ROOT',str(Path(tmp)/'workbench')), patch.object(server,'VIDEO',tmp), patch.object(server,'load_vendors',return_value=[cfg]):
+            def save(data, out_path=None, **kwargs):
+                Path(out_path).parent.mkdir(parents=True,exist_ok=True)
+                Path(out_path).write_bytes(b'model-file')
+            with patch.object(RunningHubClient,'query',return_value=result), patch.object(RunningHubClient,'output',side_effect=save):
+                code,_,payload=self.request('/api/runninghub/query','POST',b'{"task_id":"t","download":true}')
+            self.assertEqual(code,200,payload)
+            file=json.loads(payload)['files'][0]
+            self.assertEqual(self.request(file['url'])[2],b'model-file')
+            self.assertEqual(self.request('/api/runninghub/file?task_id=t&name=../../providers.json')[0],400)
+
+    def test_asset_completion_passes_exact_selection_to_job(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server,'proj_dir',return_value=folder):
+            path=Path(folder)/'素材/道具.json'
+            path.parent.mkdir()
+            path.write_text(json.dumps({'props':[{'id':'p'},{'id':'q'}]}),encoding='utf-8')
+            with patch.object(server.H,'spawn_job',return_value=987) as spawn:
+                code,_,payload=self.request('/api/units/build','POST',json.dumps({'project':'test','stage':'entity','asset_refs':['@prop:p']}).encode())
+                self.assertEqual(code,200,payload)
+                args=spawn.call_args.args[1]
+                self.assertEqual(json.loads(args[args.index('--asset-refs')+1]),['@prop:p'])
+                spawn.reset_mock()
+                for refs in ([],['@prop:missing']):
+                    self.assertEqual(self.request('/api/units/build','POST',json.dumps({'project':'test','stage':'entity','asset_refs':refs}).encode())[0],400)
+                spawn.assert_not_called()
+
+    def test_batch_episode_edit_has_revision_and_partial_scope(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server,'proj_dir',return_value=folder):
+            path=Path(folder)/'剧本/分集.json'
+            path.parent.mkdir()
+            path.write_text(json.dumps({'episodes':[{'id':'E1','summary':'旧','text':'已采用正文'},{'id':'E2','summary':'不变'}]}),encoding='utf-8')
+            planning=server.tools_mod('story_planning_versions.py')
+            body=json.dumps({'project':'test','kind':'episodes','revision':planning.current_revision(folder),'items':[{'id':'E1','fields':{'summary':'新'}}]}).encode()
+            code,_,payload=self.request('/api/units/edit','POST',body)
+            self.assertEqual(code,200,payload)
+            self.assertEqual(json.loads(payload)['applied'],['E1'])
+            stored=json.loads(path.read_text('utf-8'))
+            self.assertEqual(stored['episodes'][1]['summary'],'不变')
+            self.assertEqual(self.request('/api/units/edit','POST',body)[0],409)
+
+    def test_visual_review_missing_assets_and_batch_save(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            path = Path(folder)/'素材/道具.json'
+            path.parent.mkdir()
+            path.write_text(json.dumps({'props':[{'id':'p','name':'铜牌'}]}),encoding='utf-8')
+            code, _, payload = self.request('/api/assets/visual-review?project=test')
+            self.assertEqual(code,200,payload)
+            result=json.loads(payload)
+            self.assertEqual(result['other_assets'][0]['id'],'@prop:p')
+            body=json.dumps({'project':'test','revision':result['revision'],'items':[{'id':'@prop:p','patch':{'visual_description':'方铜牌'}}]}).encode()
+            code,_,payload=self.request('/api/assets/visual-review','POST',body)
+            self.assertEqual(code,200,payload)
+            self.assertTrue(json.loads(payload)['validations']['@prop:p']['ready'])
+            self.assertEqual(self.request('/api/assets/visual-review','POST',body)[0],409)
+
+    def test_style_options_does_not_load_full_script_or_production_checks(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder), patch.object(server, 'tools_mod', side_effect=AssertionError('风格选择不能运行制作检查')):
+            path = Path(folder)/'剧本/style.json'
+            path.parent.mkdir()
+            path.write_text('{"image":"auto"}', encoding='utf-8')
+            code, _, payload = self.request('/api/skills/style?project=test')
+            self.assertEqual(code, 200, payload)
+            value = json.loads(payload)
+            self.assertEqual(value['style']['image'], 'auto')
+            self.assertTrue(value['skills'])
+            self.assertNotIn('script', value)
+
+    def test_asset_reconcile_previews_then_saves_reviewed_selection(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            base = Path(folder)
+            for name, data in {'剧本/分集.json': {'episodes':[{'id':'E1','key_asset_refs':['@prop:p']}]},
+                               '素材/道具.json': {'props':[{'id':'p','name':'令旗','image_prompt':'蓝布竹杆令旗'}]}}.items():
+                path = base/name
+                path.parent.mkdir(exist_ok=True)
+                path.write_text(json.dumps(data), encoding='utf-8')
+            code, _, payload = self.request('/api/assets/reconcile?project=test')
+            self.assertEqual(code, 200, payload)
+            result = json.loads(payload)
+            self.assertNotIn('_changes', result)
+            self.assertEqual(result['items'][0]['id'], '@prop:p')
+            body = json.dumps({'project':'test','revision':result['revision'],'selected':['@prop:p']}).encode()
+            code, _, payload = self.request('/api/assets/reconcile', 'POST', body)
+            self.assertEqual(code, 200, payload)
+            self.assertEqual(json.loads((base/'素材/道具.json').read_text('utf-8'))['props'][0]['visual_description'], '蓝布竹杆令旗')
+            self.assertEqual(self.request('/api/assets/reconcile', 'POST', body)[0], 409)
+
+    def test_character_batch_review_submits_selected_changes_atomically(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            path=Path(folder) / '素材/人物.json'
+            path.parent.mkdir()
+            path.write_text(json.dumps({'characters':[{'id':'a'},{'id':'b'}]}),encoding='utf-8')
+            _,_,payload=self.request('/api/characters?project=test')
+            revision=json.loads(payload)['revision']
+            body=json.dumps({'project':'test','expected_revision':revision,'items':[
+                {'character_id':'a','patch':{'appearance':{'face':'窄脸'}}},
+                {'character_id':'b','patch':{'appearance':{'hair':'短卷发'}}}]}).encode()
+            code,_,payload=self.request('/api/characters/save','POST',body)
+            self.assertEqual(code,200,payload)
+            self.assertEqual(json.loads(payload)['saved'],['a','b'])
+            code,_,_=self.request('/api/characters/save','POST',body)
+            self.assertEqual(code,409)
+
+    def test_storyboard_diff_reads_content_and_revision_from_same_document(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            path=Path(folder) / '分镜/剧本_E1.json'
+            path.parent.mkdir()
+            path.write_text('{"shots":[{"id":"S1","prompt":"现行提示词"}]}',encoding='utf-8')
+            code,_,payload=self.request('/api/storyboard/revision?project=test&name='+quote('剧本_E1.json')+'&include=board')
+            self.assertEqual(code,200,payload)
+            result=json.loads(payload)
+            self.assertEqual(result['board']['shots'][0]['prompt'],'现行提示词')
+            self.assertEqual(result['revision'],server.project_store.current_revision(path))
+
+    def test_storyboard_review_returns_saved_content_and_preserves_unselected_shot(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            path=Path(folder) / '分镜/board.json'
+            path.parent.mkdir()
+            shots=[{'id':'S1','dur':4,'action':'原动作一'},{'id':'S2','dur':4,'action':'原动作二'}]
+            path.write_text(json.dumps({'shots':shots}),encoding='utf-8')
+            shots[1]['action']='选中并确认的动作二'
+            body=json.dumps({'project':'test','name':'board.json','shots':shots,'revision':server.project_store.current_revision(path)}).encode()
+            code,_,payload=self.request('/api/storyboard/save','POST',body)
+            self.assertEqual(code,200,payload)
+            result=json.loads(payload)
+            self.assertEqual(result['board']['shots'][0]['action'],'原动作一')
+            self.assertEqual(result['board']['shots'][1]['action'],'选中并确认的动作二')
+            self.assertEqual(result['board'],json.loads(path.read_text(encoding='utf-8')))
+
+    def test_visual_asset_preview_reads_current_character_settings(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            base = Path(folder) / '素材'
+            base.mkdir()
+            (base / '人物.json').write_text(json.dumps({'characters': [{'id': 'a',
+                'sheet_prompt': '旧红衣', 'appearance': {'outfit': '新灰衣', 'hair': '短发'}}]}), encoding='utf-8')
+            code, _, payload = self.request('/api/asset/prompt_layers?project=test&kind=character&id=a')
+            self.assertEqual(code, 200, payload)
+            layers = json.loads(payload)['layers']
+            self.assertIn('新灰衣', layers['subject'])
+            self.assertIn('新灰衣', layers['final'])
+            self.assertNotIn('旧红衣', layers['final'])
+
     @classmethod
     def setUpClass(cls):
         cls.http = ThreadingHTTPServer(('127.0.0.1', 0), server.H)
@@ -23,6 +196,294 @@ class HttpRouteTests(unittest.TestCase):
     @classmethod
     def tearDownClass(cls):
         cls.http.shutdown(); cls.http.server_close(); cls.thread.join()
+
+    def test_existing_imported_episode_can_expand_without_idea(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder), patch.object(server.H, 'spawn_job', return_value=8) as spawn:
+            base = Path(folder) / '剧本'
+            base.mkdir()
+            (base / '分集.json').write_text(json.dumps({'episodes': [{'id': 'E1', 'text': '导入的正文'}]}), encoding='utf-8')
+            body = json.dumps({'project': 'test', 'episode': 'E1'}).encode()
+            self.assertEqual(self.request('/api/script/expand', 'POST', body)[0], 200)
+            self.assertIn('--episode', spawn.call_args.args[1])
+            self.assertNotIn('--idea', spawn.call_args.args[1])
+
+    def test_missing_episode_rejected_before_job_is_created(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder), patch.object(server.H, 'spawn_job') as spawn:
+            self.assertEqual(self.request('/api/script/expand', 'POST', json.dumps({'project': 'test', 'episode': 'E9'}).encode())[0], 400)
+            spawn.assert_not_called()
+
+    def test_invalid_episode_book_rejected_before_job_is_created(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder), patch.object(server.H, 'spawn_job') as spawn:
+            base = Path(folder) / '剧本'
+            base.mkdir()
+            for book in ([], {'episodes': 'E1'}, {'episodes': [None]}):
+                with self.subTest(book=book):
+                    (base / '分集.json').write_text(json.dumps(book), encoding='utf-8')
+                    self.assertEqual(self.request('/api/script/expand', 'POST', b'{"project":"test","episode":"E1"}')[0], 400)
+            spawn.assert_not_called()
+
+    def test_locked_actor_performance_keeps_stale_and_invalid_status(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            base = Path(folder) / '分镜'
+            base.mkdir()
+            (base / 'board.json').write_text('{}', encoding='utf-8')
+            actor = MagicMock()
+            actor.list_candidates.return_value = []
+            actor.hydrate_actor_cards.return_value = {}
+            actor.main_actor_records.return_value = {}
+            actor.actor_ids_for_shot.return_value = []
+            actor.continuity_evidence.return_value = None
+            compiler = MagicMock()
+            with patch.object(server, 'tools_mod', side_effect=lambda name: actor if name == 'actor_pipeline.py' else compiler):
+                for performance, warning, expected in [('ready', '', 'locked'), ('ready', '表演来源过期', 'stale'), ('invalid', '', 'invalid')]:
+                    with self.subTest(expected=expected):
+                        actor._read_board.return_value = ({'shots': [{'id': 'S1', 'performance_locked': True, 'performance': {'status': performance}}]}, 1)
+                        compiler.compile_shot.return_value = {'warnings': [warning] if warning else []}
+                        code, _, body = self.request('/api/acting/context?project=test&storyboard=board.json')
+                        self.assertEqual(code, 200, body)
+                        shot = json.loads(body)['shots'][0]
+                        self.assertTrue(shot['performance_locked'])
+                        self.assertEqual(shot['performance_status'], expected)
+
+    def test_units_job_receives_idea_without_a_second_outline_job(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder), patch.object(server.H, 'spawn_job', return_value=8) as spawn:
+            body = json.dumps({'project': 'test', 'idea': '一个完整的故事构想', 'eps': 2}).encode()
+            self.assertEqual(self.request('/api/units/build', 'POST', body)[0], 200)
+            command = spawn.call_args.args[1]
+            self.assertIn('units', command)
+            self.assertIn('一个完整的故事构想', command)
+            self.assertEqual(spawn.call_count, 1)
+
+    def test_completion_conflict_rejected_without_creating_job(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder), patch.object(server.H, 'spawn_job') as spawn:
+            base = Path(folder) / '剧本'
+            base.mkdir()
+            (base / '构想.txt').write_text('一个完整的故事构想', encoding='utf-8')
+            (base / '分集.json').write_text(json.dumps({'units_version': 1, 'episodes': [{'id': 'E1'}]}), encoding='utf-8')
+            (base / 'brief.json').write_text('{"total_episodes":15}', encoding='utf-8')
+            for endpoint in ('/api/units/build', '/api/script/expand'):
+                with self.subTest(endpoint=endpoint):
+                    code, _, payload = self.request(endpoint, 'POST', b'{"project":"test","stage":"complete"}')
+                    self.assertEqual(code, 409, payload)
+                    response = json.loads(payload)
+                    self.assertEqual(response['episode_count'], 1)
+                    self.assertEqual(response['target_episodes'], 15)
+                    self.assertEqual(response['errors'][0]['code'], 'SPEC_EP_COUNT')
+            spawn.assert_not_called()
+
+    def test_replan_uses_async_candidate_job_even_when_current_planning_is_locked(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder), patch.object(server.H, 'spawn_job', return_value=8) as spawn:
+            base = Path(folder) / '剧本'
+            base.mkdir()
+            (base / '分集.json').write_text('{"units_version":1,"episodes":[{"id":"E1"}]}', encoding='utf-8')
+            (base / '大纲.json').write_text('{"anchor_rev":2,"premise":"旧主线"}', encoding='utf-8')
+            body = json.dumps({'project': 'test', 'stage': 'replan', 'eps': 15, 'idea': '重新规划的完整故事', 'planning_source': 'idea'}).encode()
+            code, _, payload = self.request('/api/units/build', 'POST', body)
+            self.assertEqual(code, 200, payload)
+            command = spawn.call_args.args[1]
+            self.assertIn('replan', command)
+            self.assertIn('--planning-source', command)
+            self.assertEqual(command[command.index('--eps') + 1], '15')
+            self.assertEqual(spawn.call_count, 1)
+
+    def test_story_revision_forwards_mode_and_instructions_and_rejects_undefined_rewrite(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder), \
+             patch.object(server.H, 'spawn_job', return_value=8) as spawn:
+            base = Path(folder) / '剧本'
+            base.mkdir()
+            (base / '分集.json').write_text('{"episodes":[{"id":"E1"}]}', encoding='utf-8')
+            request = {'project': 'test', 'stage': 'replan', 'eps': 1, 'revision_mode': 'rewrite'}
+            code, _, payload = self.request('/api/units/build', 'POST', json.dumps(request).encode())
+            self.assertEqual(code, 400, payload)
+            spawn.assert_not_called()
+            request['revision_instructions'] = '保留主角，把第一集节奏压紧'
+            code, _, payload = self.request('/api/units/build', 'POST', json.dumps(request).encode())
+            self.assertEqual(code, 200, payload)
+            command = spawn.call_args.args[1]
+            self.assertEqual(command[command.index('--revision-mode') + 1], 'rewrite')
+            self.assertEqual(command[command.index('--revision-instructions') + 1], request['revision_instructions'])
+
+    def test_resume_failed_planning_uses_original_candidate_and_rejects_stale_baseline(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder), \
+             patch.object(server.H, 'spawn_job', return_value=8) as spawn:
+            base = Path(folder) / '剧本'
+            base.mkdir()
+            (base / '分集.json').write_text('{"mode":"generated","episodes":[{"id":"E1","text":"旧正文"}]}', encoding='utf-8')
+            (base / '构想.txt').write_text('已有角色寻找证据', encoding='utf-8')
+            planning = server.tools_mod('story_planning_versions.py')
+            failed = planning.generate(folder, target_episodes=3,
+                runner=lambda *_: {'ok': False, 'incomplete': ['模型失败']})
+            request = {'project': 'test', 'stage': 'replan', 'planning_version': failed['version_id']}
+            code, _, payload = self.request('/api/units/build', 'POST', json.dumps(request).encode())
+            self.assertEqual(code, 200, payload)
+            command = spawn.call_args.args[1]
+            self.assertEqual(command[command.index('--planning-version') + 1], failed['version_id'])
+            self.assertNotIn('--idea', command)
+            spawn.reset_mock()
+            (base / '构想.txt').write_text('当前构想已经人工修改', encoding='utf-8')
+            code, _, payload = self.request('/api/units/build', 'POST', json.dumps(request).encode())
+            self.assertEqual(code, 409, payload)
+            spawn.assert_not_called()
+
+    def test_working_candidate_requires_adoption_and_legacy_restore_is_disabled(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            base = Path(folder) / '剧本'
+            base.mkdir()
+            (base / '分集.json').write_text('{"mode":"generated","episodes":[{"id":"E1","text":"旧正文"}]}', encoding='utf-8')
+            (base / '构想.txt').write_text('一个完整的故事构想', encoding='utf-8')
+            planning = server.tools_mod('story_planning_versions.py')
+            history_id = 'history-' + 'a' * 16
+            history_dir = base / '.versions/规划' / history_id
+            for name, content in planning._collect(folder).items():
+                target = history_dir / '内容' / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+            (history_dir / 'version.json').write_text(json.dumps({'id': history_id, 'status': 'history',
+                'label': '旧存档', 'created_at': '2026-09-26T12:00:00'}), encoding='utf-8')
+            def runner(workspace, target):
+                (workspace / '剧本/分集.json').write_text(json.dumps({'units_version': 1, 'episodes': [
+                    {'id': f'E{i}', 'arc_id': 'A', 'summary': '新剧情', 'beats': ['寻找']} for i in range(1, target + 1)]}), encoding='utf-8')
+                (workspace / '剧本/大纲.json').write_text(json.dumps({'arcs': [{'id': 'A', 'ep_from': 'E1', 'ep_to': f'E{target}'}]}), encoding='utf-8')
+                return {'ok': True}
+            result = planning.generate(folder, target_episodes=2, revision_mode='rewrite',
+                instructions='在旧故事基础上调整分集', runner=runner)
+            self.assertTrue(result['ok'])
+            code, _, payload = self.request('/api/units?project=test')
+            self.assertEqual(code, 200, payload)
+            current = json.loads(payload)
+            # 候选就绪即停：生成不自动发布——正式项目仍是旧 1 集，候选待人工采用
+            self.assertEqual(len(current['episodes']), 1, '生成只进候选区，采用前不得改写当前规划')
+            self.assertEqual(current['planning_versions'], [])
+            code, _, payload = self.request('/api/units/candidate?project=test')
+            self.assertEqual(code, 200, payload)
+            candidate = json.loads(payload)
+            self.assertEqual(candidate['candidate']['id'], result['version_id'])
+            self.assertTrue(candidate['candidate']['can_adopt'])
+            before = planning.current_revision(folder)
+            for action in ('adopt-plan', 'restore-plan'):
+                body = json.dumps({'project':'test','kind':action,'id':history_id,'revision':before}).encode()
+                self.assertEqual(self.request('/api/units/edit', 'POST', body)[0], 400)
+                self.assertEqual(planning.current_revision(folder), before)
+            # 采用新候选：经 /api/units/edit(kind=adopt-plan) 人工落盘
+            body = json.dumps({'project':'test','kind':'adopt-plan','id':result['version_id'],
+                               'revision':before}).encode()
+            code, _, payload = self.request('/api/units/edit', 'POST', body)
+            self.assertEqual(code, 200, payload)
+            code, _, payload = self.request('/api/units?project=test')
+            current = json.loads(payload)
+            self.assertEqual(len(current['episodes']), 2, '采用后候选规划落回正式项目')
+            code, _, payload = self.request('/api/script/episode/history?project=test')
+            self.assertEqual(code, 200, payload)
+            self.assertTrue(any('旧正文' in v['text'] for v in json.loads(payload)['versions']))
+
+    def test_units_exposes_scene_and_prop_visual_descriptions_for_missing_field_editor(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            assets = Path(folder) / '素材'
+            assets.mkdir()
+            (assets / '场景.json').write_text(json.dumps({'scenes': [
+                {'id': 'room', 'name': '房间', 'visual_description': '青石墙与朝南窗'}]}), encoding='utf-8')
+            (assets / '道具.json').write_text(json.dumps({'props': [
+                {'id': 'ring', 'name': '铜环', 'usage_boundary': '只能开旧锁',
+                 'visual_description': '暗褐铜环，三道刻痕'}]}), encoding='utf-8')
+            code, _, payload = self.request('/api/units?project=test')
+            self.assertEqual(code, 200, payload)
+            result = json.loads(payload)
+            self.assertEqual(result['scene_limits'][0]['visual_description'], '青石墙与朝南窗')
+            self.assertEqual(result['prop_boundaries'][0]['visual_description'], '暗褐铜环，三道刻痕')
+
+    def test_episode_save_conflict_and_history_contract(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            base = Path(folder) / '剧本'
+            base.mkdir()
+            (base / '分集.json').write_text(json.dumps({'mode':'generated','episodes':[{'id':'E1','text':'甲：旧稿'}]}), encoding='utf-8')
+            revision = server.project_store.current_revision(base / '分集.json')
+            body = json.dumps({'project':'test','episode':'E1','text':'甲：新稿','revision':revision}).encode()
+            code, _, payload = self.request('/api/script/episode/save','POST',body)
+            self.assertEqual(code,200,payload)
+            self.assertTrue(json.loads(payload)['changed'])
+            self.assertEqual(self.request('/api/script/episode/save','POST',body)[0],409)
+            code, _, payload = self.request('/api/script/episode/history?project=test&episode=E1')
+            self.assertEqual(code,200,payload)
+            self.assertIn('甲：旧稿',[r['text'] for r in json.loads(payload)['versions']])
+
+    def test_character_workspace_roundtrip_and_revision_conflict(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            path = Path(folder) / '素材/人物.json'
+            path.parent.mkdir()
+            path.write_text(json.dumps({'characters':[{'id':'hero','name':'主角','states':[{'id':'s1'}]}]}),encoding='utf-8')
+            code, _, raw = self.request('/api/characters?project=test')
+            self.assertEqual(code,200,raw)
+            data=json.loads(raw)
+            body=json.dumps({'project':'test','character_id':'hero','patch':{'biography':'人物小传'},'expected_revision':data['revision']}).encode()
+            code, _, raw = self.request('/api/characters/save','POST',body)
+            self.assertEqual(code,200,raw)
+            self.assertEqual(json.loads(raw)['character']['states'],[{'id':'s1'}])
+            self.assertEqual(self.request('/api/characters/save','POST',body)[0],409)
+
+    def test_script_draft_job_and_adoption_contract(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder), patch.object(server.H,'spawn_job',return_value=90001):
+            path=Path(folder) / '剧本/分集.json'
+            path.parent.mkdir()
+            path.write_text(json.dumps({'mode':'generated','episodes':[{'id':'E1','text':'原稿','summary':'概要'}]}),encoding='utf-8')
+            (path.parent / '构想.txt').write_text('完整故事构想',encoding='utf-8')
+            body=json.dumps({'project':'test','episodes':['E1']}).encode()
+            code,_,raw=self.request('/api/script/drafts/generate','POST',body)
+            self.assertEqual(code,200,raw)
+            created=json.loads(raw)
+            self.assertEqual(created['id'],90001)
+            self.assertEqual(self.request('/api/script/drafts/generate','POST',body)[0],400)
+            drafts=server.tools_mod('script_drafts.py')
+            drafts.run(folder,created['batch'],generate=lambda *args:'新稿')
+            code,_,raw=self.request('/api/script/drafts?project=test')
+            self.assertEqual(code,200,raw)
+            self.assertEqual(json.loads(raw)['batches'][0]['items'][0]['after'],'新稿')
+            code,_,raw=self.request('/api/script/drafts/adopt','POST',json.dumps({'project':'test','batch':created['batch'],'episodes':['E1']}).encode())
+            self.assertEqual(code,200,raw)
+            self.assertEqual(json.loads(path.read_text(encoding='utf-8'))['episodes'][0]['text'],'新稿')
+
+    def test_failed_draft_repair_is_a_single_async_job_with_saved_original(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server,'proj_dir',return_value=folder), patch.object(server.H,'spawn_job',return_value=90003) as spawn:
+            path=Path(folder)/'剧本/分集.json'
+            path.parent.mkdir()
+            path.write_text(json.dumps({'mode':'generated','episodes':[{'id':'E1','text':'原稿','summary':'概要'}]}),encoding='utf-8')
+            (path.parent/'构想.txt').write_text('完整故事构想',encoding='utf-8')
+            drafts=server.tools_mod('script_drafts.py')
+            batch=drafts.create(folder,['E1'])
+            drafts.run(folder,batch['id'],generate=lambda *args:'已生成原稿')
+            def failed(doc):
+                doc['status']='partial'
+                doc['items'][0].update(status='failed',failure_kind='validation',error='未登记说话人：陌生人')
+            drafts._update(drafts._path(folder,batch['id']),failed)
+            body=json.dumps({'project':'test','batch':batch['id'],'episodes':['E1'],'instructions':'按设定修正'}).encode()
+            code,_,raw=self.request('/api/script/drafts/repair','POST',body)
+            self.assertEqual(code,200,raw)
+            self.assertTrue(json.loads(raw)['job'])
+            self.assertIn('--repair',spawn.call_args.args[1])
+            self.assertEqual(spawn.call_count,1)
+            self.assertEqual(self.request('/api/script/drafts/repair','POST',body)[0],400)
+            self.assertEqual(spawn.call_count,1)
+            saved=json.loads(drafts._path(folder,batch['id']).read_text(encoding='utf-8'))
+            self.assertEqual(saved['items'][0]['after'],'已生成原稿')
+            self.assertEqual(json.loads(path.read_text(encoding='utf-8'))['episodes'][0]['text'],'原稿')
+
+    def test_episode_read_revision_matches_the_returned_screenplay(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            base = Path(folder) / '剧本'
+            base.mkdir()
+            path = base / '分集.json'
+            path.write_text(json.dumps({'mode': 'generated', 'episodes': [{'id': 'E1', 'text': '甲：读取时的旧稿'}]}), encoding='utf-8')
+            original_revision = server.project_store.current_revision(path)
+            def changed_during_response(*args):
+                path.write_text(json.dumps({'mode': 'generated', 'episodes': [{'id': 'E1', 'text': '甲：并发保存的新稿'}]}), encoding='utf-8')
+                return {}
+            with patch.object(server, 'skill_lib_call', side_effect=changed_during_response):
+                code, _, payload = self.request('/api/script/data?project=test')
+            self.assertEqual(code, 200, payload)
+            result = json.loads(payload)
+            self.assertEqual(result['episodes'][0]['text'], '甲：读取时的旧稿')
+            self.assertEqual(result['script_revision'], original_revision)
+            body = json.dumps({'project': 'test', 'episode': 'E1', 'text': '甲：旧页面编辑稿', 'revision': result['script_revision']}).encode()
+            self.assertEqual(self.request('/api/script/episode/save', 'POST', body)[0], 409)
 
     def request(self, path, method='GET', body=b'', headers=None):
         fields = {'Host': 'localhost', 'Connection': 'close', 'Content-Length': str(len(body)), **(headers or {})}
@@ -384,7 +845,7 @@ class HttpRouteTests(unittest.TestCase):
             with patch.object(server, 'WEBDIST', folder):
                 code, headers, body = self.request('/assets/test.js')
                 self.assertEqual((code, body), (200, b'test'))
-                self.assertIn(b'Cache-Control: public, max-age=31536000, immutable', headers)
+                self.assertIn(b'Cache-Control: no-cache', headers)   # 开发期工具正确性优先：hash 资源也走协商缓存（防 SPA 懒加载旧 chunk）
 
     def test_multipart_bytes_arrive_unchanged(self):
         boundary = 'route-boundary'
@@ -459,6 +920,35 @@ class HttpRouteTests(unittest.TestCase):
             body = module.enqueue.call_args.args[1]
             self.assertEqual((body['action'], body['scope'], body['type']), ('redo_segment', 'V', 'video'))
             self.assertEqual((body['t0'], body['t1'], body['target']), (6, 8, 'v-1'))
+
+
+    def test_asset_http_uses_shared_transaction_and_preserves_reference_source(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            assets = Path(folder) / '素材'
+            assets.mkdir()
+            (assets / '人物.json').write_text(json.dumps({'characters': [{'id': 'hero', 'name': '主角',
+                'states': [{'id': 'rain', 'label': '雨中'}]}]}), encoding='utf-8')
+            body = {'project': 'test', 'kind': 'prop', 'id': 'bow', 'name': '弩',
+                    'parent_ref': '@character:hero', 'derived_from': '@character:hero#rain'}
+            code, _, payload = self.request('/api/assets/create', 'POST', json.dumps(body).encode())
+            self.assertEqual(code, 200, payload)
+            self.assertEqual(json.loads(payload)['asset']['derived_from'], '@character:hero#rain')
+            self.assertEqual(self.request('/api/assets/create', 'POST', json.dumps(body).encode())[0], 409)
+            before = (assets / '道具.json').read_bytes()
+            invalid = {'project': 'test', 'updates': [{'ref': '@prop:bow', 'parent_ref': None}, None]}
+            self.assertEqual(self.request('/api/assets/relations', 'POST', json.dumps(invalid).encode())[0], 400)
+            self.assertEqual((assets / '道具.json').read_bytes(), before)
+
+    def test_style_http_patch_keeps_other_dimensions(self):
+        with tempfile.TemporaryDirectory() as folder, patch.object(server, 'proj_dir', return_value=folder):
+            path = Path(folder) / '剧本/style.json'
+            path.parent.mkdir()
+            path.write_text('{"script":"three-act"}', encoding='utf-8')
+            with patch.object(server.chatgpt_queue, 'refresh_queued_asset_jobs', return_value=0):
+                code, _, raw = self.request('/api/skills/style', 'POST',
+                    json.dumps({'project': 'test', 'patch': {'image_visual': 'ink-wash'}}).encode())
+            self.assertEqual(code, 200, raw)
+            self.assertEqual(json.loads(raw)['style'], {'script': 'three-act', 'image_visual': 'ink-wash'})
 
 
 class RegistryTests(unittest.TestCase):

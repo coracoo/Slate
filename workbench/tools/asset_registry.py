@@ -101,7 +101,10 @@ class AssetRegistry:
         if not self.project_dir.is_dir():
             raise AssetReferenceError(f"项目目录不存在：{self.project_dir}")
         self._records = {}
-        self._load()
+        from skill_lib import read_scope
+        from asset_repository import locks
+        with read_scope(), locks(self.project_dir, ['素材/素材图.json']):
+            self._load()
 
     def _read_json(self, path):
         try:
@@ -133,6 +136,9 @@ class AssetRegistry:
 
     def _load(self):
         index = self._index_records()
+        self._generated = index
+        ledger = self._read_json(self.project_dir/'素材/.work/提交记录.json')
+        self._changes = ledger.get('assets', {}) if isinstance(ledger, dict) else {}
         pending = {kind: [] for kind in _KIND_FILES}
         for kind, (filename, keys, zone, default_usage) in _KIND_FILES.items():
             data = self._read_json(self.project_dir / "素材" / filename)
@@ -153,8 +159,14 @@ class AssetRegistry:
                 if isinstance(item, dict) and item.get("id"):
                     merged[str(item["id"])] = dict(item)
             for rid, item in index.get(kind, {}).items():
+                authoritative = str(rid) in merged
+                if not authoritative and (self.project_dir / '素材' / filename).is_file():
+                    continue
                 base = merged.setdefault(str(rid), {})
+                base['_archive_present'] = authoritative
                 for key, value in item.items():
+                    if authoritative and key in ('prompt', 'sheet_prompt', 'image_prompt', 'visual_description', 'appearance', 'identity_anchor', 'description'):
+                        continue
                     if not base.get(key) and value:
                         base[key] = value
             for rid, item in merged.items():
@@ -166,6 +178,12 @@ class AssetRegistry:
         for kind, (_, _, zone, default_usage) in _KIND_FILES.items():
             for item in pending.get(kind, []):
                 self._add_record(kind, item, zone, default_usage)
+        from visual_asset_prompt import uses_planning_settings
+        if uses_planning_settings(self.project_dir):
+            from story_units import referenced_assets
+            active = referenced_assets(self.project_dir)
+            for ref, row in self._records.items():
+                row['in_use'] = ref in active
         if asset_relations is not None:
             rows = asset_relations.build_relation_index(list(self._records.values()))
             self._records = {row["ref"]: row for row in rows if row.get("ref")}
@@ -191,9 +209,11 @@ class AssetRegistry:
         ref = f"@{kind}:{ident}"
         # 提示词是资产详情弹窗的稳定摘要；三件套仍保留完整字段，
         # 注册表只暴露当前类型对应的一条生图提示词，避免前端猜字段。
-        prompt = item.get("sheet_prompt") if kind == "character" else item.get("image_prompt")
-        if not prompt:
-            prompt = item.get("prompt") or item.get("description") or ""
+        from visual_asset_prompt import visual_contract
+        generated = self._generated.get(kind, {}).get(ident, {})
+        status = visual_contract(kind, item, project=self.project_dir, image=generated, has_image=bool(path))
+        status['archive_present'] = item.get('_archive_present', True)
+        prompt = status['subject']
         self._records[ref] = {
             "ref": ref,
             "kind": kind,
@@ -203,24 +223,38 @@ class AssetRegistry:
             "usage": str(item.get("usage") or item.get("kind") or default_usage),
             "aliases": aliases,
             "prompt": str(prompt or "").strip(),
+            "prompt_editable": status['editable_prompt'],
+            "visual_status": {key: value for key, value in status.items() if key not in ('subject', 'editable_prompt')},
             "asset_revision": self._revision(item.get("asset_revision")),
+            "media_settings_revision": generated.get('settings_revision'),
+            "settings_source": item.get('settings_source'),
+            "settings_updated_at": item.get('settings_updated_at'),
+            "settings_change": self._changes.get(ref),
         }
-        for field in ("parent_ref", "relation", "derived_from", "related_refs", "source_episode_ids", "style", "style_prompt"):
+        for field in ("parent_ref", "relation", "derived_from", "related_refs", "source_episode_ids", "style", "style_prompt", "visual_description"):
             value = item.get(field)
             if value not in (None, "", []):
                 self._records[ref][field] = value
-        if kind == "character" and isinstance(item.get("states"), list):
+        if isinstance(item.get("states"), list):
             # 状态资产（派生状态）随注册表暴露给资产提炼页；path 指向已生成的
             # 状态图 <角色id>__<状态id>.png，未生成时为空串由前端显示占位。
             exposed = []
             for st in item["states"]:
                 if not isinstance(st, dict):
                     continue
+                if st.get('output_asset_ref'):
+                    continue
                 sid = str(st.get("id") or "").strip()
                 if not sid:
                     continue
                 spath = ""
+                indexed_path = str(((generated.get('states') or {}).get(sid) or {}).get('path') or '')
+                indexed_file = (self.project_dir / indexed_path).resolve()
+                if indexed_path and indexed_file.is_relative_to(self.project_dir) and indexed_file.is_file():
+                    spath = indexed_file.relative_to(self.project_dir).as_posix()
                 for ext in (".png", ".jpg", ".jpeg", ".webp"):
+                    if spath:
+                        break
                     candidate = self.project_dir / "素材" / zone / (f"{ident}__{sid}" + ext)
                     if candidate.is_file():
                         spath = candidate.relative_to(self.project_dir).as_posix()
@@ -232,6 +266,10 @@ class AssetRegistry:
                     "camp": str(st.get("camp") or ""),
                     "episodes": [str(e) for e in (st.get("episodes") or [])],
                     "path": spath,
+                    "visual_status": {key: value for key, value in visual_contract(
+                        kind, item, st, project=self.project_dir,
+                        image=(generated.get('states') or {}).get(sid, {}), has_image=bool(spath)).items()
+                        if key not in ('subject', 'editable_prompt')},
                 })
             if exposed:
                 self._records[ref]["states"] = exposed
@@ -277,6 +315,17 @@ class AssetRegistry:
         return sorted(rows, key=lambda value: (value["kind"], value["id"]))
 
     def resolve(self, ref):
+        raw = str(ref or '').strip()
+        if '#' in raw:
+            base, state_id = raw.split('#', 1)
+            mother = self.resolve(base)
+            state = next((s for s in mother.get('states') or [] if s['id'] == state_id), None)
+            if state is None:
+                raise AssetReferenceError(f"找不到派生状态：{ref}")
+            return {**mother, 'ref': mother['ref']+'#'+state_id,
+                    'name': mother['name']+' · '+state['label'], 'path': state.get('path') or '',
+                    'state_id': state_id, 'parent_ref': mother['ref'],
+                    'visual_status': state.get('visual_status') or {}}
         normalized = normalize_asset_ref(ref)
         if normalized in self._records:
             return dict(self._records[normalized])

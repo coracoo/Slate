@@ -3,9 +3,10 @@
 import copy
 
 KINDS = ('text', 'vision', 'image', 'image_edit', 'video', 'music', 'speech')
-ORDER = ('local-comfyui', 'chatgpt-queue', 'doubao', 'doubao-api', 'minimax', 'qwen', 'aliyun',
+ORDER = ('local-comfyui', 'chatgpt-queue', 'runninghub', 'doubao', 'doubao-api', 'minimax', 'qwen', 'aliyun',
          'gemini', 'kling', 'agnes', 'openai-compat', 'kimi', 'glm', 'deepseek')
 SOURCES = {
+    'runninghub':'https://www.runninghub.ai/runninghub-api-doc-en/',
     'chatgpt-queue':'https://github.com/leeguooooo/image-use',
     'minimax':'https://platform.minimax.cn/docs/api-reference/video-generation-v2-create',
     'aliyun':'https://help.aliyun.com/zh/model-studio/wan3-video-generation-api-reference',
@@ -28,6 +29,15 @@ DEFAULT_VENDORS = [
             {'workflow_path':'','image_edit_workflow_path':''}),
     _vendor('chatgpt-queue','ChatGPT · chrome-use','',{'image':'chatgpt-web'},
             note='服务由 image-use 提供；浏览器登录 ChatGPT，一次一张、串行导入。'),
+    _vendor('runninghub','RunningHub · RH','https://www.runninghub.ai',
+            {'image':'seedream-v5-pro/text-to-image','image_edit':'seedream-v5-pro/image-to-image',
+             'video':'minimax/hailuo-h3/multimodal-to-video',
+             'music':'minimax/music-2.6/text-to-instrumental',
+             'speech':'rhart-audio/text-to-audio/speech-2.8-hd'},
+            {'text':'/chat/completions','vision':'/chat/completions'},
+            '企业级共享 API Key；官方模型接口原生参数，多模态参考自动上传，异步任务完成后下载。文本/视觉走独立 LLM 地址。',
+            {'llm_base_url':'https://llm.runninghub.ai/v1','voice_id':'',
+             'api_parameters':'{}'}),
     _vendor('doubao','火山方舟 · Agent Plan','https://ark.cn-beijing.volces.com/api/plan/v3',
             {'text':'doubao-seed-evolving','vision':'doubao-seed-evolving','image':'doubao-seedream-5.0-pro'},
             {'image':'/images/generations','video':'/contents/generations/tasks'},'Agent Plan 视频模型需按当前套餐填写；Seedance 1.5 Pro 不适用于此接口。'),

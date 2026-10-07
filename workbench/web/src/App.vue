@@ -74,24 +74,21 @@ const theme = computed(() => ({
 
 const navItems = [
   { key: 'home', to: '/', label: '首页', icon: 'home', group: '' },
-  { key: 'studio', to: '/studio', label: '① 剧本生成', icon: 'chat', group: '制作' },
-  { key: 'studioAsset', to: '/studio/asset', label: '② 素材生成', icon: 'box3d', group: '制作' },
-  { key: 'studioShots', to: '/studio/shots', label: '③ 分镜生成', icon: 'clapper', group: '制作' },
-  { key: 'voices', to: '/studio/asset/voices', label: '④ 音色绑定', icon: 'wave', group: '制作' },
-  { key: 'acting', to: '/acting', label: '⑤ 演员表现', icon: 'user', group: '制作' },
-  { key: 'package', to: '/package', label: '⑥ 平面推演', icon: 'box3d', group: '制作' },
-  { key: 'create', to: '/create', label: '⑦ 创作生成', icon: 'wand', group: '制作' },
-  { key: 'free', to: '/create/free', label: '⑧ 自由创作', icon: 'wand', group: '制作' },
+  { key: 'studio', to: '/studio', label: '① 剧本工作区', icon: 'chat', group: '制作' },
+  { key: 'characters', to: '/studio/characters', label: '② 角色设定', icon: 'user', group: '制作' },
+  { key: 'studioAsset', to: '/studio/asset', label: '③ 视觉素材', icon: 'box3d', group: '制作' },
+  { key: 'studioShots', to: '/studio/shots', label: '④ 分镜设计', icon: 'clapper', group: '制作' },
+  { key: 'create', to: '/create', label: '⑤ 镜头创作', icon: 'wand', group: '制作' },
+  { key: 'free', to: '/create/free', label: '⑥ 自由创作', icon: 'wand', group: '制作' },
+  { key: 'package', to: '/package', label: '空间验证', icon: 'box3d', group: '预演 · 可选' },
   { key: 'lapian', to: '/lapian', label: '① 拉片结构', icon: 'clapper', group: '拉片' },
   { key: 'lines', to: '/lines', label: '② 台词分析', icon: 'chat', group: '拉片' },
   { key: 'frames', to: '/frames', label: '③ 逐帧拉片', icon: 'frames', group: '拉片' },
   { key: 'depth', to: '/depth', label: '④ 深度动作', icon: 'wave', group: '拉片' },
   { key: 'explain', to: '/explain', label: '⑤ 镜头讲解', icon: 'book', group: '拉片' },
-  { key: 'white', to: '/white', label: '① 辅助·白模', icon: 'cube', group: '系统' },
-  { key: 'white3d', to: '/white3d', label: '② 辅助·Blender', icon: 'box3d', group: '系统' },
-  { key: 'skills', to: '/skills', label: '③ Skill 配置', icon: 'book', group: '系统' },
-  { key: 'env', to: '/env', label: '④ 环境检查', icon: 'server', group: '系统' },
-  { key: 'billing', to: '/billing', label: '⑤ 用量计费', icon: 'chart', group: '系统' }
+  { key: 'skills', to: '/skills', label: 'Skill 配置', icon: 'book', group: '系统' },
+  { key: 'env', to: '/env', label: '环境检查', icon: 'server', group: '系统' },
+  { key: 'billing', to: '/billing', label: '用量计费', icon: 'chart', group: '系统' }
 ]
 
 watch(
@@ -142,21 +139,21 @@ watch(showShell, (v) => { if (v && !isGuest()) void loadBasics() })
             class="mt-3 mb-1 px-3 text-2xs font-black tracking-[0.25em] text-slate-500">{{ r.group }}</div>
           <RouterLink
           :to="r.to"
-          v-slot="{ isActive, navigate }"
+          v-slot="{ isExactActive, navigate }"
           custom
         >
           <button
             class="group flex w-full items-center gap-2.5 rounded-lg px-3 py-2 text-left text-sm transition-all duration-200"
-            :class="isActive
+            :class="isExactActive
               ? 'font-bold text-white shadow-lg'
               : 'text-slate-400 hover:bg-white/5 hover:text-slate-200'"
-            :style="isActive ? { background: `linear-gradient(110deg, color-mix(in srgb, ${theme.c1} 26%, transparent), color-mix(in srgb, ${theme.c2} 14%, transparent))`, boxShadow: `inset 2px 0 0 ${theme.c1}` } : {}"
+            :style="isExactActive ? { background: `linear-gradient(110deg, color-mix(in srgb, ${theme.c1} 26%, transparent), color-mix(in srgb, ${theme.c2} 14%, transparent))`, boxShadow: `inset 2px 0 0 ${theme.c1}` } : {}"
             @click="navigate"
           >
             <svg
               width="16" height="16" viewBox="0 0 24 24" fill="none"
               stroke="currentColor" stroke-width="2"
-              :style="isActive ? { color: theme.c1 } : {}"
+              :style="isExactActive ? { color: theme.c1 } : {}"
               class="transition-transform duration-200 group-hover:scale-110"
             ><path :d="icons[r.icon]" stroke-linecap="round" stroke-linejoin="round"/></svg>
             {{ r.label }}

@@ -25,6 +25,18 @@ from strategy_map import load_scenes, shot_scene_id
 FONT = r"C:\Windows\Fonts\msyh.ttc"
 
 
+def draw_arrow(dr, points, color, width=2):
+    """按最后一段方向画箭头，区分路径方向与落点。"""
+    if len(points) < 2:
+        return
+    dr.line(points, fill=color, width=width)
+    ax, ay = points[-2]
+    bx, by = points[-1]
+    angle = math.atan2(by - ay, bx - ax)
+    dr.polygon([(bx, by), (bx - 10 * math.cos(angle - .45), by - 10 * math.sin(angle - .45)),
+                (bx - 10 * math.cos(angle + .45), by - 10 * math.sin(angle + .45))], fill=color)
+
+
 def setup(ax, az, w, h):
     """世界窗口(米) -> 画布映射：x 左右，z 纵深。窗口由相机/角色包围盒外扩。"""
     x0, x1 = ax[0] - 2.5, ax[1] + 2.5
@@ -47,6 +59,16 @@ def draw_plan_base(dr, M, base):
         pts = [M(p[0], p[1]) for p in walls]
         pts.append(pts[0])
         dr.line(pts, fill=(60, 66, 74), width=5, joint="curve")
+    for opening in base.get("openings") or []:
+        start, end = opening.get("start"), opening.get("end")
+        if not start or not end:
+            continue
+        points = [M(*start), M(*end)]
+        dr.line(points, fill=(240, 244, 248), width=9)
+        color = (14, 116, 210) if opening.get("kind") == "window" else (18, 145, 98)
+        dr.line(points, fill=color, width=4)
+        for px, py in points:
+            dr.ellipse((px - 3, py - 3, px + 3, py + 3), fill=color)
     for f in base.get("props") or []:
         x, z = f["pos"][0], f["pos"][1]
         size = f.get("size") or [1]
@@ -57,7 +79,10 @@ def draw_plan_base(dr, M, base):
         else:
             w2, h2 = float(size[0] or 1) / 2, float(size[1] if len(size) > 1 else 1) / 2
             p0, p1 = M(x - w2, z - h2), M(x + w2, z + h2)
-            dr.rectangle((p0[0], p1[1], p1[0], p0[1]), fill=(120, 126, 134, 160), outline=(52, 58, 64))
+            if f.get("outline"):
+                dr.polygon([M(*p) for p in f["outline"]], fill=(120, 126, 134, 160), outline=(52, 58, 64))
+            else:
+                dr.rectangle((p0[0], p1[1], p1[0], p0[1]), fill=(120, 126, 134, 160), outline=(52, 58, 64))
         cx, cy = M(x, z)
         try:
             fS = ImageFont.truetype(FONT, 11)
@@ -78,14 +103,14 @@ def draw_plan_base(dr, M, base):
     for pth in base.get("paths") or []:
         pts = [M(p[0], p[1]) for p in (pth.get("points") or [])]
         if len(pts) >= 2:
-            dr.line(pts, fill=(22, 130, 90), width=2)
+            draw_arrow(dr, pts, (22, 130, 90))
             ex, ey = pts[-1]
             dr.ellipse((ex - 4, ey - 4, ex + 4, ey + 4), fill=(22, 130, 90))
 
 
 def draw_shot(dr, W, H, M, shot, actors, prev_pos, fov_def=48, base=None):
     fld = (shot.get("scene") == "field")
-    dr.rectangle((0, 0, W, H), fill=(196, 180, 152) if fld else (168, 170, 174))
+    dr.rectangle((0, 0, W, H), fill=(245, 239, 224) if fld else (239, 244, 249))
     for gx in range(-20, 21, 2):
         p1, p2 = M(gx, -60), M(gx, 60)
         dr.line((*p1, *p2), fill=(0, 0, 0, 22), width=1)
@@ -130,7 +155,7 @@ def draw_shot(dr, W, H, M, shot, actors, prev_pos, fov_def=48, base=None):
             t = ang + math.pi * 0.7
             arr = (pc, M(cx + 2.6 * math.sin(t), cz + 2.6 * math.cos(t)))
         if arr:
-            dr.line((*arr[0], *arr[1]), fill=(234, 88, 12), width=3)
+            draw_arrow(dr, list(arr), (234, 88, 12), 3)
             ax_, ay_ = arr[1]
             dr.ellipse((ax_ - 4, ay_ - 4, ax_ + 4, ay_ + 4), fill=(234, 88, 12))
     # 角色 + 走位箭头
@@ -150,7 +175,7 @@ def draw_shot(dr, W, H, M, shot, actors, prev_pos, fov_def=48, base=None):
             ox, oz = prev_pos[aid]
             if math.hypot(x - ox, z - oz) > 0.4:
                 p0 = M(ox, oz)
-                dr.line((*p0, px, py), fill=(22, 130, 90), width=3)
+                draw_arrow(dr, [p0, (px, py)], (22, 130, 90), 3)
                 mx, my = (p0[0] + px) / 2, (p0[1] + py) / 2
                 dr.ellipse((mx - 4, my - 4, mx + 4, my + 4), fill=(22, 130, 90))
     # 台词条
@@ -159,6 +184,11 @@ def draw_shot(dr, W, H, M, shot, actors, prev_pos, fov_def=48, base=None):
         txt = " / ".join(f"{l.get('speaker')}:{str(l.get('line'))[:14]}" for l in lines[:2])
         dr.rectangle((0, H - 26, W, H), fill=(15, 23, 42, 200))
         dr.text((8, H - 24), txt[:80], font=fS, fill=(226, 232, 240))
+    else:
+        scale = abs(M(1, 0)[0] - M(0, 0)[0])
+        if scale < W - 40:
+            dr.line((20, H - 30, 20 + scale, H - 30), fill=(35, 50, 70), width=3)
+            dr.text((20, H - 25), "1m（估算）", font=fS, fill=(35, 50, 70))
 
 
 def main():
@@ -186,8 +216,8 @@ def main():
         from plan_adapt import (plan_walls_world, plan_props_world, plan_zones_world,
                                 plan_cameras_world, plan_actor_positions, plan_actors_map,
                                 plan_paths_world)
-        base = {"walls": plan_walls_world(plan), "props": plan_props_world(plan),
-                "zones": plan_zones_world(plan), "paths": plan_paths_world(plan)}
+        from plan_adapt import plan_base_world
+        base = plan_base_world(plan)
         cams = plan_cameras_world(plan)
         plan_pos = plan_actor_positions(plan)
 

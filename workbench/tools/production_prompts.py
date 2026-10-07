@@ -61,12 +61,6 @@ def require_prompts(shots):
             raise ValueError(f"{shot.get('id')} 的提示词缺失或三类内容重复，拒绝以一类内容补齐另一类")
 
 
-def retime_prompt(text, shot_id, start, end):
-    """只替换本镜格式化时间标签，不改台词、动作或自由文本里的数字。"""
-    pattern = r'【' + re.escape(str(shot_id)) + r'(?:镜)?[（(][^）)]*[）)][：:]'
-    return re.sub(pattern, f'【{shot_id}镜（{start:g}—{end:g}s）：', str(text or ''))
-
-
 # 运镜元数据 → 可执行运镜句（图生视频模型对标签词服从度低，须译成连续动作描述；
 # 09-24 V01 实证：「平视缓推/固定」被模型无视——8-12s 要求固定却持续剧烈运动）。
 CAMERA_MOTION_SENTENCES = {
@@ -102,8 +96,10 @@ def video_shot_text(shot, start, end):
     """提交时补齐结构化镜头事实，不回写三类作者提示词。
 
     N90：运镜不再是元数据标签——camera_move 译成可执行运镜句（运镜执行：行）
-    放在镜正文之后；标签本身保留在分镜补充里供人工核对。"""
-    text = retime_prompt(shot.get('prompt_video'), shot['id'], start, end)
+    放在镜正文之后；标签本身保留在分镜补充里供人工核对。
+    时间标签重写函数已删（用户 09-25 定版）：正文保留作者层时间标签，实际节拍
+    由 compile 侧时间轴行单独声明，不再改写作者文本。"""
+    text = str(shot.get('prompt_video') or shot.get('prompt') or '')
     fields = [('场景', 'scene_ref'), ('景别', 'shot_size'), ('机位', 'angle'),
               ('镜头', 'lens'), ('拍摄方式', 'rig'), ('运镜', 'camera_move'),
               ('画面', 'content'), ('动作', 'action'), ('声音', 'sound'),

@@ -188,6 +188,22 @@ class RedoJobTests(unittest.TestCase):
             self.assertTrue(path.is_file() and path.stat().st_size)
             self.assertEqual(digest(path), ref['sha256'])
 
+    def test_redo_prompt_shares_filtered_style_with_submit(self):
+        """⑦ 两条出口必须共用「过滤后的画风」。
+
+        画风 skill 正文里「人物三视图 / 纯白背景 / 表情中性」是资产设定图阶段的约束，
+        prompt_assembler.skill_positive 的文档明写单镜生图与 ⑦ 制作线共用它以防口径分叉；
+        重拍链直接下发全文会把镜头里的空间调度拉成白底设定图风格。
+        """
+        import skill_lib
+        from production_jobs import compile_redo_request
+        raw = '电影级写实光影\n人物三视图，纯白背景，表情中性\n35mm 胶片颗粒'
+        with patch.object(skill_lib, 'resolve_asset_style_text', return_value=(raw, 'project')):
+            prompt = compile_redo_request(self.root, self.body, self.cfg)['prompt']
+        self.assertIn('电影级写实光影', prompt, '画风正文仍要注入')
+        self.assertNotIn('三视图', prompt, '资产设定图专属指令不得随镜头提示词下发')
+        self.assertNotIn('纯白背景', prompt)
+
     def test_compile_prompt_override_and_errors(self):
         from production_jobs import compile_redo_request
         req = compile_redo_request(self.root, {**self.body, 'prompt': '重写中段动作'}, self.cfg)

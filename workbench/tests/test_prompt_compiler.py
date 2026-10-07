@@ -52,6 +52,24 @@ class PromptCompilerTests(unittest.TestCase):
         self.assertIn("握紧手机", out["text"])
         self.assertNotIn("平静", out["text"])
 
+    def test_required_visible_action_is_consumed_for_image_and_video(self):
+        from prompt_compiler import _performance_text, compile_shot
+        board = board_with_performance()
+        board["shots"][0]["performance"]["packet"]["actors"][0]["beats"] = [
+            {"at": 0, "duration": 1, "visible_action": "抬手挡住门缝"},
+            {"at": 2, "duration": 1, "visible_action": "退到墙边停住"},
+        ]
+        video_rows = _performance_text(board["shots"][0]["performance"], board["actors"], "video")
+        image_rows = _performance_text(board["shots"][0]["performance"], board["actors"], "image")
+        self.assertIn("抬手挡住门缝", "\n".join(video_rows))
+        self.assertIn("退到墙边停住", "\n".join(image_rows))
+        video = compile_shot(board, "S1", mode="stateful", media_type="video")
+        image = compile_shot(board, "S1", mode="stateful", media_type="image")
+        self.assertIn("抬手挡住门缝", video["text"])
+        self.assertIn("退到墙边停住", video["text"])
+        self.assertNotIn("抬手挡住门缝", image["text"])
+        self.assertIn("退到墙边停住", image["text"])
+
     def test_stale_performance_falls_back(self):
         from prompt_compiler import compile_shot
         out = compile_shot(board_with_performance(source_hash="stale"), "S1", mode="stateful", media_type="video")

@@ -80,10 +80,7 @@ def render_plan_base_png(plan, out_path, width=960, height=720):
     """plan v1 JSON → 单张俯视底图 PNG（复用 shot_diagram 画笔：墙/陈设/区域/走位轨迹/角色点）。
     窗口=底图实体+角色包围盒（空则 [-5,5]²）；无相机不画扇形。"""
     import shot_diagram as SD
-    base = {"walls": plan_adapt.plan_walls_world(plan),
-            "props": plan_adapt.plan_props_world(plan),
-            "zones": plan_adapt.plan_zones_world(plan),
-            "paths": plan_adapt.plan_paths_world(plan)}
+    base = plan_adapt.plan_base_world(plan)
     actors = plan_adapt.plan_actors_map(plan)
     positions = plan_adapt.plan_actor_positions(plan)
     shot = {"id": "", "scene": "room" if plan.get("room") else "field",
@@ -116,7 +113,8 @@ def ensure_plan_png(project_dir, scene_id, plan_path, log=None):
     rel = plan_png_relpath(scene_id)
     out = os.path.join(project_dir, rel.replace("/", os.sep))
     os.makedirs(os.path.dirname(out), exist_ok=True)
-    if os.path.isfile(out) and os.path.getmtime(out) >= os.path.getmtime(plan_path):
+    renderer_time = max(os.path.getmtime(SHOT_DIAGRAM), os.path.getmtime(plan_adapt.__file__), os.path.getmtime(__file__))
+    if os.path.isfile(out) and os.path.getmtime(out) >= max(os.path.getmtime(plan_path), renderer_time):
         return rel
     plan = _load_json(plan_path)
     if not isinstance(plan, dict):
@@ -251,8 +249,10 @@ def ensure_plan_frames(project_dir, board_path, plan_path, member_ids=None, v_la
             pth = cand or plan_path
         plan_for[key] = pth
     sigs = ";".join(sorted({f"{os.path.basename(p)}:{_sig(p)}" for p in plan_for.values()}))
+    renderer_sig = ";".join(_sig(p) for p in (SHOT_DIAGRAM, plan_adapt.__file__, __file__))
 
     fresh = (meta.get("plan_sigs") == sigs
+             and meta.get("renderer_sig") == renderer_sig
              and meta.get("board_sig") == _sig(board_path)
              and all(frame_ok(s) for s in keep))
     if not fresh:
@@ -278,7 +278,7 @@ def ensure_plan_frames(project_dir, board_path, plan_path, member_ids=None, v_la
         with open(meta_p, "w", encoding="utf-8") as fh:
             json.dump({"plans": sorted({os.path.basename(p) for p in plan_for.values()}),
                        "board": os.path.basename(board_path),
-                       "plan_sigs": sigs, "board_sig": _sig(board_path),
+                       "plan_sigs": sigs, "board_sig": _sig(board_path), "renderer_sig": renderer_sig,
                        "shots": keep, "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")},
                       fh, ensure_ascii=False, indent=1)
         log("  [plan] 平面图帧 %d 张（按 %d 张场景底图分组）-> %s"

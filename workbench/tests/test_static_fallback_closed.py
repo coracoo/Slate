@@ -75,7 +75,11 @@ class StaticFallbackClosed(unittest.TestCase):
         code, head, body = self.get('/assets/index-abc123.js')
         self.assertEqual(code, 200)
         self.assertIn(b'console.log', body)
-        self.assertIn(b'immutable', head, '带 hash 的分片仍要长缓存，否则每次进页重下')
+        # 开发期口径（10-06 随批改）：hash 分片不再 immutable 长缓存——没刷新的 SPA
+        # 懒加载旧 chunk + 新构建删文件 = 404 卡死（N56 实证）；assets 用 no-cache
+        # （ETag/304 仍省流量），index.html 恒不缓存。
+        self.assertIn(b'no-cache', head, 'assets 必须可再验证，immutable 会把旧 chunk 钉死在浏览器')
+        self.assertNotIn(b'immutable', head)
 
     def test_spa_deeplink_still_returns_index(self):
         code, _, body = self.get('/studio/shots', accept='text/html,application/xhtml+xml')

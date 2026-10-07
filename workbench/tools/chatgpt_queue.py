@@ -21,6 +21,7 @@ import prompt_assembler
 import prompt_compiler
 import skill_lib
 import gen_asset_images
+from visual_asset_prompt import generation_kind
 
 try:
     import asset_registry
@@ -203,11 +204,8 @@ def _read_json(path, default=None):
 
 
 def _asset_source(project_dir, row, state_id=""):
-    """读取资产档案中的设定图提示词，保持 ChatGPT 与本地生图共用资产语料。
-
-    人物设定图过时校验：sheet_prompt 仍是旧三视图文本（含"三视图"且无 45 度侧脸/五视图特征）
-    时直接打回，提示重新提炼——旧构图提示词生成的图会与新版素材链不一致。
-    """
+    """读取资产档案，人物构图与本地生图使用统一模板。"""
+    from visual_asset_prompt import subject_prompt
     kind = str(row.get("kind") or "")
     ident = str(row.get("id") or "")
     files = {"character": ("人物.json", "characters", "sheet_prompt"),
@@ -220,31 +218,16 @@ def _asset_source(project_dir, row, state_id=""):
         rows = [dict(value, id=rid) for rid, value in rows.items() if isinstance(value, dict)]
     for item in rows or []:
         if isinstance(item, dict) and str(item.get("id")) == ident:
-            if kind == "character":
-                raw_prompt = str(item.get(prompt_key) or "").strip()
-                if raw_prompt and "三视图" in raw_prompt and "45度" not in raw_prompt and "45 度" not in raw_prompt:
-                    raise QueueError(
-                        f"@character:{ident} 的设定图提示词仍是旧版三视图构图。"
-                        f"请在「② 素材生成」重新提炼（或重新生成提示词）为五视图构图后，再重新提交本任务")
             if state_id:
                 state = next((value for value in item.get("states") or []
                               if isinstance(value, dict) and str(value.get("id")) == str(state_id)), None)
                 if not state:
-                    raise QueueError(f"人物状态不存在：@{kind}:{ident}#{state_id}")
-                prompt = str(state.get("sheet_prompt") or "").strip()
-                if prompt and "三视图" in prompt and "45度" not in prompt and "45 度" not in prompt:
-                    raise QueueError(
-                        f"@{kind}:{ident}#{state_id} 的状态提示词仍是旧版三视图构图。"
-                        f"请在「② 素材生成」重新生成该角色提示词后，再重新提交本任务")
-                if not prompt:
-                    base = str(item.get(prompt_key) or item.get("prompt") or "").strip()
-                    diff = str(state.get("look_diff") or state.get("label") or "").strip()
-                    prompt = "；".join(value for value in (base, f"状态差异：{diff}" if diff else "") if value)
+                    raise QueueError(f"素材状态不存在：@{kind}:{ident}#{state_id}")
                 merged = dict(item)
                 merged["state"] = dict(state)
                 merged["state_id"] = str(state_id)
-                return prompt, merged
-            return str(item.get(prompt_key) or item.get("prompt") or "").strip(), item
+                return subject_prompt(kind, item, state, project=project_dir), merged
+            return subject_prompt(kind, item, project=project_dir), item
     index = _read_json(os.path.join(project_dir, "素材", "素材图.json"), {})
     zone = {"character": "人物", "scene": "场景", "prop": "道具"}.get(kind, "")
     indexed = (index.get(zone) or {}).get(ident) if isinstance(index, dict) and isinstance(index.get(zone), dict) else None
@@ -271,23 +254,26 @@ def resolve_asset_execution_plan(project_dir, asset_ref, state_id=""):
         raise QueueError("资产引用格式无效")
     kind, ident = ref[1:].split(":", 1)
     if state_id:
-        if kind != "character":
-            raise QueueError("只有人物资产支持状态图")
+        zone = {"character": "人物", "scene": "场景", "prop": "道具"}.get(kind)
+        if not zone:
+            raise QueueError('素材类型不支持派生图')
         _prompt, source_record = _asset_source(project_dir, {"kind": kind, "id": ident}, state_id)
         registry = asset_registry.AssetRegistry(project_dir) if asset_registry is not None else None
         try:
             source = registry.resolve(ref) if registry is not None else {}
         except Exception:
             source = {}
-        mother_rel = str(source.get("path") or f"素材/人物/{ident}.png").replace("\\", "/")
+        mother_rel = str(source.get("path") or f"素材/{zone}/{ident}.png").replace("\\", "/")
         mother_abs = os.path.join(project_dir, mother_rel.replace("/", os.sep))
         present = os.path.isfile(mother_abs)
         state = source_record.get("state") or {}
+        from visual_asset_prompt import require_visual_settings
+        visual = require_visual_settings(kind, source_record, state, project=project_dir)
         revision_payload = json.dumps(state, ensure_ascii=False, sort_keys=True).encode("utf-8")
         return {
             "refs": [{
                 "path": mother_rel,
-                "purpose": f"人物母图身份参考：{source_record.get('name') or ident}",
+                "purpose": f"{zone}母图参考：{source_record.get('name') or ident}",
                 "reference_role": "identity_anchor",
                 "asset_ref": ref,
             }] if present else [],
@@ -295,8 +281,9 @@ def resolve_asset_execution_plan(project_dir, asset_ref, state_id=""):
             "missing_refs": [] if present else [ref],
             "execution_state": "ready" if present else "waiting_dependencies",
             "can_execute": present,
-            "target_path": f"素材/人物/{ident}__{_safe_piece(state_id)}.png",
+            "target_path": f"素材/{zone}/{ident}__{_safe_piece(state_id)}.png",
             "source_revision": f"{int(source.get('asset_revision') or 1)}:{hashlib.sha256(revision_payload).hexdigest()[:12]}",
+            "visual_source_hash": visual['source_hash'],
         }
     plans = gen_asset_images.collect_asset_image_plan(
         project_dir, kind, ident, "chatgpt", strict_dependencies=True
@@ -304,6 +291,10 @@ def resolve_asset_execution_plan(project_dir, asset_ref, state_id=""):
     plan = next((row for row in plans if row.get("kind") == kind and row.get("id") == ident), None)
     if not plan:
         raise QueueError(f"资产规划不存在：{ref}")
+    if not plan['visual_validation']['ready']:
+        from visual_asset_prompt import require_visual_settings
+        _prompt, record = _asset_source(project_dir, {'kind': kind, 'id': ident})
+        require_visual_settings(kind, record, project=project_dir)
     registry = asset_registry.AssetRegistry(project_dir) if asset_registry is not None else None
     references = []
     for dependency in plan.get("reference_tokens") or []:
@@ -331,6 +322,7 @@ def resolve_asset_execution_plan(project_dir, asset_ref, state_id=""):
         "can_execute": bool(plan.get("can_execute", True)),
         "target_path": f"素材/{zone}/{ident}.png",
         "source_revision": int(source.get("asset_revision") or 1),
+        "visual_source_hash": plan['visual_validation']['source_hash'],
     }
 
 
@@ -350,18 +342,19 @@ def _refresh_queued_asset_item(project_dir, item):
         raise QueueError(f"已排队资产缺少提示词：{ref}")
     prompt, negative = skill_lib.compose_asset_image_prompt(
         project_dir, prompt, skill_id=(source or {}).get("style") if isinstance(source, dict) else None,
-        kind=kind, style_prompt=(source or {}).get("style_prompt") if isinstance(source, dict) else None)
+        kind=generation_kind(kind, source or {}), style_prompt=(source or {}).get("style_prompt") if isinstance(source, dict) else None)
     item = dict(item)
     item.update(prompt=prompt, prompt_user=prompt, prompt_assembled=prompt, negative=negative)
     execution = resolve_asset_execution_plan(project_dir, ref, state_id)
     item.update({key: execution[key] for key in (
         "refs", "reference_tokens", "missing_refs", "execution_state",
-        "can_execute", "source_revision"
+        "can_execute", "source_revision", "visual_source_hash"
     )})
     prompt_json = dict(item.get("prompt_json") or {})
     prompt_json["source_record"] = source
     item["prompt_json"] = prompt_json
     item["asset_context"] = {"assets": [source]}
+    item['settings_revision'] = source.get('asset_revision', 1)
     return item
 
 
@@ -408,7 +401,7 @@ def queue_assets(project_dir, asset_refs, task_type="asset_image"):
             if not prompt:
                 prompt = f"{row.get('name') or row.get('id')} 的资产设定图；保持稳定身份、材质、比例和画风。"
             prompt, negative = skill_lib.compose_asset_image_prompt(
-                project_dir, prompt, skill_id=row.get("style"), kind=str(row.get("kind") or "character"),
+                project_dir, prompt, skill_id=row.get("style"), kind=generation_kind(str(row.get("kind") or "character"), source or {}),
                 style_prompt=row.get("style_prompt"))
             version = _next_asset_version(items, task_ref, task_type)
             kind = _safe_piece(row.get("kind"), "asset").upper()
@@ -436,6 +429,8 @@ def queue_assets(project_dir, asset_refs, task_type="asset_image"):
                 "execution_state": execution["execution_state"],
                 "can_execute": execution["can_execute"],
                 "source_revision": execution["source_revision"],
+                "visual_source_hash": execution['visual_source_hash'],
+                "settings_revision": row.get('asset_revision', 1),
                 "status": "queued", "output_spec": {
                     "asset_id": os.path.splitext(filename)[0], "filename": filename, "version": version,
                     "target_path": execution["target_path"]

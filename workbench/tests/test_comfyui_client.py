@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "tools")))
 from comfyui_client import (
+    build_qwen21_workflow,
     ComfyUIClient,
     ComfyUIError,
     build_qwen_image_edit_workflow,
@@ -16,6 +17,16 @@ from comfyui_client import (
 
 
 class ComfyUIWorkflowTests(unittest.TestCase):
+    def test_qwen21_edit_samples_on_encoder_canvas_then_sizes_output(self):
+        graph = build_qwen21_workflow('换上蓝衣', '', 'qwen21', width=1024, height=576,
+                                      seed=17, reference_images=['mother.png'])
+        self.assertEqual(graph['7']['inputs']['latent_image'], ['4', 2])
+        self.assertNotIn('6', graph)
+        output = graph[graph['10']['inputs']['images'][0]]
+        self.assertEqual(output['class_type'], 'ImageScale')
+        self.assertEqual((output['inputs']['width'], output['inputs']['height']), (1024, 576))
+        self.assertEqual(output['inputs']['crop'], 'center')
+
     def test_qwen21_model_routes_both_modes_to_its_own_encoder(self):
         client = ComfyUIClient("http://example.invalid:8188")
         client.upload_image = lambda p: "uploaded.png"

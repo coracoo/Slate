@@ -1,6 +1,15 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
-import { defaultShotPrompt, retimeUnit } from '../src/utils/shotPromptEditor.ts'
+import { defaultShotPrompt, defaultUnitPrompt, retimeUnit } from '../src/utils/shotPromptEditor.ts'
+
+test('加载保留 V 作者正文，不反复叠加 S 或嵌套宫格', () => {
+  const shots = [{id:'S1',dur:3,prompt_video:'S 动作',prompt_grid:'3×3，本镜宫格'}]
+  const unit = {shot_ids:['S1'],duration:8,prompt_video:'人工整段描述',prompt_grid:'2×2，统一布局'}
+  assert.equal(defaultUnitPrompt(unit,shots,'prompt_video'),'人工整段描述')
+  assert.equal(defaultUnitPrompt(unit,shots,'prompt_grid'),'2×2，统一布局')
+  assert.equal(defaultUnitPrompt({...unit,prompt_grid:''},shots,'prompt_grid'),'')
+  assert.equal(unit.duration,8)
+})
 
 test('S 时间更新联动 V 总长和标签，保留手写正文', () => {
   const shots = [{id:'S1',dur:4,prompt_video:'【S1镜（0.0—2.0s）：用户内容】'}, {id:'S2',dur:3,prompt_video:'【S2镜（2.0—5.0s）：动作不变】'}]

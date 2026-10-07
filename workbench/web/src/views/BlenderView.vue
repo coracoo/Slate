@@ -35,8 +35,8 @@ const FLOW = [
 <template>
   <div class="page">
     <header class="mb-6">
-      <h1 class="grad-text text-2xl font-black">⑤ Blender 配置</h1>
-      <p class="mt-1 text-xs text-slate-500">3D 白模链路依赖本机 Blender + Blender MCP；本页引导从零装到能用</p>
+      <h1 class="grad-text text-2xl font-black">Blender 连接配置</h1>
+      <p class="mt-1 text-sm text-slate-400">检查 Blender 与 Blender MCP 的连接状态。</p>
     </header>
 
     <!-- 顶部状态卡 -->
@@ -172,4 +172,3 @@ const FLOW = [
     </section>
   </div>
 </template>
-

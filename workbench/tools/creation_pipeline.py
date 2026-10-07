@@ -18,6 +18,7 @@
 公共: 429/超时指数退避重试（5/10/20/40s），配合 server 看门狗（每30分钟巡检卡死任务）。
 """
 import sys, os, json, re, time, argparse, glob
+import copy
 try:
     sys.stdout.reconfigure(encoding="utf-8")
 except Exception:
@@ -35,6 +36,7 @@ from narration import NARRATOR_ALIASES, is_narrator
 import skill_lib
 import script_repository
 import story_units
+import story_settings
 import project_store
 from llm_result import parse_structured
 from validate_dialogue import validate_document
@@ -46,14 +48,23 @@ FAST_THINK = {"thinking": {"type": "disabled"}}   # 结构化 JSON 任务关思�
 STORYBOARD_MAX_TOKENS = 24000  # 三类提示词与 V 分组同轮输出，避免截断
 
 
-def chat_retry(cli, messages, max_tokens=4000, timeout=420, tries=4, extra=None):
-    """429/超时指数退避；全部失败抛 VendorError。extra 失败（HTTP 4xx 参数拒绝）自动去参兜底。"""
+def chat_retry(cli, messages, max_tokens=4000, timeout=420, tries=6, extra=None,
+               trace_stage="", trace_sources=None, trace_input_revision=""):
+    """429/超时/连接失败指数退避（网络瞬断常连发，6 次 5→60s 覆盖约 3 分钟窗口）；全部失败抛 VendorError。
+    extra 失败（HTTP 4xx 参数拒绝）自动去参兜底。"""
     wait = 5
     use_extra = extra
     for i in range(tries):
         try:
+            trace_options = {}
+            if trace_stage:
+                trace_options["trace_stage"] = trace_stage
+            if trace_sources is not None:
+                trace_options["trace_sources"] = trace_sources
+            if trace_input_revision:
+                trace_options["trace_input_revision"] = trace_input_revision
             return cli.chat(messages, kind="text", max_tokens=max_tokens, timeout=timeout,
-                            temperature=0.4, extra=use_extra)
+                            temperature=0.4, extra=use_extra, **trace_options)
         except VendorError as e:
             msg = str(e)
             if use_extra and msg.startswith("HTTP 4"):
@@ -100,12 +111,69 @@ def anchor_locate(script, anchor, fallback):
     return -1
 
 
+def generate_episode_text(proj, vendor, idea, episode, previous_summary=None, instructions=''):
+    """生成正文提案；调用方决定保存到候选还是正式分集。"""
+    units = story_units.units_block(proj, episode['id'])
+    system, user = PM.expand_episode_prompt(idea, episode, previous_summary,
+        style_text=skill_lib.style_for(proj, 'script', persist_defaults=False), proj=proj, units=units)
+    if episode.get('text'):
+        user += '\n【现有正文】\n' + episode['text'] + '\n保持未要求修改的剧情事实和人物身份。'
+    if instructions:
+        user += '\n【本次修订要求】\n' + instructions + '\n要求与已确认事实冲突时保留事实，并用【缺口：需要修改规划】标明。'
+    client = VendorClient(pick_vendor(vendor))
+    result = chat_retry(client,
+        [{'role': 'system', 'content': system}, {'role': 'user', 'content': user}],
+        max_tokens=6000, trace_stage='expand').strip()
+    if not result:
+        raise ValueError('模型返回空正文')
+    response_meta = getattr(client, 'last_response_meta', {})
+    if isinstance(response_meta, dict) and response_meta.get('finish_reason') in ('length', 'max_tokens'):
+        raise ValueError('模型正文因输出上限被截断，未作为可采用候选保存；请缩小修改范围或调整输出额度')
+    return result
+
+
+def repair_episode_text(proj, vendor, episode, text, report, instructions=''):
+    """对已生成正文执行一次局部修正；不落正式正文或更改资产设定。"""
+    units = story_units.load_units(proj)
+    catalogue = {kind: [{key: row.get(key) for key in ('id', 'name', 'aliases')} for row in units[kind]]
+                 for kind in ('characters', 'scenes', 'props')}
+    card = {k: v for k, v in episode.items() if k not in ('text', 'char_start', 'char_end')}
+    system, user = PM.repair_episode_prompt(card, text, report,
+        story_units.units_block(proj, episode['id']), catalogue, instructions)
+    client = VendorClient(pick_vendor(vendor))
+    result = chat_retry(client, [{'role':'system','content':system}, {'role':'user','content':user}],
+                        max_tokens=6000, timeout=180, tries=1, trace_stage='script-repair').strip()
+    if not result:
+        raise ValueError('修正模型返回空正文，原稿保留')
+    meta = getattr(client, 'last_response_meta', {})
+    if isinstance(meta, dict) and meta.get('finish_reason') in ('length', 'max_tokens'):
+        raise ValueError('修正正文被截断，原稿保留')
+    if len(text) >= 100 and len(result) < len(text) * 0.65:
+        raise ValueError('修正稿删减过多，原稿保留')
+    return result
+
+
 def cmd_expand(proj, vendor, idea, eps_n, episode, allow_gaps=False):
-    """创作构想 → 剧集大纲（写 分集.json，schema 与 episodes 一致，后续提取/分镜无缝衔接）；
-    --episode E1 时再扩写该集为分场剧本，写 剧本/分集剧本_E1.txt 并并入 剧本.txt 尾部（或建库）。"""
+    """构想生成分集；单集扩写只更新现有分集卡的正文，保留全剧设定。"""
+    if not episode:
+        stage = 'complete' if story_units.load_units(proj)['episodes'] else 'all'
+        return cmd_units(proj, vendor, eps_n=eps_n, stage=stage, idea_text=idea)
     base = os.path.join(proj, "剧本")
-    cli = VendorClient(pick_vendor(vendor))
+    epjson = os.path.join(base, "分集.json")
+    book = {}
+    book_revision = None
+    if os.path.isfile(epjson):
+        book, book_revision = project_store.read_json(epjson)
+    if episode and not any(str(e.get("id")) == str(episode) for e in book.get("episodes") or []):
+        raise ValueError(f"分集中没有 {episode}，请先生成分集，再扩写单集正文")
+    from preproduction_flow import require_expansion_ready
+    workflow = require_expansion_ready(proj)
+    planned_revision = story_units.anchor_fingerprint(proj) if workflow['managed'] else None
     idea_path = os.path.join(base, "构想.txt")
+    if idea and workflow['managed']:
+        current_idea = open(idea_path, encoding='utf-8').read().strip() if os.path.isfile(idea_path) else ''
+        if idea.strip() != current_idea:
+            raise ValueError('构想已变化，请先更新规划并重新锁定，不能在扩写时替换构想。')
     if idea:
         os.makedirs(base, exist_ok=True)
         try:
@@ -113,11 +181,15 @@ def cmd_expand(proj, vendor, idea, eps_n, episode, allow_gaps=False):
             _V.snapshot(idea_path)
         except Exception:
             pass
-        open(idea_path, "w", encoding="utf-8").write(idea)
+        with open(idea_path, "w", encoding="utf-8") as handle:
+            handle.write(idea)
     elif os.path.isfile(idea_path):
-        idea = open(idea_path, encoding="utf-8").read()
+        with open(idea_path, encoding="utf-8") as handle:
+            idea = handle.read()
+    if episode and not idea:
+        idea = full_script_text(proj)
     if not idea or len(idea.strip()) < 5:
-        print("[错误] 缺少创作构想（--idea 一段话 或 剧本/构想.txt）"); sys.exit(1)
+        raise ValueError("缺少创作构想或导入正文")
     outline_path = os.path.join(base, "大纲.json")
     prev_main = None
     if os.path.isfile(outline_path):
@@ -127,67 +199,16 @@ def cmd_expand(proj, vendor, idea, eps_n, episode, allow_gaps=False):
             pass
     if prev_main:
         idea = idea + "[既有主线（保持一致）]" + prev_main
-    # 指定单集时复用既有大纲，避免重新生成并清空已扩写集。
-    if episode and os.path.isfile(outline_path):
-        try:
-            data = json.load(open(outline_path, encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise ValueError(f"既有大纲无法读取：{exc}")
-    else:
-        sys_p, user_p = PM.outline_prompt(idea, eps_n=eps_n, style_text=skill_lib.style_for(proj, "script"), proj=proj)
-        txt = chat_retry(cli, [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-                         max_tokens=12000, timeout=420, extra=FAST_THINK)
-        data = parse_json(txt)
+    data = book
     eps = data.get("episodes") or []
-    if not eps:
-        print("[错误] 大纲无 episodes: " + str(locals().get("txt", ""))[:300]); sys.exit(1)
-    old_ep_data = {}
-    old_ep_path = os.path.join(base, "分集.json")
-    if os.path.isfile(old_ep_path):
-        try:
-            old_ep_data = {str(x.get("id")): x for x in json.load(open(old_ep_path, encoding="utf-8")).get("episodes", [])}
-        except (OSError, ValueError):
-            old_ep_data = {}
-    for i, e in enumerate(eps, 1):
-        e.setdefault("id", f"E{i}")
-        e["char_start"] = 0; e["char_end"] = 0   # 从0生成：无原文锚点，text 由扩写填充
-        if str(e["id"]) in old_ep_data:
-            e["text"] = old_ep_data[str(e["id"])].get("text") or ""
-    data["idea"] = idea
-    data["prompt_version"] = PM.PROMPT_VERSION
-    # E10 冻结：记录本次大纲/扩写实际注入的拆剧本 skill（id/name/正文 sha 前12位）
-    data["skill_snapshot"] = skill_lib.skill_snapshot_for(proj, ["script"])
-    _dump(outline_path, data)
-    # 画风不再自动落 style.json：visual_style 只留在大纲里作参考，
-    # 视觉画风统一到资产提炼页手选（故事链路不携带视觉画风）。
-    print(f"[画风] 大纲 visual_style「{data.get('visual_style') or '(未给)'}」仅存档参考；生图风格请到资产提炼页选择")
-    print(f"[完成] 大纲 {len(eps)} 集 -> {outline_path}")
-    print(f"  主线: {data.get('main_line','')}")
-    for e in eps:
-        print(f"  {e['id']} {e.get('title','')} ({e.get('duration_min')}min) {e.get('summary','')[:36]}")
-    # 同步 分集.json（带 text 字段的兼容视图；未扩写集 text 为空）
-    for e in eps:
-        e.setdefault("text", "")
-    epjson = os.path.join(base, "分集.json")
-    if episode is None:
-        _dump_episodes(epjson, {"episodes": eps, "prompt_version": PM.PROMPT_VERSION, "mode": "generated"})
-        print("OUTPUT:" + epjson)
-        return
     # 扩写指定集
     tgt = next((e for e in eps if e["id"] == episode), None)
     if tgt is None:
         print(f"[错误] 大纲中没有 {episode}"); sys.exit(1)
     idx = eps.index(tgt)
     prev_s = eps[idx-1].get("summary") if idx > 0 else None
-    # ① 第一步锚定过的项目：把该集的最小单元（传记/边界/伏笔/规则/白名单）当硬输入；
-    # 未锚定项目 units_txt 为空串，提示词与改造前逐字相同。
-    units_txt = story_units.units_block(proj, episode)
-    if units_txt:
-        print(f"[锚定注入] {episode} 吃最小单元 {len(units_txt)} 字（未锚定则不注入）", flush=True)
-    sys_p, user_p = PM.expand_episode_prompt(idea, tgt, prev_s, style_text=skill_lib.style_for(proj, "script"),
-                                             proj=proj, units=units_txt)
-    script_txt = chat_retry(cli, [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-                            max_tokens=6000).strip()
+    # 已锁定设定作为扩写硬输入；导入稿与尚未迁移的旧项目沿用既有入口。
+    script_txt = generate_episode_text(proj, vendor, idea, tgt, prev_s)
     marks = re.findall(r"【缺口[:：]\s*([^】]{1,80})】", script_txt)
     if marks:
         print("[缺口] 正文自报缺实体（回第一步把名册补上，别在正文里造）：", flush=True)
@@ -205,17 +226,25 @@ def cmd_expand(proj, vendor, idea, eps_n, episode, allow_gaps=False):
                   "确实要先留稿用 --allow-gaps 强行落盘。", flush=True)
             sys.exit(2)
         print("[警告] --allow-gaps 已放行，缺口实体未入档，后续 ②③ 不会认它们。", flush=True)
+    import episode_editor
+    if planned_revision and (not story_units.is_anchored(proj) or story_units.anchor_fingerprint(proj) != planned_revision):
+        raise ValueError('扩写期间剧情依据发生变化，本次正文未保存；请在剧本页核对并重新确认规划。')
+    for existing in eps:
+        if not existing.get('text'):
+            existing['text'] = episode_editor.episode_text(proj, book, existing)
     tgt["text"] = script_txt
+    tgt.pop('planning_review_required', None)
     tgt["char_start"] = 0; tgt["char_end"] = len(script_txt)
-    _dump_episodes(epjson, {"episodes": eps, "prompt_version": PM.PROMPT_VERSION, "mode": "generated"})
+    next_revision = int(book.get('rev') or 0) + 1
+    tgt['script_edit_rev'] = next_revision
+    data.setdefault('script_edit_revisions', {})[str(next_revision)] = episode
+    data.update({"episodes": eps, "prompt_version": PM.PROMPT_VERSION, "mode": "generated"})
+    _dump_episodes(epjson, data, expected_revision=book_revision)
     ep_txt = os.path.join(base, f"分集剧本_{episode}.txt")
-    import versions as _V
-    _V.snapshot(ep_txt)   # 覆写前快照旧稿，保留可回滚历史
-    open(ep_txt, "w", encoding="utf-8").write(script_txt)
-    # 若 剧本.txt 不存在（纯创作项目）则以扩写文本建库；存在则不动（用户可能混编）
-    if not os.path.isfile(script_path(proj)):
-        open(script_path(proj), "w", encoding="utf-8").write(script_txt)
-        print("[信息] 已写入 剧本/剧本.txt（原库为空，供台词/白模链路使用）")
+    try:
+        episode_editor.sync_episode_copy(proj, episode, seed_script=True)
+    except (OSError, ValueError, project_store.RevisionConflict) as exc:
+        print(f"[警告] 正文已保存，文本副本未刷新：{exc}", flush=True)
     print(f"[完成] {episode} 扩写 {len(script_txt)} 字 -> {ep_txt}")
     print("OUTPUT:" + ep_txt)
 
@@ -225,7 +254,87 @@ def _ep_num(ep_id):
     return int(m.group(1)) if m else None
 
 
-def cmd_units(proj, vendor, eps_n=0, arc_size=6, do_anchor=False, stage="all"):
+def _validate_planning_skeleton(data, count):
+    if not str(data.get('premise') or '').strip():
+        raise ValueError('骨架缺少主线 premise')
+    arcs = data.get('arcs')
+    if not isinstance(arcs, list) or not arcs:
+        raise ValueError('骨架缺少全剧分段 arcs')
+    cover, arc_ids = [], set()
+    for arc in arcs:
+        if not isinstance(arc, dict) or not arc.get('id') or str(arc['id']) in arc_ids:
+            raise ValueError('骨架分段 id 缺失或重复')
+        arc_ids.add(str(arc['id']))
+        lo, hi = _ep_num(arc.get('ep_from')), _ep_num(arc.get('ep_to'))
+        if lo is None or hi is None or not 1 <= lo <= hi <= count:
+            raise ValueError(f'分段 {arc["id"]} 区间须在 E1–E{count} 内')
+        cover.extend(range(lo, hi + 1))
+    missing = sorted(set(range(1, count + 1)) - set(cover))
+    if missing or len(cover) != len(set(cover)):
+        raise ValueError('全剧分段有重叠或漏集：' + ('、'.join(f'E{n}' for n in missing) or '区间重叠'))
+
+
+def _validate_planning_cards(data, ids, arc_id):
+    """校验剧情内容；本批的分段归属由已保存骨架绑定。"""
+    rows = data.get('episodes')
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError('分集补批必须返回 episodes 数组')
+    returned = [str(row.get('id')) for row in rows]
+    if sorted(returned) != sorted(ids):
+        raise ValueError('本批分集必须逐一包含 ' + '、'.join(ids) + '，不得漏集、重复或返回别的集号')
+    for row in rows:
+        if not isinstance(row.get('summary'), str) or not row['summary'].strip():
+            raise ValueError(f'{row["id"]} 缺少非空文本概要 summary')
+        beats = row.get('beats')
+        if not isinstance(beats, list) or not beats or any(not isinstance(x, str) or not x.strip() for x in beats):
+            raise ValueError(f'{row["id"]} 缺少非空节拍 beats')
+    for row in rows:
+        row['arc_id'] = arc_id
+
+
+def _replay_planning_cards(proj, ids, arc_id):
+    """续跑时复用本批完整响应，截断、漏集和内容缺项仍拒收。"""
+    from pathlib import Path
+    folder = Path(proj) / '剧本/规划诊断'
+    for path in sorted(folder.glob('*.json'), key=lambda p: p.stat().st_mtime_ns, reverse=True):
+        try:
+            record = json.loads(path.read_text(encoding='utf-8'))
+            if record.get('stage') != f'U1 批 {arc_id}' or record.get('finish_reason') in ('length', 'max_tokens'):
+                continue
+            data = parse_json(record.get('text') or '')
+            _validate_planning_cards(data, ids, arc_id)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        print(f'[恢复响应] 已校验并复用 {"、".join(ids)}，分段归属按骨架绑定。', flush=True)
+        return {key: value for key, value in data.items() if key in ('episodes', 'hooks')}
+    return None
+
+
+def _record_planning_response(proj, stage, attempt, text, client, error=''):
+    """私有候选目录保留模型响应与终止原因；不记录请求鉴权。"""
+    import uuid
+    from pathlib import Path
+    from error_utils import scrub_error
+    folder = Path(proj) / '剧本/规划诊断'
+    path = folder / (uuid.uuid4().hex + '.json')
+    finish = getattr(client, 'last_finish_reason', None)
+    usage = getattr(client, 'last_usage', None)
+    record = {'stage': stage, 'attempt': attempt, 'text_chars': len(text or ''),
+              'finish_reason': finish if isinstance(finish, str) else None,
+              'usage': usage if isinstance(usage, dict) else None,
+              'error': scrub_error(error), 'text': scrub_error(text or '')}
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(record, ensure_ascii=False, indent=1), encoding='utf-8')
+        return str(path)
+    except OSError as exc:
+        print(f'[规划诊断] 写入失败：{scrub_error(exc)}', flush=True)
+        return ''
+
+
+def cmd_units(proj, vendor, eps_n=0, arc_size=6, do_anchor=False, stage="all", idea_text=None,
+              planning_source='idea', revision_mode='auto', revision_instructions='',
+              revision_context=None, planning_version=None, resume_planning=False, asset_refs=None):
     """① 第一步：剧本/一句话构想 → 全剧最小单元 → 落盘 → 可选锚定。
 
     U1 剧情骨架（premise/rules/taboos/分段/推演/实体名册/分集加厚条目/埋线/钩子）
@@ -233,8 +342,37 @@ def cmd_units(proj, vendor, eps_n=0, arc_size=6, do_anchor=False, stage="all"):
     集数多时按分段并批出集，防一次输出截断；每批都带"已生成摘要 + 已埋未收的线"。
     stage=story|entity|all：entity 只续跑设定层（补齐缺项用，不重跑骨架，省一次大输出）。
     """
+    if stage == 'replan':
+        if do_anchor:
+            raise ValueError('规划更新完成后请核对并确认')
+        from story_planning_versions import generate, resume
+        if planning_version:
+            return resume(proj, planning_version,
+                runner=lambda workspace, target: cmd_units(str(workspace), vendor, eps_n=target,
+                    arc_size=arc_size, stage='all', resume_planning=True,
+                    revision_context=json.loads((workspace / '剧本/修订上下文.json').read_text(encoding='utf-8'))))
+        return generate(proj, target_episodes=eps_n, source=planning_source, idea=idea_text,
+                        revision_mode=revision_mode, instructions=revision_instructions,
+                        runner=lambda workspace, target: cmd_units(str(workspace), vendor, eps_n=target,
+                            arc_size=arc_size, stage='all',
+                            revision_context=json.loads((workspace / '剧本/修订上下文.json').read_text(encoding='utf-8'))))
+    planning_revision = revision_context is not None
+    if story_units.is_anchored(proj) and stage != 'entity':
+        raise ValueError('设定已锁定，请先解除锁定再生成或补全。')
+    fill_only = stage in ('complete', 'entity')
+    if fill_only and asset_refs is None:
+        from preproduction_flow import require_completion_ready
+        require_completion_ready(proj, eps_n)
     base = os.path.join(proj, "剧本")
     idea_path = os.path.join(base, "构想.txt")
+    if idea_text is not None:
+        if len(str(idea_text).strip()) < 5:
+            raise ValueError("创作构想至少 5 字")
+        import versions as _V
+        os.makedirs(base, exist_ok=True)
+        _V.snapshot(idea_path)
+        with open(idea_path, "w", encoding="utf-8") as handle:
+            handle.write(str(idea_text).strip())
     idea = open(idea_path, encoding="utf-8").read() if os.path.isfile(idea_path) else ""
     source = full_script_text(proj) or ""
     if not idea.strip() and not source.strip():
@@ -245,80 +383,150 @@ def cmd_units(proj, vendor, eps_n=0, arc_size=6, do_anchor=False, stage="all"):
             eps_n = int((brief_mod.load_brief(proj) or {}).get("total_episodes") or 0)
         except Exception:
             eps_n = 0
-    # 已有分集的项目：第一步只给这些集做骨架，绝不按 brief 的目标集数扩集
-    #（09_仙 实跑翻过车：6 集的剧被 brief 的 15 集带着编出 E7~E15 的分段，体检 C1 才拦下）
+    # 已有分集只补充规划，目标集数不会自动增删分集。
     existing_eps = [str(e.get("id")) for e in story_units.load_units(proj)["episodes"] if e.get("id")]
-    if len(existing_eps) >= 2:
+    if existing_eps and not revision_context:
         if eps_n and eps_n != len(existing_eps):
-            print(f"[校正] 目标集数按现有分集收敛：{eps_n} → {len(existing_eps)}（第一步不新增集，扩集是第二步之后的事）", flush=True)
+            print(f"[分集] 本次沿用已有 {len(existing_eps)} 集；修改目标集数不会新增或删除分集。", flush=True)
         eps_n = len(existing_eps)
     arc_size = max(1, min(arc_size, eps_n or arc_size))
+    if planning_revision:
+        arc_size = min(arc_size, 3)
     # 既有资产目录：不给它看，LLM 会把"仙恩药"登记成 xianen-yao 而既有档案里是 xianen_hei_yaowan，
     # 一个人物三个 id（09_仙 首跑实测 57 个重复建档）
     known_assets = story_units.roster_catalog(proj)
+    protected_ids = ({str(row['id']) for row in revision_context['episodes']}
+                     if revision_context and revision_context['mode'] == 'extend' else set())
     if known_assets:
         print(f"[最小单元] 既有资产 {len(known_assets)} 条进目录，要求复用 id", flush=True)
     cli = VendorClient(pick_vendor(vendor))
-    st = skill_lib.project_style(proj)
-    script_style = skill_lib.style_for(proj, "script") if str(st.get("script") or "").strip() else ""
+    script_style = skill_lib.style_for(proj, "script")
+    script_snapshot = skill_lib.skill_snapshot_for(proj, ['script'])
 
-    def ask(sys_user, stage=""):
+    def record_prompt_source():
+        import versions
+        project_store.update_json(os.path.join(base, '大纲.json'),
+            lambda value: value.update(skill_snapshot=script_snapshot, prompt_version=PM.PROMPT_VERSION),
+            snapshot=versions.snapshot)
+    if fill_only:
+        u = story_units.load_units(proj)
+        completion_context = '\n[已有规划：正文事实优先，仅补空缺，不改变人物身份、主线、分集卡或已填设定]\n' + json.dumps(
+            {'outline': u['outline'], 'episodes': [{k: v for k, v in e.items() if k != 'text'} for e in u['episodes']]},
+            ensure_ascii=False)
+    else:
+        completion_context = ''
+
+    def ask(sys_user, stage="", validator=None, attempts=2, include_completion=True):
         """一次结构化调用；截断/非 JSON 时换更紧的口吻重试一次，仍失败才抛可读错误。
 
         不再让裸 traceback 冒到 main：这一步之前已经落过盘（骨架/名册），崩得难看会让人以为整批白跑。
         """
         sys_p, user_p = sys_user
-        tighten = ("上一轮输出无法解析成合法 JSON。这次只输出一个 JSON 对象：不要解释、不要 markdown 代码栏、"
-                   "不要尾逗号；字段值一律短句（每条 ≤40 字），数组宁少勿长，确保 JSON 能闭合。")
+        if include_completion:
+            user_p += completion_context
+        tighten = ("上一轮输出未通过校验。这次只输出一个 JSON 对象，必须完整，不要解释或代码栏、不要尾逗号。"
+                   "所有指定集号和必填字段必须保留，只缩短长文本；禁止通过漏集或删必填字段缩短输出。")
         last = None
+        output_error = False
         txt = ""
-        for attempt in (1, 2):
+        for attempt in range(1, attempts + 1):
+            txt = ''
             msgs = [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}]
             if attempt == 2:
-                msgs.append({"role": "assistant", "content": (txt or "")[:1500]})
-                msgs.append({"role": "user", "content": tighten})
+                msgs.append({"role": "user", "content": tighten + '\n校验错误：' + str(last or '')})
             try:
-                txt = chat_retry(cli, msgs, max_tokens=12000, timeout=720, extra=FAST_THINK)
+                txt = chat_retry(cli, msgs, max_tokens=12000, timeout=720, extra=FAST_THINK,
+                                 trace_stage="units_" + (stage or "story"))
             except Exception as exc:
+                output_error = False
                 last = f"调用失败：{exc}"
+                _record_planning_response(proj, stage, attempt, txt, cli, last)
                 continue
             try:
+                if getattr(cli, 'last_finish_reason', None) in ('length', 'max_tokens'):
+                    raise ValueError('模型标记输出达到长度上限')
                 data = parse_json(txt)
+                if not data:
+                    raise ValueError('输出不是非空 JSON 对象')
+                if validator:
+                    validator(data)
             except Exception as exc:
-                last = f"JSON 解析失败：{exc}"
+                output_error = True
+                last = f"输出校验失败：{exc}（本次输出 {len(txt or '')} 字）"
+                diagnostic = _record_planning_response(proj, stage, attempt, txt, cli, last)
+                print(f'[规划校验] {last}' + (f'；响应记录：{diagnostic}' if diagnostic else ''), flush=True)
                 continue
-            if isinstance(data, dict) and data:
-                return data
-            last = "输出不是非空 JSON 对象"
-        raise ValueError(f"{stage or '最小单元'} 生成失败（{last}）；已落盘的部分保留，重跑本命令会从未完成的段续算")
+            _record_planning_response(proj, stage, attempt, txt, cli)
+            return data
+        error_type = story_settings.SettingsOutputError if output_error else ValueError
+        raise error_type(f"{stage or '最小单元'} 生成失败（{last}）；本次草稿保留，未完成部分不可采用或锁定")
 
     # ── U1 第一批：全剧骨架（分集只出前一段，防一次输出截断）──
-    if stage not in ("all", "story"):
-        print(f"[最小单元] 跳过 U1（stage={stage}）：骨架已有，只续跑设定层——省一次大输出，也免得重造名册", flush=True)
-    else:
-        print(f"[最小单元] U1 剧情骨架（正文 {len(source)} 字 / 目标 {eps_n or '不限'} 集 / 每段 {arc_size} 集）", flush=True)
+    existing_outline = story_units.load_units(proj)['outline']
+    need_skeleton = stage == 'complete' and not (existing_outline.get('premise') and existing_outline.get('arcs'))
+    saved_skeleton = False
+    if planning_revision and resume_planning:
         try:
-            data = ask(PM.units_story_prompt(idea, source, eps_n=eps_n, style_text=script_style, proj=proj,
-                                             arc_size=arc_size, known=known_assets), "U1 骨架")
+            _validate_planning_skeleton(existing_outline, eps_n)
+            saved_skeleton = True
+        except ValueError:
+            pass
+    if saved_skeleton or (stage not in ("all", "story") and not need_skeleton):
+        print(f"[最小单元] 主线与分段已有：本次仅补分集卡和素材设定的空缺。", flush=True)
+    else:
+        print(f"[最小单元] U1 剧情骨架（正文 {len(source)} 字 / 目标 {eps_n or '不限'} 集 / 每批 {arc_size} 集）", flush=True)
+        try:
+            if planning_revision:
+                data = ask(PM.units_skeleton_prompt(idea, source, eps_n=eps_n, style_text=script_style,
+                           proj=proj, known=known_assets, revision_context=revision_context), 'U1 骨架',
+                           validator=lambda result: _validate_planning_skeleton(result, eps_n))
+            else:
+                data = ask(PM.units_story_prompt(idea, source, eps_n=eps_n, style_text=script_style, proj=proj,
+                           arc_size=arc_size, known=known_assets), 'U1 骨架')
         except ValueError as exc:
             # 骨架是后面一切的底，拿不到就没法继续——给可读的中止信息，别把 traceback 甩给用户
             print(f"[中止] {exc}", flush=True)
             return {"ok": False, "incomplete": [str(exc)], "counts": {}}
-        roster_out = story_units.apply_story(proj, data)
+        if protected_ids:
+            data.pop('episodes', None)
+            for key in ('premise', 'rules', 'taboos', 'sources'):
+                original = revision_context['outline'].get(key)
+                if original:
+                    data[key] = original
+            previous_threads = {str(row['id']): row for row in revision_context['foreshadows'] if row.get('id')}
+            for row in data.get('foreshadows') or []:
+                if row.get('id') not in previous_threads:
+                    if _ep_num(row.get('set_in')) is None or _ep_num(row['set_in']) <= len(protected_ids):
+                        print('[中止规划] 扩集新增伏笔不能倒填既有分集。', flush=True)
+                        return {'ok': False, 'incomplete': ['新增伏笔须在新增集埋设'], 'counts': {}}
+                    previous_threads[str(row['id'])] = row
+            data['foreshadows'] = list(previous_threads.values())
+            data['hooks'] = revision_context['hooks']
+        roster_out = story_units.apply_story(proj, data, fill_only=fill_only)
+        record_prompt_source()
+        if protected_ids:
+            book = story_units.load_units(proj)['episodes_doc']
+            for row in book['episodes']:
+                number = _ep_num(row['id'])
+                row['arc_id'] = next(arc['id'] for arc in data['arcs']
+                                     if _ep_num(arc['ep_from']) <= number <= _ep_num(arc['ep_to']))
+            story_units._write(story_units.path_episodes(proj), book)
         print(f"  骨架：分段 {len(data.get('arcs') or [])} 段，实体新建 {len(roster_out['created'])} /"
-              f" 沿用既有 {len(roster_out['reused'])}，本批分集 {len(data.get('episodes') or [])} 集", flush=True)
+              f" 沿用既有 {len(roster_out['reused'])}，" +
+              ('新增或修改的分集卡将在下一阶段生成' if planning_revision else f"本批分集 {len(data.get('episodes') or [])} 集"), flush=True)
 
     # ── U1 后续批：按"还没被分段覆盖的集"补齐（段大小=arc_size）──
     # 判据不能用"分段区间里缺不缺集"：LLM 常只回第一段，其余段整段不存在，
     # 那样循环会以为没事干，把剩下 3/4 的集无声漏掉（09_仙 实跑即此形态）。
-    failed, skipped = [], set()
-    for _round in range(24 if stage in ("all", "story") else 0):
+    failed = []
+    batch_limit = max(24, eps_n) if planning_revision else 24
+    for _round in range(batch_limit if stage in ("all", "story", "complete") else 0):
         units = story_units.load_units(proj)
         rows = sorted(units["episodes"], key=lambda x: (_ep_num(x.get("id")), str(x.get("id"))))
-        have = {str(e.get("id")) for e in rows}
         arcs = [a for a in (units["outline"].get("arcs") or []) if isinstance(a, dict)]
-        wanted = [str(e.get("id")) for e in rows if e.get("id")] or \
-                 [f"E{n}" for n in range(1, (eps_n or arc_size) + 1)]
+        wanted = ([f"E{n}" for n in range(1, eps_n + 1)] if eps_n and stage in ('all', 'story') else
+                  [str(e.get("id")) for e in rows if e.get("id")] or
+                  [f"E{n}" for n in range(1, (eps_n or arc_size) + 1)])
         arc_ids = {str(a.get("id")): a for a in arcs if a.get("id")}
 
         def thickened(e):
@@ -329,7 +537,9 @@ def cmd_units(proj, vendor, eps_n=0, arc_size=6, do_anchor=False, stage="all"):
                 return False
             lo, hi = _ep_num(arc.get("ep_from")), _ep_num(arc.get("ep_to"))
             here = _ep_num(e.get("id"))
-            return lo is not None and hi is not None and here is not None and lo <= here <= hi
+            valid_arc = lo is not None and hi is not None and here is not None and lo <= here <= hi
+            return valid_arc and (str(e.get('id')) in protected_ids or
+                not (stage == 'complete' or planning_revision) or bool(e.get('summary') and e.get('beats')))
 
         missing = [i for i in wanted
                    if not thickened(next((e for e in rows if str(e.get("id")) == i), {"id": i}))]
@@ -343,74 +553,83 @@ def cmd_units(proj, vendor, eps_n=0, arc_size=6, do_anchor=False, stage="all"):
                    {"id": f"TAIL-{chunk[0]}", "ep_from": chunk[0], "ep_to": chunk[-1],
                     "goal": "补齐未被任何分段覆盖的集（分段表本身要连着补上）"})
         tag = str(arc.get("id"))
-        if tag in skipped:
-            break
+        if planning_revision:
+            end = _ep_num(arc.get('ep_to'))
+            chunk = [eid for eid in chunk if end is None or _ep_num(eid) <= end]
+            batch_arc = {**arc, 'ep_from': chunk[0], 'ep_to': chunk[-1]}
+        else:
+            batch_arc = arc
         print(f"[最小单元] U1 补批 {tag}（还有 {len(missing)} 集未加厚，本批 {len(chunk)} 集："
               f"{'、'.join(chunk[:8])}{'…' if len(chunk) > 8 else ''}）", flush=True)
         prev_rows = [e for e in rows if str(e.get("id")) in set(wanted) and e.get("arc_id")][-arc_size:]
         prev_summary = "\n".join(f"- {e.get('id')} {e.get('title', '')}：{str(e.get('summary') or '')[:60]}"
                                  for e in prev_rows)
         try:
-            data = ask(PM.units_story_prompt(idea, source, eps_n=eps_n, arc=arc, prev_summary=prev_summary,
-                                             open_threads=story_units.open_threads(proj, arc.get("ep_from")),
-                                             style_text=script_style, proj=proj,
-                                             known=story_units.roster_catalog(proj)), f"U1 批 {tag}")
+            if planning_revision:
+                data = _replay_planning_cards(proj, chunk, tag) if resume_planning else None
+                if data is None:
+                    data = ask(PM.units_episode_prompt(idea, source, outline=units['outline'],
+                        episode_ids=chunk, arc=batch_arc, eps_n=eps_n, prev_summary=prev_summary,
+                        foreshadows=units['foreshadows'], style_text=script_style, proj=proj,
+                        known=story_units.roster_catalog(proj), revision_context=revision_context), f'U1 批 {tag}',
+                        validator=lambda result: _validate_planning_cards(result, chunk, tag))
+                data = {key: value for key, value in data.items() if key in ('episodes', 'hooks')}
+            else:
+                data = ask(PM.units_story_prompt(idea, source, eps_n=eps_n, arc=batch_arc, prev_summary=prev_summary,
+                    open_threads=story_units.open_threads(proj, arc.get('ep_from')),
+                    style_text=script_style, proj=proj, known=story_units.roster_catalog(proj)), f'U1 批 {tag}')
         except ValueError as exc:
-            # 单批失败不拖垮整轮：记下、这段标记跳过，继续补别的段
             failed.append(f"{tag}: {exc}")
-            skipped.add(tag)
-            continue
-        got = story_units.apply_story(proj, data)
+            break
+        before = sum(int(thickened(e)) for e in rows if str(e.get('id')) in chunk)
+        before_fields = sum(bool(e.get(k)) for e in rows if str(e.get('id')) in chunk for k in ('summary', 'beats', 'arc_id'))
+        got = story_units.apply_story(proj, data, fill_only=fill_only)
+        record_prompt_source()
         print(f"  本批加厚 {len(data.get('episodes') or [])} 集（名册新建 {len(got['created'])}/沿用 {len(got['reused'])}）",
               flush=True)
+        updated = story_units.load_units(proj)
+        arc_ids = {str(a.get('id')): a for a in updated['outline'].get('arcs') or [] if isinstance(a, dict)}
+        after = sum(int(thickened(e)) for e in updated['episodes'] if str(e.get('id')) in chunk)
+        after_fields = sum(bool(e.get(k)) for e in updated['episodes'] if str(e.get('id')) in chunk for k in ('summary', 'beats', 'arc_id'))
+        if after <= before and (stage != 'complete' or after_fields <= before_fields):
+            failed.append(f'{tag}: 补全未产生变化，请手动修正分集与分段关系')
+            print('[停止补全] 本批未产生变化，不重复调用模型。', flush=True)
+            break
 
-    if failed:
-        print(f"[最小单元] {len(failed)} 个段没补齐（已落盘的部分保留，重跑本命令只补还缺的段）：", flush=True)
-        for f in failed:
-            print("  ✗ " + f, flush=True)
-
-    # ── U2：设定层（传记/边界/空间限制/状态派生），按缺项分批续跑 ──
     units = story_units.load_units(proj)
-    if units["characters"] or units["scenes"] or units["props"]:
-        gap_total = 0
-        for _round in range(10):
-            pend = story_units.pending_settings(proj, per_round=16)
-            if not pend["remaining"]:
-                break
-            gap_total = pend["remaining"]
-            batch = pend["batch"]
-            print(f"[最小单元] U2 设定层：还缺 {pend['remaining']} 个实体，本批写 {len(pend['targets'])} 个"
-                  f"（人物 {len(batch['characters'])}／场景 {len(batch['scenes'])}／道具 {len(batch['props'])}）",
-                  flush=True)
-            try:
-                # 名册给全量（它们是背景），只把"本批条目"列成任务——不然模型会把没进本批的
-                # 既有实体当缺口报（09_仙 实跑把主角芝靖报成"名册里没有"）
-                ent = ask(PM.units_entity_prompt({"premise": units["outline"].get("premise"),
-                                                  "rules": units["outline"].get("rules"),
-                                                  "arcs": units["outline"].get("arcs"),
-                                                  "roster": {"characters": units["characters"],
-                                                             "scenes": units["scenes"], "props": units["props"]},
-                                                  "episodes": units["episodes"],
-                                                  "foreshadows": units["foreshadows"]},
-                                                 style_text=script_style, proj=proj,
-                                                 targets=pend["targets"]), "U2 设定层")
-            except ValueError as exc:
-                failed.append(f"U2 设定层: {exc}")
-                print(f"  ✗ {exc}", flush=True)
-                break
-            res = story_units.apply_entities(proj, ent)
-            gaps = res.get("gaps") or []
-            for g in gaps[:20]:
-                print(f"  [缺口] {g.get('kind')} {g.get('ref') or ''}：{g.get('need')}", flush=True)
-            after = story_units.pending_settings(proj, per_round=0)["remaining"]
-            print(f"  本批落设定 {res['applied']} 个，仍缺 {after} 个", flush=True)
-            if after >= pend["remaining"]:
-                # LLM 这轮没写进任何一个（或只报了缺口）——再跑也是白烧钱，停下来交人工
-                print("[U2 停了] 这一批没能减少缺项：剩下的人名/场景请直接在 ① 卡「素材设定」里填。", flush=True)
-                break
-            gap_total = after
-        if gap_total:
-            print(f"[U2 收尾] 设定层仍缺 {gap_total} 个实体（① 卡可逐条补齐）", flush=True)
+    if planning_revision and not failed:
+        expected = [f'E{n}' for n in range(1, eps_n + 1)]
+        actual = [str(row.get('id')) for row in units['episodes']]
+        if sorted(expected) != sorted(actual) or any(
+                not row.get('summary') or not row.get('beats') for row in units['episodes'] if row['id'] not in protected_ids):
+            failed.append('全剧分集尚未齐全：要求 ' + '、'.join(expected))
+        report = story_units.check(proj)
+        structural = [e for e in report['errors'] if e['code'] not in
+                      ('CHARACTER_SETTINGS_INCOMPLETE', 'ASSET_SETTINGS_INCOMPLETE')]
+        if structural:
+            failed.extend(f'{e["code"]}：{e["message"]}' for e in structural)
+    if failed:
+        report = story_units.check(proj)
+        report.update(ok=False, incomplete=failed)
+        print('[中止规划] 分集阶段未完成，未进入素材设定；本次草稿不可采用或锁定。', flush=True)
+        for message in failed:
+            print('  ✗ ' + message, flush=True)
+        return report
+
+    # 设定补全只处理在用实体，缺项批次独立校验并立即保存。
+    def generate_settings(context, targets):
+        refs = '、'.join(t['ref'] for t in targets)
+        return ask(PM.units_entity_prompt(context, style_text=script_style, proj=proj, targets=targets),
+                   'U2 设定层 ' + refs, attempts=1, include_completion=False)
+
+    try:
+        story_settings.complete(proj, generate_settings, selected_refs=asset_refs)
+    except ValueError as exc:
+        failed.append(f'U2 设定层: {exc}')
+        print(f'[U2 停止] {exc}；已补齐内容保留，下次仅补剩余缺项。', flush=True)
+
+    if asset_refs is not None:
+        return {'ok': not failed, 'incomplete': failed}
 
     orphans = story_units.prune_unreferenced_new(proj)
     if orphans["candidates"]:
@@ -420,6 +639,11 @@ def cmd_units(proj, vendor, eps_n=0, arc_size=6, do_anchor=False, stage="all"):
               + "。清理：python workbench/tools/story_units.py prune <项目> --apply", flush=True)
 
     filled = story_units.fill_refs_from_text(proj, apply_changes=True)
+    # 确定性反推：场景文本点名的实体补 related_refs（LLM 漏挂兜底；场景类生图参考链依赖它）
+    relinked = story_units.backfill_scene_related(proj)
+    if relinked:
+        print(f"[补场景关联] {len(relinked)} 个场景按文本点名补挂 related_refs："
+              + "；".join(f"{r['name']}←{','.join(r['added'][:3])}" for r in relinked[:4]), flush=True)
     if filled["episodes"]:
         print(f"[补引用] 从正文反推填了 {len(filled['episodes'])} 集的 cast/scene/prop 引用"
               f"（加厚条目只覆盖到 LLM 想到的那几个，不补反查索引会是瞎的）", flush=True)
@@ -442,9 +666,12 @@ def cmd_units(proj, vendor, eps_n=0, arc_size=6, do_anchor=False, stage="all"):
             print(f"[已锚定] anchor_rev=v{done['anchor_rev']}；第二步逐集扩写将吃这套最小单元", flush=True)
         else:
             print("[未锚定] 体检仍有阻断项，修完再锚（或 --anchor --force）", flush=True)
+    elif failed or not report['ok']:
+        print('[规划未完成] 草稿已保留，当前不能采用或锁定；请查看失败阶段与诊断记录。', flush=True)
     else:
-        print("[提示] 未锚定：① 页确认各包内容后点「锚定」，或跑 units --anchor", flush=True)
+        print("[待确认] 在剧本页核对草稿、修正阻断项，再点「确认设定并锁定」。", flush=True)
     report["incomplete"] = failed
+    report['ok'] = report['ok'] and not failed
     return report
 
 
@@ -503,7 +730,8 @@ def cmd_overview(proj, vendor, ep_id=None):
     ep_path = os.path.join(proj, "剧本", "分集.json")
     if not os.path.isfile(ep_path):
         print("[错误] 缺少 剧本/分集.json（先分集或从0生成大纲）"); sys.exit(1)
-    data = json.load(open(ep_path, encoding="utf-8"))
+    data, _ = project_store.read_json(ep_path)
+    baseline = copy.deepcopy(data)
     episodes = data.get("episodes") or []
     targets = [e for e in episodes if not ep_id or str(e.get("id")) == str(ep_id)]
     if ep_id and not targets:
@@ -522,24 +750,26 @@ def cmd_overview(proj, vendor, ep_id=None):
             print(f"[跳过] {entry.get('id')} 无分集正文"); continue
         sys_p, user_p = PM.episode_overview_prompt(text, entry, style_text=style_text)
         user_p += "\n[项目可用资产引用（只能从中选择）]\n" + catalog
-        result = parse_json(chat_retry(cli, [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}], max_tokens=12000, timeout=420, extra=FAST_THINK))
+        result = parse_json(chat_retry(cli, [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}], max_tokens=12000, timeout=420, extra=FAST_THINK, trace_stage="episode_overview"))
         merge_episode_overview(entry, _overview_refs(proj, result))
         print(f"[完成] {entry.get('id')} 概要已更新", flush=True)
     data["prompt_version"] = PM.PROMPT_VERSION
-    _dump_episodes(ep_path, data)
+    _save_generated_document(proj, ep_path, data, baseline, stage='分集概要', episode_document=True)
     print(f"OUTPUT:{ep_path}")
 
 
 def cmd_episodes(proj, vendor, out):
+    baseline = project_store.read_json(out)[0] if os.path.isfile(out) else None
     script = full_script_text(proj)
+    source_mode = script_repository.script_mode(proj)
     if len(script.strip()) < 80:
         print(f"[错误] 剧本正文不足（generated=聚合分集正文 / imported=剧本.txt）"); sys.exit(1)
     if len(script) < 80:
         print("[错误] 剧本过短（<80 字）"); sys.exit(1)
     cli = VendorClient(pick_vendor(vendor))
-    sys_p, user_p = PM.episodes_prompt(script)
+    sys_p, user_p = PM.episodes_prompt(script, proj=proj)
     txt = chat_retry(cli, [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-                     max_tokens=12000, timeout=420, extra=FAST_THINK)
+                     max_tokens=12000, timeout=420, extra=FAST_THINK, trace_stage="episodes")
     data = parse_json(txt)
     eps = data.get("episodes") or []
     # 锚点 -> 字符偏移（顺序容错）
@@ -552,7 +782,9 @@ def cmd_episodes(proj, vendor, out):
         cursor = max(cursor, e["char_start"])
         e["text"] = script[e["char_start"]:e["char_end"]]
     os.makedirs(os.path.dirname(out) or ".", exist_ok=True)
-    _dump_episodes(out, {"episodes": eps, "prompt_version": PM.PROMPT_VERSION})
+    _save_generated_document(proj, out, {"episodes": eps, "prompt_version": PM.PROMPT_VERSION, "mode": source_mode},
+        baseline, stage='拆分集', episode_document=True,
+        source_valid=lambda: full_script_text(proj) == script and script_repository.script_mode(proj) == source_mode)
     print(f"[完成] 分集 {len(eps)} 集 -> {out}")
     for e in eps:
         print(f"  {e.get('id')} {e.get('title')} ({e.get('duration_min')}min) {e.get('summary','')[:40]}")
@@ -567,12 +799,13 @@ def _episode_text(proj, ep_id):
     return script_repository.load_script(proj, ep_id)
 
 
-def _dump(path, data):
+def _dump(path, data, expected_revision=None):
     import versions as _V
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     def replace(current):
         current.clear(); current.update(data)
-    project_store.update_json(path, replace, create_default={}, snapshot=_V.snapshot)
+    import asset_repository
+    asset_repository.update_json(path, replace, source='legacy', create_default={}, snapshot=_V.snapshot, expected_revision=expected_revision)
     print("OUTPUT:" + path)
 
 
@@ -584,11 +817,45 @@ def _rev_of(path):
         return 0
 
 
-def _dump_episodes(path, data):
+def _dump_episodes(path, data, expected_revision=None):
     """写 分集.json：每次覆写自动 bump rev 修订号，供分镜/资产追溯对齐。"""
     data = dict(data)
     data["rev"] = _rev_of(path) + 1
-    _dump(path, data)
+    _dump(path, data, expected_revision=expected_revision)
+
+
+def _save_generated_document(proj, path, data, baseline, *, stage, episode_document=False,
+                             source_valid=None, retain=None):
+    """模型请求结束后在统一锁内核对输入与目标；冲突稿留诊断，不覆盖新修改。"""
+    from pathlib import Path
+    import asset_repository
+    import uuid
+    from error_utils import scrub_error
+    root, target = Path(proj).resolve(), Path(path).resolve()
+    if not target.is_relative_to(root):
+        raise ValueError('生成目标必须属于当前项目')
+    name = target.relative_to(root).as_posix()
+    try:
+        with asset_repository.locks(root, [name, '剧本/分集.json', '剧本/剧本.txt', '剧本/source.json']):
+            actual = project_store._read_unlocked(target)[0] if target.is_file() else None
+            if actual != baseline or source_valid is not None and not source_valid():
+                raise project_store.RevisionConflict('生成期间正文或目标文件已更新，本次旧结果未覆盖，请重新核对后生成')
+            if retain is not None and actual is not None:
+                retain(actual, data)
+            if episode_document:
+                data['rev'] = int((actual or {}).get('rev') or 0) + 1
+            asset_repository.require_applied(asset_repository.commit_locked(root, {name: data}, source='generation'))
+    except project_store.RevisionConflict as exc:
+        diagnostic = root / '剧本/.work/生成冲突' / (uuid.uuid4().hex + '.json')
+        try:
+            diagnostic.parent.mkdir(parents=True, exist_ok=True)
+            diagnostic.write_text(json.dumps({'stage': stage, 'target': name, 'error': scrub_error(exc), 'data': data},
+                                             ensure_ascii=False, indent=1), encoding='utf-8')
+            print(f'[生成冲突] 原结果已保留：{diagnostic}', flush=True)
+        except OSError as save_error:
+            print(f'[生成冲突] 诊断保存失败：{scrub_error(save_error)}', flush=True)
+        raise
+    print('OUTPUT:' + str(target))
 
 
 def _asset_catalog(data):
@@ -731,7 +998,8 @@ def reconcile_characters(proj, cli, full_text):
     sys_p, user_p = PM.character_reconcile_prompt(roster, full_text)
     txt = chat_retry(cli, [{"role": "system", "content": sys_p},
                            {"role": "user", "content": user_p}],
-                     max_tokens=12000, timeout=420, extra=FAST_THINK)
+                     max_tokens=12000, timeout=420, extra=FAST_THINK,
+                     trace_stage="character_reconcile")
     rows = (parse_json(txt).get("characters")) or []
     by_id = {str(r.get("id")): r for r in rows if isinstance(r, dict) and r.get("id")}
     n = 0
@@ -796,10 +1064,12 @@ def _extract_one(proj, cli, name, text, combined, documents=None, paths=None, ke
     也可被 /api/extract/one 单独调用，实现最小单元重跑。
     返回更新后的 combined。
     """
+    from pathlib import Path
     paths = paths or {name: os.path.join(proj, "素材", filename)
                       for name, (filename, _key) in ASSET_DOCUMENTS.items()}
     keys = keys or {name: key for name, (_filename, key) in ASSET_DOCUMENTS.items()}
     out = paths[name]
+    base_document = json.loads(Path(out).read_text('utf-8')) if os.path.isfile(out) else None
     catalog = _asset_catalog(combined)
     if name == "人物":
         sys_p, user_p = PM.characters_prompt(text, known, style_text=style_text, catalog=catalog)
@@ -814,7 +1084,8 @@ def _extract_one(proj, cli, name, text, combined, documents=None, paths=None, ke
         sys_p += note
         print(f"[投影模式] {name}：注入 ① 锚定设定 {len(note)} 字，本步只补外观/生图字段", flush=True)
     txt = chat_retry(cli, [{"role": "system", "content": sys_p}, {"role": "user", "content": user_p}],
-                     max_tokens=12000, timeout=420, extra=FAST_THINK)
+                     max_tokens=12000, timeout=420, extra=FAST_THINK,
+                     trace_stage={"人物": "characters", "场景": "scenes", "道具": "props"}.get(name, "asset_extract"))
     for gap in re.findall(r"GAP:\s*([^\"\\\n]{1,80})", txt)[:20]:
         print(f"  [回补 ①] {name} 发现锚定块缺口：{gap.strip()}", flush=True)
     try:
@@ -834,7 +1105,8 @@ def _extract_one(proj, cli, name, text, combined, documents=None, paths=None, ke
         )
         txt = chat_retry(cli, [{"role": "system", "content": sys_p + hint},
                                {"role": "user", "content": user_p}],
-                         max_tokens=12000, timeout=420, extra=FAST_THINK)
+                         max_tokens=12000, timeout=420, extra=FAST_THINK,
+                         trace_stage={"人物": "characters", "场景": "scenes", "道具": "props"}.get(name, "asset_extract"))
         try:
             data = parse_json(txt)
         except ValueError as retry_exc:
@@ -863,49 +1135,41 @@ def _extract_one(proj, cli, name, text, combined, documents=None, paths=None, ke
             doc["script_rev"] = int(ep_doc.get("rev") or 0)
         except Exception:
             pass
-    _dump(out, doc)
+    import asset_repository
+    relative = Path(out).resolve().relative_to(Path(proj).resolve()).as_posix()
+    asset_repository.require_applied(asset_repository.commit(proj, {relative: doc}, source='legacy', bases={relative: base_document}))
+    saved = json.loads(Path(out).read_text('utf-8'))
+    doc.clear()
+    doc.update(saved)
+    combined[key] = doc[key]
     print(f"[完成] {name} {len(doc[key])} 条 -> {os.path.basename(out)}")
     return combined
 
 
-# 设定图构图描述的新旧写法：剥构图必须先剥"整段"，只 replace 关键词会把旧文案里的中文逗号
-# 留在接缝上（09_仙 zhijing 的"纯白背景。，纯白背景"就是这么来的），而在已迁移过的档案上
-# 再跑一次迁移会把模板叠两遍（同一份提示词里"五视图设定图"出现 2 次）。两者都是幂等缺口。
-_LEGACY_LAYOUT_PREFIXES = ("正面、侧面、背面三视图，纯白背景；", "正面、侧面、背面三视图，纯白背景。",
-                           "正面、侧面、背面三视图。", "正面、侧面、背面三视图，", "三视图，纯白背景；", "三视图。",
-                           "五视图设定图：", "五视图设定图（一张图内从左到右五段）：")
-
-
 def strip_layout(text):
-    """去掉新旧任一构图描述，只留外观事实；重复调用结果不变（幂等）。
-
-    只剥构图、不动事实里的标点：旧写法把关键词 replace 掉，会在接缝留下"。，"和第二个
-    "纯白背景"（09_仙 zhijing 就是这样），这里连这些残渣一起收掉。
-    """
-    out = str(text or "")
-    out = out.replace(skill_lib.SHEET_VIEW_LAYOUT_ZH, "")
-    for marker in _LEGACY_LAYOUT_PREFIXES + ("正面、侧面、背面三视图", "三视图"):
-        out = out.replace(marker, "")
-    out = re.sub(r"[，、；;：:]{2,}", "；", out)      # "，；" "；；" 之类折叠
-    out = re.sub(r"。，|，。", "。", out)             # 拼接缝上的"。，"
-    out = out.strip("；;、， \n")
-    out = re.sub(r"^(纯白背景[，、；;：:。\s]*)+", "", out)   # 残在前面的背景描述（模板自带，不需重复）
-    return out.strip("；;、， \n")
+    """兼容调用入口，构图归一化由资产提示词模块统一处理。"""
+    return skill_lib.strip_character_layout(text)
 
 
 def regenerate_asset_prompt(proj, kind, ident, vendor=None):
     """单资产提示词重生成：只重写该资产的生图提示词（人物 sheet_prompt / 场景·道具 image_prompt），
     不动外观事实等其他字段。用新构图标准 + 现有外观事实合成，供提示词过时（如旧三视图）时单点更新。"""
-    cli = VendorClient(pick_vendor(vendor))
     files = {"character": ("人物.json", "characters", "sheet_prompt"),
              "scene": ("场景.json", "scenes", "image_prompt"),
              "prop": ("道具.json", "props", "image_prompt")}
     filename, key, prompt_key = files[kind]
     doc_path = os.path.join(proj, "素材", filename)
-    doc = json.load(open(doc_path, encoding="utf-8"))
+    with open(doc_path, encoding="utf-8") as stream:
+        doc = json.load(stream)
+    baseline = copy.deepcopy(doc)
     rows = doc.get(key) or []
     target = next((r for r in rows if isinstance(r, dict) and str(r.get("id")) == ident), None)
     if not target: raise ValueError(f"资产不存在：@{kind}:{ident}")
+    from visual_asset_prompt import uses_planning_settings, subject_prompt
+    if uses_planning_settings(proj):
+        prompt = subject_prompt(kind, target, project=proj)
+        print(f'[已同步] @{kind}:{ident} 直接读取当前设定与统一构图，无需重写历史提示词。', flush=True)
+        return {'ok': True, 'prompt': prompt, 'states_updated': 0}
     if kind != "character":
         raise ValueError("场景/道具的 image_prompt 随外观事实生成，暂不支持单独重写；请重新提炼该类")
     old_prompt = str(target.get("sheet_prompt") or "")
@@ -913,24 +1177,27 @@ def regenerate_asset_prompt(proj, kind, ident, vendor=None):
     # 外观事实取旧提示词正文（去掉新旧任一构图描述），权威模板 + 原文事实 → 新提示词
     fact = strip_layout(old_prompt)
     new_prompt = f"{skill_lib.SHEET_VIEW_LAYOUT_ZH}{fact}"
-    if len(new_prompt) > 320:
-        new_prompt = new_prompt[:317] + "…"
     # 状态资产的 sheet_prompt 同步刷新（含锚点原文 + 差异合成）
     updated_states = 0
     for st in target.get("states") or []:
         if not isinstance(st, dict): continue
         sp = str(st.get("sheet_prompt") or "")
-        if sp and ("三视图" in sp or skill_lib.SHEET_VIEW_TITLE_ZH in sp):
-            st["sheet_prompt"] = f"{skill_lib.SHEET_VIEW_LAYOUT_ZH}{strip_layout(sp)}"[:320]
+        if sp:
+            st["sheet_prompt"] = skill_lib.normalize_character_sheet(sp)
             updated_states += 1
     target["sheet_prompt"] = new_prompt
     doc["prompt_version"] = PM.PROMPT_VERSION
-    _dump(doc_path, doc)
+    import asset_repository
+    relative = '素材/'+filename
+    asset_repository.commit(proj, {relative: doc}, source='normalization', bases={relative: baseline})
     print(f"[完成] @{kind}:{ident} 提示词已更新为五视图（状态资产同步 {updated_states} 条）")
     return {"ok": True, "prompt": new_prompt, "states_updated": updated_states}
 
 
 def cmd_extract(proj, vendor, ep_id):
+    from visual_asset_prompt import uses_planning_settings, check_project
+    if uses_planning_settings(proj):
+        return check_project(proj, episode=ep_id)
     ep_json_path = os.path.join(proj, "剧本", "分集.json")
     if not os.path.isfile(ep_json_path):
         print("[错误] 缺少 剧本/分集.json：资产提炼必须关联已有剧本分集（先到①剧本分集页分集或生成大纲）"); sys.exit(1)
@@ -958,17 +1225,11 @@ def cmd_extract(proj, vendor, ep_id):
             print(f"[关系预处理] 已修正/清理 {len(relation_issues)} 条历史引用", flush=True)
     # 只给人物提炼传轻量既有档案；完整目录会在每次调用前按当前 combined 重建。
     known = _asset_catalog(combined).get("characters") or None
-    st = skill_lib.project_style(proj)
-    # 画风唯一来源 = 生图风格 skill；未选（自动）则不注入画风指令。
-    sel_img = str(st.get("image") or "").strip()
-    style_text = (skill_lib.style_for(proj, "image") if sel_img else "").strip()
-    if style_text:
-        print(f"[画风] 提炼使用: 生图风格 {sel_img}")
     # 依次提炼：人物和场景先进入当前目录，道具再读取这两类真实 @ 引用，
     # 避免三次独立调用各自臆造“女主/教室/炸弹”的父级。
     for name in ("人物", "场景", "道具"):
         combined = _extract_one(proj, cli, name, text, combined, documents, paths, keys,
-                                known=known if name == "人物" else None, style_text=style_text, ep_id=ep_id)
+                                known=known if name == "人物" else None, ep_id=ep_id)
     # 保留各文件其它顶层元数据，只替换对应数组；关系字段已经在 combined 中统一归一化。
     for name, out in paths.items():
         key = keys[name]
@@ -1004,19 +1265,21 @@ def cmd_extract(proj, vendor, ep_id):
 def _storyboard_completion(cli, system_prompt, user_prompt):
     """生成并解析分镜 JSON；截断时用压缩约束自动重试一次。"""
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
-    text = chat_retry(cli, messages, max_tokens=STORYBOARD_MAX_TOKENS, timeout=720, extra=FAST_THINK)
+    text = chat_retry(cli, messages, max_tokens=STORYBOARD_MAX_TOKENS, timeout=720, extra=FAST_THINK,
+                      trace_stage="storyboard")
     parsed = parse_structured(text)
     if parsed.get("complete"):
         return parsed, text
     repair_hint = (
         "上一次分镜 JSON 输出不完整。请基于同一剧本重新输出一个完整合法 JSON 对象；"
-        "最多 20 镜，每镜 prompt 100~160 字，negative 最多 4 条，字段值用短句，禁止 markdown 和解释。"
+        "最多 20 镜，保留每镜三类独立提示词及 V 汇总和宫格布局；negative 最多 4 条，字段值用短句，禁止 markdown 和解释。"
     )
     retry_messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt + "\n\n" + repair_hint},
     ]
-    retry_text = chat_retry(cli, retry_messages, max_tokens=STORYBOARD_MAX_TOKENS, timeout=720, extra=FAST_THINK)
+    retry_text = chat_retry(cli, retry_messages, max_tokens=STORYBOARD_MAX_TOKENS, timeout=720, extra=FAST_THINK,
+                           trace_stage="storyboard")
     return parse_structured(retry_text), retry_text
 
 
@@ -1096,6 +1359,10 @@ def _pick_scene_ref(shot, scenes, text):
 
 
 def cmd_storyboard(proj, vendor, ep_id, out=None):
+    out = out or os.path.join(proj, "分镜", f"剧本_{ep_id or '全本'}.json")
+    baseline = project_store.read_json(out)[0] if os.path.isfile(out) else None
+    source_book = os.path.join(proj, '剧本', '分集.json')
+    source_revision = project_store.read_json(source_book)[1] if os.path.isfile(source_book) else None
     text = _episode_text(proj, ep_id)
     if not text:
         print("[错误] 无剧本文本"); sys.exit(1)
@@ -1117,8 +1384,9 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
     units_txt = story_units.units_block(proj, ep_id)
     if units_txt:
         print(f"[锚定注入] 分镜吃 ① 最小单元 {len(units_txt)} 字（场景限制/道具边界/禁区/待埋伏笔）", flush=True)
+    storyboard_context = skill_lib.storyboard_generation_context(proj)
     sys_p, user_p = PM.storyboard_prompt(text, chars, scenes, props, mood_text=text,
-                                         style_text=skill_lib.style_for(proj, "storyboard"),
+                                         style_text=storyboard_context['text'],
                                          units=units_txt)
     parsed, txt = _storyboard_completion(cli, sys_p, user_p)
     if not parsed["complete"]:
@@ -1211,8 +1479,10 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
            "w": 960, "h": 540, "fps": 24, "set": {}, "env": {},
            "prompt_version": PM.PROMPT_VERSION,
            "script_rev": _rev_of(os.path.join(base, "分集.json")),
+           "episode_id": ep_id or '全本',
+           "script_source_hash": __import__('episode_editor').text_hash(text),
            # E10 冻结：记录本次分镜实际注入的导演风格 skill（id/name/正文 sha 前12位）
-           "skill_snapshot": skill_lib.skill_snapshot_for(proj, ["storyboard"]),
+           "skill_snapshot": storyboard_context['snapshot'],
            "actors": {c["id"]: {"name": c.get("name", c["id"]),
                                 "shirt": [(160, 60, 60), (40, 90, 160), (60, 140, 90), (150, 120, 50),
                                           (120, 70, 150), (60, 150, 150)][i % 6],
@@ -1244,14 +1514,12 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
         sys.exit(1)
     for warning in validation.get("warnings") or []:
         print(f"[警告] {warning.get('code')}: {warning.get('message')}")
-    out = out or os.path.join(proj, "分镜", f"剧本_{ep_id or '全本'}.json")
     import uuid
     units = data.get('video_units') or []
     if not units: raise ValueError('LLM 未返回 V 分镜视频汇总，已保留原文件；请重新生成')
     for unit in units:
-        # 契约 v3（N81）：宫格为按需人工字段，LLM 不再生成——校验只查视频提示词
-        if not str(unit.get('prompt_video') or '').strip():
-            raise ValueError('V 缺少视频提示词，已拒绝保存不完整分镜')
+        if not all(isinstance(unit.get(field), str) and unit[field].strip() for field in ('prompt_video', 'prompt_grid')):
+            raise ValueError('V 缺少视频或宫格提示词，已拒绝保存不完整分镜')
         unit['id'] = 'v-' + uuid.uuid4().hex[:12]
         members = shot_list(cfg, unit)
         unit['duration'] = sum(float(s['dur']) for s in members)
@@ -1279,9 +1547,11 @@ def cmd_storyboard(proj, vendor, ep_id, out=None):
             print("[禁区告警] {} 违反 {}（{}）：{}".format(w["shot_id"], w["taboo_id"], w["rule"], where), flush=True)
     else:
         cfg.pop("unit_warnings", None)
-    if os.path.isfile(out):
-        retain_production(json.load(open(out, encoding='utf-8')), cfg)
-    _dump(out, cfg)
+    def source_valid():
+        current = project_store._read_unlocked(source_book)[1] if os.path.isfile(source_book) else None
+        return current == source_revision and _episode_text(proj, ep_id) == text
+    _save_generated_document(proj, out, cfg, baseline, stage='生成分镜',
+                             source_valid=source_valid, retain=retain_production)
     print(f"[完成] 分镜 {len(shots)} 镜 -> {out}")
     print(f"[提示] 可直接进白模页渲染 / 3D 页构建 / 平面图生成")
 
@@ -1488,11 +1758,18 @@ def main():
     ap.add_argument("--eps", type=int, default=None,
                     help="expand: 目标集数（缺省 6）；units: 目标集数（缺省读 brief.total_episodes）")
     ap.add_argument("--arc-size", dest="arc_size", type=int, default=6,
-                    help="units: 每段集数（超出即分段并批生成，默认 6）")
+                    help="units: 每批生成分集数（分批防止输出截断，默认 6）")
     ap.add_argument("--anchor", action="store_true",
                     help="units: 生成完成后立即锚定（体检有阻断项则拒绝）")
-    ap.add_argument("--stage", default="all", choices=["all", "story", "entity"],
-                    help="units: story=只出剧情骨架，entity=只续跑设定层（补缺项用），all=两步都跑（默认）")
+    ap.add_argument("--stage", default="all", choices=["all", "story", "entity", "complete", "replan"],
+                    help="units: all=首次生成，complete=只补规划及设定空缺，entity=只补设定，story=生成骨架")
+    ap.add_argument('--planning-source', choices=['idea', 'script'], default='idea',
+                    help='units replan: 选择修订的补充构想或正文来源，始终使用已有剧情')
+    ap.add_argument('--asset-refs', default=None, help='仅补齐选定素材，JSON 引用数组')
+    ap.add_argument('--revision-mode', choices=['auto', 'extend', 'rewrite'], default='auto',
+                    help='units replan: extend=保留已有分集并扩集，rewrite=按修改要求改写')
+    ap.add_argument('--revision-instructions', default='', help='已有故事的修改要求；改写时必填')
+    ap.add_argument('--planning-version', default=None, help='units replan: 继续指定失败候选，只补未完成部分')
     ap.add_argument("--allow-gaps", dest="allow_gaps", action="store_true",
                     help="expand: 正文引用了名册外实体时也强行落盘（默认中止并上报缺口）")
     a = ap.parse_args()
@@ -1502,14 +1779,18 @@ def main():
     set_billing_project(os.path.basename(proj))
     if a.cmd == "units":
         rep = cmd_units(proj, a.vendor, eps_n=a.eps or 0, arc_size=max(1, a.arc_size), do_anchor=a.anchor,
-                       stage=a.stage)
-        if rep.get("incomplete"):
+                       stage=a.stage, idea_text=a.idea, planning_source=a.planning_source,
+                       revision_mode=a.revision_mode, revision_instructions=a.revision_instructions,
+                       planning_version=a.planning_version, asset_refs=json.loads(a.asset_refs) if a.asset_refs is not None else None)
+        if not rep.get("ok") or rep.get("incomplete"):
             sys.exit(1)   # 任务体系据此标失败；已落盘部分保留，重跑只补缺段
     elif a.cmd == "episodes":
         cmd_episodes(proj, a.vendor, a.out or os.path.join(proj, "剧本", "分集.json"))
     elif a.cmd == "expand":
-        cmd_expand(proj, a.vendor, a.idea, a.eps if a.eps is not None else 6, a.episode,
+        rep = cmd_expand(proj, a.vendor, a.idea, a.eps if a.eps is not None else 6, a.episode,
                    allow_gaps=a.allow_gaps)
+        if isinstance(rep, dict) and (not rep.get('ok') or rep.get('incomplete')):
+            sys.exit(1)
     elif a.cmd == "overview":
         cmd_overview(proj, a.vendor, a.episode)
     elif a.cmd == "reconcile":
@@ -1518,6 +1799,10 @@ def main():
         text = _episode_text(proj, a.episode)
         reconcile_characters(proj, cli, text)
     elif a.cmd == "extract":
+        from visual_asset_prompt import uses_planning_settings, check_project
+        if uses_planning_settings(proj):
+            result = check_project(proj, episode=a.episode)
+            sys.exit(0 if result['ok'] else 1)
         # 全本提炼按分集执行再合并，避免一次性把长剧本塞给模型导致 JSON 截断。
         # 显式 --episode 仍只处理指定集，便于单集重跑。
         if not a.episode:
@@ -1548,13 +1833,15 @@ def main():
         # 最小单元重跑：单类资产提炼（一次 LLM 调用），保持与整批提炼同一合并/门控/落盘链路
         if not a.kind or a.kind not in ("人物", "场景", "道具"):
             print("[错误] extract-one 需要 --kind 人物|场景|道具"); sys.exit(1)
+        from visual_asset_prompt import uses_planning_settings, check_project
+        if uses_planning_settings(proj):
+            result = check_project(proj, kind=a.kind, episode=a.episode)
+            sys.exit(0 if result['ok'] else 1)
         ep_doc = json.load(open(os.path.join(proj, "剧本", "分集.json"), encoding="utf-8"))
         script_rev = int(ep_doc.get("rev") or 0)
         text = _episode_text(proj, a.episode)
         if not text: print("[错误] 无剧本文本"); sys.exit(1)
         cli = VendorClient(pick_vendor(a.vendor))
-        st = skill_lib.project_style(proj)
-        style_text = (skill_lib.style_for(proj, "image") if str(st.get("image") or "").strip() else "").strip()
         # 单类重跑也要读全量既有档案做合并与目录（道具依赖人物/场景 @ 引用）
         base = os.path.join(proj, "素材")
         documents, combined = load_asset_documents(proj)
@@ -1563,7 +1850,7 @@ def main():
             combined, _ = relation_mod.normalize_asset_relations(combined)
         known = _asset_catalog(combined).get("characters") or None
         _extract_one(proj, cli, a.kind, text, combined,
-                     known=known if a.kind == "人物" else None, style_text=style_text, ep_id=a.episode)
+                     known=known if a.kind == "人物" else None, ep_id=a.episode)
     elif a.cmd == "regen-prompt":
         if not a.kind or not a.asset_id:
             print("[错误] regen-prompt 需要 --kind character|scene|prop --id <资产id>"); sys.exit(1)

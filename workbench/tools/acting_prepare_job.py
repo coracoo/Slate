@@ -19,7 +19,9 @@ def execute(request_path):
         vendor = next((v for v in config['vendors'] if v['id'] == request['vendor_id'] and v.get('enabled') and v.get('models',{}).get('text')), None)
         if vendor is None: raise ValueError('准备厂商不存在、未启用或未配置文本模型')
         client = VendorClient.from_config(vendor)
-        callback = lambda messages: {'content':client.chat(messages,kind='text',max_tokens=5000,timeout=420,temperature=0.25)}
+        client.billing_project = Path(board).resolve().parents[1].name
+        callback = lambda messages: {'content':client.chat(messages,kind='text',max_tokens=5000,timeout=420,temperature=0.25,
+                                                           trace_stage='actor_prepare')}
     result = prepare_context(board,request.get('shot_ids'),request.get('context'),call_llm=callback)
     print('OUTPUT:' + result['path'])
     if result.get('status') != 'ready':

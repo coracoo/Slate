@@ -64,7 +64,7 @@ HTML = """<!DOCTYPE html>
   header { padding:10px 18px; border-bottom:1px solid #ffffff14; display:flex; gap:14px; align-items:center; flex-wrap:wrap; }
   h1 { font-size:16px; margin:0; letter-spacing:2px; }
   #stage { position:relative; }
-  canvas { display:block; }
+  canvas { display:block; width:100%; touch-action:none; cursor:grab; }
   .panel { padding:8px 18px 14px; display:flex; gap:12px; align-items:center; flex-wrap:wrap; }
   button { background:#1e293b; color:#e2e8f0; border:1px solid #ffffff22; border-radius:8px; padding:5px 14px; cursor:pointer; }
   button:hover { border-color:#38bdf8; }
@@ -77,8 +77,10 @@ HTML = """<!DOCTYPE html>
 <span id="sceneName" class="tag" style="background:#34d39922;color:#6ee7b7"></span>__PLAN_NOTE__
 <span style="color:#94a3b8;font-size:12px">底图=场景平面(layout) · 圆点=在场角色 · ▲=机位+视场 · 橙箭头=运动 · 虚线=走位轨迹</span></header>
 <div id="stage"><canvas id="cv"></canvas></div>
-<div id="legend"><span>▭ 大件陈设</span><span>━ 出入口(方位)</span><span>◆ 点位</span><span>N=北(远景)</span></div>
+<div id="legend"><span>▭ 大件陈设</span><span>━ 绿=门 · 蓝=窗</span><span>◆ 点位</span><span>N=图面上方（方位以场景设定为准）</span></div>
 <div class="panel">
+  <button onclick="setZoom(1.25)">放大</button><button onclick="setZoom(0.8)">缩小</button><button onclick="resetView()">适配场景</button>
+  <span style="font-size:12px;color:#94a3b8">拖动平移 · 滚轮缩放 · 比例为米制估算</span>
   <button onclick="step(-1)">◀ 上一镜</button>
   <input id="slider" type="range" min="0" value="0">
   <button onclick="step(1)">下一镜 ▶</button>
@@ -91,7 +93,9 @@ const DATA = __DATA__;
 const shots = DATA.shots, actors = DATA.actors, scenes = DATA.scenes;
 const cv = document.getElementById('cv'), ctx = cv.getContext('2d');
 const slider = document.getElementById('slider');
-let idx = 0, showTrail = true;
+let idx = 0, showTrail = true, zoom = 1, pan = {x:0,z:0};
+let canvasWidth = 800, canvasHeight = 520;
+let labelBoxes = [];
 slider.max = shots.length - 1;
 
 function sceneOf(s) { return scenes[s._scene_id] || null; }
@@ -105,8 +109,8 @@ function worldBounds(s) {
 
 let VIEW = null;
 function computeView() {
-  let x0 = -8, x1 = 8, z0 = -8, z1 = 8;
-  for (const s of shots) {
+  let x0 = Infinity, x1 = -Infinity, z0 = Infinity, z1 = -Infinity;
+  for (const s of shots.filter(sh => sh._scene_id === shots[idx]._scene_id)) {
     const b = worldBounds(s);
     x0 = Math.min(x0, b.x0 - 1); x1 = Math.max(x1, b.x1 + 1);
     z0 = Math.min(z0, b.z0 - 1); z1 = Math.max(z1, b.z1 + 1);
@@ -116,23 +120,38 @@ function computeView() {
       x0 = Math.min(x0, p.x - 1); x1 = Math.max(x1, p.x + 1); z0 = Math.min(z0, p.z - 1); z1 = Math.max(z1, p.z + 1);
     }
   }
-  VIEW = { x0, x1, z0, z1 };
+  const cx = (x0+x1)/2 + pan.x, cz = (z0+z1)/2 + pan.z;
+  const span = Math.max(x1-x0, (z1-z0)*canvasWidth/canvasHeight)/zoom;
+  VIEW = {x0:cx-span/2, x1:cx+span/2, z0:cz-span*canvasHeight/canvasWidth/2, z1:cz+span*canvasHeight/canvasWidth/2};
 }
-function MX(x) { return (x - VIEW.x0) / (VIEW.x1 - VIEW.x0) * cv.width; }
-function MZ(z) { return cv.height - (z - VIEW.z0) / (VIEW.z1 - VIEW.z0) * cv.height; }
+function MX(x) { return (x - VIEW.x0) / (VIEW.x1 - VIEW.x0) * canvasWidth; }
+function MZ(z) { return canvasHeight - (z - VIEW.z0) / (VIEW.z1 - VIEW.z0) * canvasHeight; }
 
 function actorPos(s, aid) {
   const p = (s._actor_positions || {})[aid];
   return p ? {x:p[0], z:p[1], off:false} : {x:0, z:0, off:true};
 }
 
+function drawLabel(text, x, y, color) {
+  ctx.save(); ctx.font = '12px "Microsoft YaHei",sans-serif'; ctx.textAlign = 'left';
+  const w = ctx.measureText(String(text)).width + 10, h = 20;
+  let box;
+  for (const [dx,dy] of [[8,-10],[8,12],[-w-8,-10],[8,-32],[-w-8,12]]) {
+    const bx = Math.max(4, Math.min(canvasWidth-w-4,x+dx)), by = Math.max(4,Math.min(canvasHeight-h-4,y+dy));
+    box = {x:bx,y:by,w,h};
+    if (!labelBoxes.some(b => bx < b.x+b.w && bx+w > b.x && by < b.y+b.h && by+h > b.y)) break;
+  }
+  labelBoxes.push(box); ctx.fillStyle = '#0b1020e8'; ctx.fillRect(box.x,box.y,box.w,box.h);
+  ctx.fillStyle = color; ctx.fillText(String(text),box.x+5,box.y+14); ctx.restore();
+}
+
 function drawCompass(sc) {
-  const cx = cv.width - 46, cy = 52, r = 24;
+  const cx = canvasWidth - 46, cy = 52, r = 24;
   ctx.strokeStyle = '#64748b'; ctx.lineWidth = 1.5;
   ctx.beginPath(); ctx.arc(cx, cy, r, 0, 7); ctx.stroke();
   ctx.fillStyle = '#e2e8f0'; ctx.font = 'bold 12px sans-serif'; ctx.textAlign = 'center';
-  ctx.fillText('N', cx, cy - r + 13); ctx.fillText('S', cx, cy + r - 5);
-  ctx.fillText('E', cx + r - 5, cy + 4); ctx.fillText('W', cx - r + 5, cy + 4);
+  ctx.fillText('上', cx, cy - r + 13); ctx.fillText('下', cx, cy + r - 5);
+  ctx.fillText('右', cx + r - 5, cy + 4); ctx.fillText('左', cx - r + 5, cy + 4);
   ctx.strokeStyle = '#f59e0b'; ctx.lineWidth = 2;
   ctx.beginPath(); ctx.moveTo(cx, cy + 8); ctx.lineTo(cx, cy - 8);
   ctx.lineTo(cx - 3.5, cy - 3); ctx.moveTo(cx, cy - 8); ctx.lineTo(cx + 3.5, cy - 3); ctx.stroke();
@@ -165,33 +184,45 @@ function drawScenePlane(s) {
   if (sc) { ctx.fillStyle = '#6ee7b7'; ctx.font = 'bold 13px "Microsoft YaHei"'; ctx.textAlign = 'left';
     ctx.fillText(sc.name || s._scene_id, MX(b.x0) + 8, MZ(b.z1) + 18); }
   ctx.font = '10px sans-serif';
-  for (const e of lay.entry || []) {
-    const p = e.pos || [0, (e.at === 'N' ? b.z1 : e.at === 'S' ? b.z0 : 0)];
-    const X = MX(p[0]), Y = MZ(p[1]);
-    ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 3;
-    ctx.beginPath(); ctx.moveTo(X - 10, Y); ctx.lineTo(X + 10, Y); ctx.stroke();
-    ctx.fillStyle = '#38bdf8'; ctx.textAlign = 'center';
-    ctx.fillText((e.kind || '口') + (e.at ? '·' + e.at : ''), X, Y - 6);
-  }
   for (const f of lay.furniture || []) {
     const X = MX((f.pos || [0, 0])[0]), Y = MZ((f.pos || [0, 0])[1]);
-    const w = ((f.size && f.size[0]) || 1.5) / (VIEW.x1 - VIEW.x0) * cv.width;
-    const h = ((f.size && f.size[1]) || 1) / (VIEW.z1 - VIEW.z0) * cv.height;
+    const w = ((f.size && f.size[0]) || 1.5) / (VIEW.x1 - VIEW.x0) * canvasWidth;
+    const h = ((f.size && f.size[1]) || 1) / (VIEW.z1 - VIEW.z0) * canvasHeight;
     ctx.fillStyle = '#334155cc';
     ctx.strokeStyle = '#94a3b8';
     if (f.shape === 'circle') {
-      ctx.beginPath(); ctx.arc(X, Y, w / 2, 0, 7); ctx.fill(); ctx.stroke();
+      ctx.beginPath(); ctx.arc(X, Y, (f.radius || (f.size || [1])[0]/2) / (VIEW.x1-VIEW.x0) * canvasWidth, 0, 7); ctx.fill(); ctx.stroke();
     } else {
-      ctx.fillRect(X - w / 2, Y - h / 2, w, h);
-      ctx.strokeRect(X - w / 2, Y - h / 2, w, h);
+      if (f.outline) {
+        ctx.beginPath(); f.outline.forEach((p,i) => {if(i) ctx.lineTo(MX(p[0]),MZ(p[1])); else ctx.moveTo(MX(p[0]),MZ(p[1]));});
+        ctx.closePath(); ctx.fill(); ctx.stroke();
+      } else {
+        ctx.save(); ctx.translate(X,Y); ctx.rotate(-(f.rot || 0)*Math.PI/180);
+        ctx.fillRect(-w/2,-h/2,w,h); ctx.strokeRect(-w/2,-h/2,w,h); ctx.restore();
+      }
     }
-    if (f.label || f.kind) { ctx.fillStyle = '#cbd5e1'; ctx.textAlign = 'center'; ctx.fillText(f.label || f.kind, X, Y + 3); }
+    if (f.label || f.kind) drawLabel(f.label || f.kind, X, Y, '#cbd5e1');
   }
   // plan v1 扩展层：墙多边形 / 命名区域（虚线框）/ plan 走位轨迹（虚线+落点）
   if ((lay.walls || []).length >= 3) {
     ctx.strokeStyle = '#94a3b8'; ctx.lineWidth = 3; ctx.beginPath();
     lay.walls.forEach((p, i) => { const X = MX(p[0]), Y = MZ(p[1]); if (i) ctx.lineTo(X, Y); else ctx.moveTo(X, Y); });
     ctx.closePath(); ctx.stroke();
+  }
+  for (const e of lay.entry || []) {
+    if (e.start && e.end) {
+      ctx.strokeStyle = '#151a26'; ctx.lineWidth = 10;
+      ctx.beginPath(); ctx.moveTo(MX(e.start[0]),MZ(e.start[1])); ctx.lineTo(MX(e.end[0]),MZ(e.end[1])); ctx.stroke();
+      ctx.strokeStyle = e.kind === 'window' ? '#38bdf8' : '#34d399'; ctx.lineWidth = 4; ctx.stroke();
+      drawLabel(e.kind === 'window' ? '窗' : '门', MX((e.start[0]+e.end[0])/2), MZ((e.start[1]+e.end[1])/2), ctx.strokeStyle);
+      continue;
+    }
+    const p = e.pos || [0, (e.at === 'N' ? b.z1 : e.at === 'S' ? b.z0 : 0)];
+    const X = MX(p[0]), Y = MZ(p[1]);
+    ctx.strokeStyle = '#38bdf8'; ctx.lineWidth = 3;
+    ctx.beginPath(); ctx.moveTo(X - 10, Y); ctx.lineTo(X + 10, Y); ctx.stroke();
+    ctx.fillStyle = '#38bdf8'; ctx.textAlign = 'center';
+    ctx.fillText((e.kind || '口') + (e.at ? '·' + e.at : ''), X, Y - 6);
   }
   for (const z of lay.zones || []) {
     const r = z.rect || [0, 0, 0, 0];
@@ -217,10 +248,17 @@ function drawScenePlane(s) {
 }
 
 function draw() {
-  cv.width = document.getElementById('stage').clientWidth; cv.height = Math.max(460, cv.width * 0.64);
+  if (!shots.length) return;
+  canvasWidth = Math.max(320, document.getElementById('stage').clientWidth);
+  canvasHeight = Math.max(360, Math.min(720, canvasWidth * 0.64));
+  const pixelRatio = window.devicePixelRatio || 1;
+  cv.width = Math.round(canvasWidth * pixelRatio); cv.height = Math.round(canvasHeight * pixelRatio);
+  cv.style.height = canvasHeight + 'px';
+  ctx.setTransform(pixelRatio, 0, 0, pixelRatio, 0, 0);
+  labelBoxes = [];
   computeView();
   const s = shots[idx];
-  ctx.fillStyle = '#0b1020'; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.fillStyle = '#0b1020'; ctx.fillRect(0, 0, canvasWidth, canvasHeight);
   drawScenePlane(s);
   if (showTrail) {
     ctx.setLineDash([4, 5]);
@@ -284,7 +322,7 @@ function draw() {
     ctx.strokeStyle = '#0b1020'; ctx.lineWidth = 2; ctx.stroke();
     if (speakers.has(aid)) { ctx.strokeStyle = '#fbbf24'; ctx.lineWidth = 2.5; ctx.beginPath(); ctx.arc(X, Y, 12, 0, 7); ctx.stroke(); }
     ctx.fillStyle = speakers.has(aid) ? '#fde68a' : '#f1f5f9'; ctx.textAlign = 'left';
-    ctx.fillText(actors[aid].name || aid, X + 11, Y + 4);
+    drawLabel(actors[aid].name || aid, X + 11, Y + 4, speakers.has(aid) ? '#fde68a' : '#f1f5f9');
   }
   drawCompass(sceneOf(s));
   document.getElementById('sceneName').textContent = ((sceneOf(s) || {}).name || '未绑定场景') + (s._scene_id ? ' · ' + s._scene_id : '');
@@ -300,6 +338,14 @@ slider.oninput = () => { idx = +slider.value; draw(); };
 document.getElementById('trail').onchange = e => { showTrail = e.target.checked; draw(); };
 window.onresize = draw;
 window.onmessage = (ev) => { if (ev.data && ev.data.type === 'goto' && Number.isInteger(ev.data.idx)) { idx = Math.max(0, Math.min(shots.length - 1, ev.data.idx)); draw(); } };
+function setZoom(factor) { zoom = Math.max(.5,Math.min(5,zoom*factor)); draw(); }
+function resetView() { zoom=1; pan={x:0,z:0}; draw(); }
+cv.addEventListener('wheel', e => {e.preventDefault(); setZoom(e.deltaY<0 ? 1.15 : 1/1.15);}, {passive:false});
+let drag = null;
+cv.addEventListener('pointerdown', e => {drag={x:e.clientX,y:e.clientY,pan:{...pan},view:{...VIEW}}; cv.setPointerCapture(e.pointerId);});
+cv.addEventListener('pointermove', e => {if(!drag) return; pan={x:drag.pan.x-(e.clientX-drag.x)/canvasWidth*(drag.view.x1-drag.view.x0),z:drag.pan.z+(e.clientY-drag.y)/canvasHeight*(drag.view.z1-drag.view.z0)}; draw();});
+cv.addEventListener('pointerup', () => {drag=null;});
+cv.addEventListener('pointercancel', () => {drag=null;});
 document.getElementById('cnt').textContent = shots.length + ' 镜';
 draw();
 </script></body></html>"""

@@ -96,13 +96,15 @@ class ChatGPTAssetQueueTests(unittest.TestCase):
                 "file": "images/" + spec["filename"]
             }]}
             package = io.BytesIO()
+            image = io.BytesIO()
+            Image.new('RGB', (32, 18), 'white').save(image, format='PNG')
             with zipfile.ZipFile(package, "w") as zf:
                 zf.writestr("manifest.json", json.dumps(manifest))
-                zf.writestr("images/" + spec["filename"], b"image")
+                zf.writestr("images/" + spec["filename"], image.getvalue())
             result = chatgpt_import.import_package(project, package.getvalue())
             self.assertEqual(result["imported"], 1)
             with open(os.path.join(project, "素材", "人物", "hero.png"), "rb") as fh:
-                self.assertEqual(fh.read(), b"image")
+                self.assertEqual(fh.read(), image.getvalue())
 
     def test_jpeg_import_to_asset_png_is_decodable(self):
         with tempfile.TemporaryDirectory() as root:

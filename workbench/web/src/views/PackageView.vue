@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { useBoardSelection } from '../utils/useBoardSelection'
 // -*- coding: utf-8 -*-
-/** 平面推演页（⑥）：本页产物全部服务 AI 视频模型——平面图=布局参考(注入V请求)、走位战略图=运镜核对(人工)、拍摄资料包=逐镜资料固化。
- *  白模(2D)/3D 是辅助系统的独立链路：辅助·白模 出预演帧、辅助·Blender 出 3D 预演，产物同步本页素材；本页只放转跳链接。左=V 列表（与⑦同源 video_units；无 V 老分镜回退场景列表），右=选中场景详情 */
+/** 可选空间验证：平面图核对站位与轴线，战略图核对运动路径，拍摄资料汇集派生参考。
+ * 左侧沿用分镜中的 V / 场景组织，右侧展示当前场景；白模与 3D 经公共导航切换。 */
 import { ref, computed, watch } from 'vue'
 import {
   fetchWhiteBoard, fetchProjectFile, creationAssemble, buildStrategy,
@@ -12,7 +12,7 @@ import {
 import { app, projectFiles, loadBasics, toast } from '../stores/app'
 import { trackJob } from '../stores/jobs'
 import StyledSelect from '../components/StyledSelect.vue'
-import OverlayViewer from '../components/OverlayViewer.vue'
+import SpatialWorkspaceNav from '../components/SpatialWorkspaceNav.vue'
 
 interface Shot { id: string; dur?: number; move?: string; scene?: string; scene_ref?: string; action?: string; prompt?: string; lines?: { speaker: string; line: string }[]; staging?: Record<string, unknown> }
 interface PkgShot { id: string; dur?: number; move?: string; action?: string; script?: { speaker?: string; text?: string }[]; diagram?: string | null; white_ref?: string | null; prompt?: string }
@@ -31,10 +31,9 @@ const tab = ref<'strategy' | 'shots' | 'aiplan'>('aiplan')
 const TABS = computed(() => [
   { k: 'aiplan', label: '平面图' },                       // 主入口：AI 平面图（plan v1）——布局参考，注入 V 视频请求
   { k: 'strategy', label: '走位战略图' },                 // 运镜/走位动态核对（人工）
-  { k: 'shots', label: '拍摄资料包 (' + (pkg.value?.shots?.length ?? 0) + ') · 脚本/素材' }
+  { k: 'shots', label: '拍摄资料 (' + (pkg.value?.shots?.length ?? 0) + ')' }
 ] as const)
 const currentShot = ref(0)
-const overlay = ref<{ visible: boolean; src: string; kind: 'image' | 'html'; title: string }>({ visible: false, src: '', kind: 'image', title: '' })
 
 const baseName = computed(() => board.value.replace(/\.json$/, ''))
 const strategyFile = computed(() => (baseName.value ? `战略图_${baseName.value}.html` : ''))
@@ -161,6 +160,13 @@ const otherPlans = computed(() => {
 })
 
 const selGroup = computed(() => sceneGroups.value.find((g) => g.key === selScene.value) || null)
+const planCanvasNonce = ref(0)
+const selectedPlanCanvas = computed(() => {
+  const name = selGroup.value?.plan?.name
+  const file = name ? `战略图_平面图_${name}.html` : ''
+  return file && projectFiles('推演').includes(file)
+    ? `${mediaUrl(`projects/${app.current}/推演/${file}`)}&v=${planCanvasNonce.value}` : ''
+})
 
 /* ── V 组织（与⑦创作生成同源同批：同一份分镜 JSON 的 video_units；无 V 的老分镜回退场景列表） ── */
 interface VUnit { id: string; title?: string; shot_ids?: string[]; duration?: number }
@@ -286,9 +292,10 @@ const doRegenScenePlan = () => run('生成平面图', () => {
   })
 }, loadPlans)
 
-/** 打开画布：strategy_map --plan 出俯视 HTML → 新窗打开（产物路径约定 推演/战略图_平面图_<名>.html）。 */
-const openPlanCanvas = (name: string) => run('渲染画布', () => buildPlanCanvas(app.current!, name), () => {
-  window.open(mediaUrl(`projects/${app.current}/推演/战略图_平面图_${name}.html`), '_blank')
+/** 本地几何渲染，直接在页面预览。 */
+const openPlanCanvas = (name: string) => run('渲染画布', () => buildPlanCanvas(app.current!, name), async () => {
+  planCanvasNonce.value++
+  await loadBasics()
 })
 /** 打开项目内相对路径的画布 HTML（创作包 manifest plans.canvas_html）。 */
 function openCanvasHtml(rel: string) {
@@ -298,51 +305,41 @@ useBoardSelection(board, boards, 'package')
 </script>
 
 <template>
-  <div class="page-wide flex h-full gap-4">
+  <div class="page-wide flex min-h-full flex-col">
+    <SpatialWorkspaceNav active="plan" />
+    <div class="flex min-h-[640px] flex-1 flex-col gap-4 lg:flex-row">
     <!-- 左列：分镜与镜头列表 -->
-    <aside class="flex w-72 shrink-0 flex-col gap-3">
+    <aside class="flex w-full shrink-0 flex-col gap-3 lg:w-72">
       <div class="glass p-3">
+        <h2 class="mb-3 text-sm font-bold text-slate-100">分镜与场景</h2>
         <label class="block text-xs text-slate-400">
           分镜
           <StyledSelect v-model="board" class="mt-1" :options="boards" :storage-key="`wb.${app.current}.package.board`" placeholder="— 选择分镜 —" />
         </label>
-        <div class="mt-2 flex flex-wrap gap-1.5">
-          <button class="btn btn-sm flex-1 justify-center" :disabled="!!busy || !board" @click="doAssemble">
-            {{ busy === '拍摄资料包' ? '生成中…' : '生成拍摄资料包' }}
-          </button>
-          <button class="btn btn-ghost btn-sm flex-1 justify-center" :disabled="!!busy || !board" @click="doStrategy">
-            {{ busy === '生成战略图' ? '生成中…' : '刷新战略图' }}
-          </button>
-          <RouterLink class="btn btn-ghost btn-sm flex-1 justify-center" to="/white"
-            title="白模渲染与预演帧导出在辅助·白模专栏（产物同步本页素材）">辅助·白模 →</RouterLink>
-          <RouterLink class="btn btn-ghost btn-sm flex-1 justify-center" to="/white3d"
-            title="3D 白模构建/渲染在辅助·Blender 专栏（独立旁路，产物不参与⑦参考注入）">辅助·Blender →</RouterLink>
-        </div>
       </div>
       <div class="glass min-h-0 flex-1 overflow-y-auto p-2">
         <button class="btn btn-sm mb-2 w-full justify-center" :disabled="!!busy || !app.current || !zoneOptions.length"
           title="为 素材/场景.json 里还没有平面图的每个场景各生成一张（已有平面图的跳过；资产提炼完成时也会自动补）"
           @click="doGenerateAllPlans">
-          {{ busy === '批量生成平面图' ? '批量生成中…' : '为全部场景生成平面图' }}
+          {{ busy === '批量生成平面图' ? '批量生成中…' : '批量生成平面图' }}
         </button>
         <p v-if="!zoneOptions.length" class="mb-2 text-center text-2xs text-slate-500">无场景资产——先到 ②素材生成 页提炼</p>
         <p v-if="!sceneGroups.length" class="py-10 text-center text-sm text-slate-500">选择分镜</p>
         <p v-if="sceneGroups.length && !hasUnits" class="mb-2 text-center text-2xs text-slate-500">
-          本分镜无 V 分组（老分镜）——按场景展示；到 ⑦创作生成 建立 V 后按 V 组织
+          按场景查看当前分镜
         </p>
         <!-- V 列表（与⑦创作生成同源同批）：状态点 + V 名 + 成员场景 chips + S 徽标 -->
         <template v-if="hasUnits">
-          <button v-for="g in vGroups" :key="g.id"
+          <article v-for="g in vGroups" :key="g.id"
             class="mb-1 block w-full rounded-lg p-2 text-left transition"
-            :class="selUnit === g.id ? 'bg-sky-400/15 ring-1 ring-sky-400/40' : 'hover:bg-white/5'"
-            @click="selectUnit(g)">
-            <div class="flex items-center gap-1.5">
+            :class="selUnit === g.id ? 'bg-sky-400/15 ring-1 ring-sky-400/40' : 'hover:bg-white/5'">
+            <button type="button" class="flex w-full items-center gap-1.5 text-left" @click="selectUnit(g)">
               <span class="h-2 w-2 shrink-0 rounded-full" :class="vDot(g).cls" :title="vDot(g).title"></span>
               <span class="text-xs font-black text-sky-300">{{ g.label }}</span>
               <span class="truncate text-xs font-bold text-slate-200" :title="g.title">{{ g.title }}</span>
               <span class="ml-auto shrink-0 text-2xs text-slate-500">{{ g.duration }}s</span>
               <span class="shrink-0 text-2xs" :class="vDot(g).textCls">{{ vDot(g).label }}</span>
-            </div>
+            </button>
             <div class="mt-1 flex flex-wrap gap-1" title="成员场景（点击切换右侧详情）">
               <button v-for="sc in g.scenes" :key="sc.ref"
                 class="rounded px-1 text-2xs transition"
@@ -354,7 +351,7 @@ useBoardSelection(board, boards, 'package')
                 class="rounded bg-sky-400/15 px-1 text-2xs font-black text-sky-300 hover:bg-sky-400/30"
                 @click.stop="gotoShot(e.i)">{{ e.s.id }}</button>
             </div>
-          </button>
+          </article>
         </template>
         <!-- 场景列表（老分镜回退）：状态点 + 场景名 + 镜头徽标；点击=选中场景（右侧详情） -->
         <template v-else>
@@ -389,24 +386,30 @@ useBoardSelection(board, boards, 'package')
 
     <!-- 右主区：三 tab -->
     <section class="flex min-w-0 flex-1 flex-col gap-3">
-      <div class="glass flex items-center gap-2 px-3 py-2">
+      <div class="glass flex flex-wrap items-center gap-2 px-3 py-2">
         <button v-for="t in TABS" :key="t.k"
           class="rounded-lg px-3 py-1 text-xs font-bold transition"
           :class="tab === t.k ? 'bg-sky-400/20 text-sky-200' : 'bg-white/5 text-slate-400 hover:text-slate-200'"
           @click="tab = t.k">{{ t.label }}</button>
         <span class="flex-1"></span>
+        <button v-if="tab === 'strategy' && strategyUrl" class="btn btn-ghost btn-sm" :disabled="!!busy || !board" @click="doStrategy">
+          {{ busy === '生成战略图' ? '生成中…' : '更新走位图' }}
+        </button>
+        <button v-if="tab === 'shots'" class="btn btn-ghost btn-sm" :disabled="!!busy || !board" @click="doAssemble">
+          {{ busy === '拍摄资料包' ? '生成中…' : pkg ? '更新拍摄资料' : '生成拍摄资料' }}
+        </button>
       </div>
 
       <!-- 战略图：全高 iframe（产物未生成时给空态，不再让 404 变成白屏） -->
-      <div v-if="tab === 'strategy'" class="glass min-h-0 flex-1 overflow-hidden p-1">
+      <div v-if="tab === 'strategy'" class="glass flex min-h-[560px] flex-1 flex-col overflow-hidden p-1">
         <!-- 底图来源不只在产物里标一次：这页切 tab、iframe 被滚掉时就没人看见了 -->
         <div v-if="planFallback" class="mb-1 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-1.5 text-2xs text-amber-200">
           底图「{{ planFallback.name || '未命名' }}」与本分镜 scene_ref {{ planFallback.score || 0 }}/{{ planFallback.total || 0 }} 匹配——
           用的是回退的最新一张，<b>空间一致性未经校验</b>；要按场景出图请先到 ② 关联场景资产、再到 ⑥ 生成对应平面图
         </div>
-        <iframe v-if="strategyUrl" id="strategyFrame" :src="strategyUrl" class="h-full w-full rounded-lg border-0 bg-white"
+        <iframe v-if="strategyUrl" id="strategyFrame" :src="strategyUrl" class="min-h-[560px] w-full flex-1 rounded-lg border-0 bg-white"
           title="战略图"></iframe>
-        <div v-else class="grid h-full place-items-center p-6 text-center">
+        <div v-else class="grid min-h-[560px] flex-1 place-items-center p-6 text-center">
           <div v-if="!board" class="text-xs text-slate-500">选择分镜后展示战略图</div>
           <div v-else>
             <div class="text-sm font-bold text-amber-300">尚无走位战略图</div>
@@ -414,7 +417,7 @@ useBoardSelection(board, boards, 'package')
             <button class="btn btn-sm mt-3" :disabled="!!busy" @click="doStrategy">
               {{ busy === '生成战略图' ? '生成中…' : '生成走位战略图' }}
             </button>
-            <div class="mt-2 text-2xs text-slate-500">「生成拍摄资料包」会另出一版以场景平面图为底图的战略图</div>
+            <div class="mt-2 text-2xs text-slate-500">需要汇集脚本与参考素材时，可切换「拍摄资料」</div>
           </div>
         </div>
       </div>
@@ -462,7 +465,7 @@ useBoardSelection(board, boards, 'package')
               </div>
               <div class="mt-2 flex flex-wrap items-center gap-2">
                 <button class="btn btn-ghost btn-sm" :disabled="!!busy" @click="openPlanCanvas(selGroup.plan.name)">
-                  {{ busy === '渲染画布' ? '渲染中…' : '打开画布' }}
+                  {{ busy === '渲染画布' ? '渲染中…' : selectedPlanCanvas ? '刷新绘图' : '渲染预览' }}
                 </button>
                 <input v-model="planExtra" class="input w-64 text-xs" placeholder="补充描述（可省）：陈设增减、门窗调整……" />
                 <button class="btn btn-ghost btn-sm" :disabled="!!busy"
@@ -492,6 +495,7 @@ useBoardSelection(board, boards, 'package')
           </div>
 
           <!-- 本场景镜头（点击跳走位战略图对应镜） -->
+          <iframe v-if="selectedPlanCanvas" :key="selectedPlanCanvas" :src="selectedPlanCanvas" class="h-[620px] w-full rounded-xl border border-line-soft" title="场景平面图：可缩放与平移"></iframe>
           <div>
             <div class="mb-1 text-2xs text-slate-500">本场景镜头（点击跳走位战略图）</div>
             <div class="flex flex-wrap gap-1.5">
@@ -511,7 +515,7 @@ useBoardSelection(board, boards, 'package')
 
       <!-- 逐镜包 -->
       <div v-else class="glass min-h-0 flex-1 overflow-y-auto p-3">
-        <div v-if="!pkg" class="grid h-full place-items-center text-xs text-slate-500">尚未生成——点左上「生成拍摄资料包」</div>
+        <div v-if="!pkg" class="grid h-full place-items-center text-xs text-slate-500">尚无拍摄资料，点击上方「生成拍摄资料」汇集脚本与参考素材</div>
         <div v-else class="space-y-2">
           <div v-for="s in pkg.shots" :key="s.id" class="rounded-lg bg-white/5 p-2.5">
             <div class="flex flex-wrap items-center gap-2">
@@ -545,6 +549,6 @@ useBoardSelection(board, boards, 'package')
       </div>
     </section>
 
-  <OverlayViewer :visible="overlay.visible" :src="overlay.src" :kind="overlay.kind" :title="overlay.title" @close="overlay.visible = false" />
+    </div>
   </div>
 </template>

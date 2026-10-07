@@ -11,7 +11,7 @@ from production_studio import inside
 from video_profiles import public_url
 
 CONFIG = Path(__file__).resolve().parents[1] / 'media_gateway.json'
-EXTENSIONS = {'.mp3','.wav','.m4a','.aac','.flac','.ogg','.mp4','.mov','.mkv','.webm'}
+EXTENSIONS = {'.mp3','.wav','.m4a','.aac','.flac','.ogg','.mp4','.mov','.mkv','.webm','.png','.jpg','.jpeg','.webp'}
 
 
 def load():
@@ -29,6 +29,26 @@ def save(body):
     ttl = int(body.get('ttl_seconds') or 86400)
     if not 3600 <= ttl <= 604800: raise ValueError('链接有效期必须为 1 小时至 7 天')
     cfg = {**load(), 'base_url':base, 'ttl_seconds':ttl}
+    if 'image_host' in body:
+        host = body.get('image_host')
+        if isinstance(host, dict) and host.get('type'):
+            kind = str(host.get('type')).lower()
+            if kind not in ('webdav','imgur','imgbb','cloudflare'): raise ValueError('image_host.type 仅支持 imgbb / cloudflare / imgur / webdav')
+            if kind == 'webdav' and not (str(host.get('webdav_url') or '').strip() and str(host.get('base_url') or '').strip()):
+                raise ValueError('WebDAV 图床需同时填写 webdav_url（上传地址）与 base_url（静态直链前缀）')
+            if kind == 'imgur' and not str(host.get('client_id') or '').strip():
+                raise ValueError('Imgur 图床需填写 client_id')
+            if kind == 'imgbb' and not str(host.get('api_key') or '').strip():
+                raise ValueError('imgbb 图床需填写 api_key（imgbb.com 免费注册获取）')
+            if kind == 'cloudflare' and not (str(host.get('account_id') or '').strip() and str(host.get('api_token') or '').strip()):
+                raise ValueError('Cloudflare 图床需填写 account_id 与 api_token')
+            if kind == 'imgbb' and not str(host.get('api_key') or '').strip():
+                raise ValueError('imgbb 图床需填写 api_key（imgbb.com 免费注册获取）')
+            if kind == 'cloudflare' and not (str(host.get('account_id') or '').strip() and str(host.get('api_token') or '').strip()):
+                raise ValueError('Cloudflare 图床需填写 account_id 与 api_token')
+            cfg['image_host'] = host
+        else:
+            cfg.pop('image_host', None)   # 停用图床
     cfg.setdefault('secret', secrets.token_hex(32))
     temp = CONFIG.with_suffix('.tmp')
     temp.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), 'utf-8')
@@ -50,7 +70,12 @@ def signed_url(project, path):
     name = Path(project).name
     expires = int(time.time()) + cfg['ttl_seconds']
     params = {'project':name,'path':rel,'expires':expires,'signature':signature(cfg,name,rel,expires)}
-    return cfg['base_url'] + '/api/public-reference?' + urlencode(params)
+    url = cfg['base_url'] + '/api/public-reference?' + urlencode(params)
+    # hsk 隧道未认领期需 verify_code 激活网关；认领后可移除（放 extra_query 不影响签名）
+    extra = str(cfg.get('extra_query') or '').lstrip('?')
+    if extra:
+        url += '&' + extra
+    return url
 
 
 def verify(projects_root, params):

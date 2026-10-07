@@ -3,6 +3,7 @@ id: suspense-timeline
 name: 悬疑时间线
 category: 拆剧本
 target: script
+dimension: script_continuity
 enabled: true
 builtin: true
 description: 信息差管理、伏笔回收表、红鲱鱼——悬疑/烧脑

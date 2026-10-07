@@ -11,6 +11,7 @@ import zipfile
 import sys
 import uuid
 from PIL import Image, UnidentifiedImageError
+from character_sheet_mask import mask_character_sheet
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CORE = os.path.abspath(os.path.join(HERE, "..", "..", "previs_system", "tools"))
@@ -304,6 +305,8 @@ def _import_package(project_dir, manifest_or_zip, files=None, transaction_id=Non
             if versions is not None and os.path.isfile(target):
                 versions.snapshot(target)
             os.replace(tmp, target)
+            if row['item'].get('asset_kind') == 'character' and (row['item'].get('output_spec') or {}).get('target_path'):
+                row['head_mask'] = mask_character_sheet(target)
             try:
                 rel_media = os.path.relpath(target, VIDEO_ROOT).replace(os.sep, "/")
             except ValueError:
@@ -332,18 +335,24 @@ def _import_package(project_dir, manifest_or_zip, files=None, transaction_id=Non
                         parent = zone_data.setdefault(ident, {
                             "name": str(source.get("name") or ident),
                         })
-                        mother_rel = f"素材/人物/{ident}.png"
+                        mother_rel = f"素材/{zone}/{ident}.png"
                         if os.path.isfile(os.path.join(root, mother_rel.replace("/", os.sep))):
                             parent.setdefault("path", mother_rel)
                             parent.setdefault("prompt", str(source.get("sheet_prompt") or source.get("prompt") or ""))
                         state_source = source.get("state") if isinstance(source.get("state"), dict) else {}
                         parent.setdefault("states", {})[state_id] = {
+                            **({'settings_revision': item['settings_revision']} if item.get('settings_revision') else {}),
+                            **({'visual_source_hash': item['visual_source_hash']} if item.get('visual_source_hash') else {}),
+                            **({'head_mask': row['head_mask']} if 'head_mask' in row else {}),
                             "path": target_rel,
                             "prompt": str(item.get("prompt_assembled") or item.get("prompt") or ""),
                             "name": str(state_source.get("label") or state_id),
                         }
                     else:
                         zone_data[ident] = {
+                            **({'settings_revision': item['settings_revision']} if item.get('settings_revision') else {}),
+                            **({'visual_source_hash': item['visual_source_hash']} if item.get('visual_source_hash') else {}),
+                            **({'head_mask': row['head_mask']} if 'head_mask' in row else {}),
                             "path": target_rel,
                             "prompt": str(item.get("prompt_assembled") or item.get("prompt") or ""),
                             "name": str(source.get("name") or ident),

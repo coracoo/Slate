@@ -279,13 +279,30 @@ export const runFramesExtract = (body: { project: string; video: string }) =>
 export interface AssetStateItem {
   id: string; label: string; look_diff?: string; camp?: string
   episodes?: string[]; path?: string
+  visual_status?: VisualAssetStatus
+}
+export interface VisualAssetStatus {
+  ready: boolean; source: string; source_hash: string; pending_fields: string[]; missing_fields: string[]
+  field_labels: string[]; warnings: string[]; image_status: 'missing' | 'unverified' | 'outdated' | 'current'
+  image_stale: boolean; image_reasons: string[]
+  postprocess_warning?: string
+  archive_present?: boolean
+  review_status?: 'unconfirmed' | 'confirmed' | 'changed'
+  reviewed_at?: string | null
 }
 export interface AssetRegistryItem {
   ref: string; kind: "character" | "scene" | "prop" | "style"; id: string; name: string
   path?: string; usage?: string; aliases?: string[]; prompt?: string
+  prompt_editable?: string
+  visual_description?: string
+  visual_status?: VisualAssetStatus
   asset_revision?: number
+  media_settings_revision?: number
+  settings_source?: string
+  settings_updated_at?: string
+  settings_change?: {revision:number;fields:string[];impact?:{image:boolean;voice:boolean;storyboards:string[]}}
   parent_ref?: string; relation?: string; derived_from?: string; related_refs?: string[]
-  children_refs?: string[]; source_episode_ids?: string[]
+  children_refs?: string[]; source_episode_ids?: string[]; in_use?: boolean
   /** 资产级画风覆盖（image skill id）；空 = 跟随项目生图风格。 */
   style?: string
   /** 资产级画风自由文本（最高优先级，直接作为画风层）；空 = 用 style skill / 项目默认。 */
@@ -297,6 +314,7 @@ export interface AssetRegistryItem {
 export interface AssetPromptLayers {
   subject: string; style: string; style_source: "asset_text" | "asset_skill" | "project" | "none"
   negative: string; constraint: string; final: string
+  validation?: VisualAssetStatus
 }
 export const fetchAssetPromptLayers = (project: string, kind: string, id: string) =>
   getJSON<{ ok: boolean; layers: AssetPromptLayers }>(`/api/asset/prompt_layers?project=${encodeURIComponent(project)}&kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(id)}`)
@@ -310,7 +328,7 @@ export const saveAssetRelations = (body: { project: string; updates: AssetRelati
   postJSON<{ ok: boolean; updated?: string[]; assets?: AssetRegistryItem[]; issues?: Array<Record<string, unknown>> }>('/api/assets/relations', body)
 export interface AssetCreateRequest {
   project: string; kind: "character" | "scene" | "prop"; id?: string; name: string
-  parent_ref?: string | null; relation?: string | null; prompt?: string
+  parent_ref?: string | null; relation?: string | null; prompt?: string; derived_from?: string | null
   role?: string; prop_kind?: string; episode?: string
   related_refs?: string[]
 }
@@ -460,6 +478,8 @@ export interface TestResult {
 
 export const fetchEnv = () => getJSON<EnvInfo>('/api/env')
 
+export const queryVendorBalance = (vendorId: string) =>
+  postJSON<{ ok: boolean; text: string; detail?: Record<string, unknown> }>('/api/env/balance', { vendor_id: vendorId })
 export const fetchEnvConfig = async (options: { includeHidden?: boolean } = {}) => {
   const config = await getJSON<EnvConfig>('/api/env/config')
   return options.includeHidden ? config : { ...config, vendors: visibleVendors(config.vendors || []) }
@@ -535,8 +555,23 @@ export const testProvider = (body: { id: string; kind?: ModelSlot; draft?: Vendo
   postJSON<TestResult>('/api/env/test', body)
 
 /** 拉取厂商可用模型列表（OpenAI 兼容 /models）；draft 非空直接用草稿的 base_url/key 拉取。 */
-export const fetchEnvModels = (body: { id?: string; draft?: { base_url?: string; api_key?: string } }) =>
+export const fetchEnvModels = (body: { id?: string; kind?: ModelSlot; draft?: { base_url?: string; api_key?: string; extra?: Record<string, string> } }) =>
   postJSON<{ ok: boolean; models?: string[]; err?: string }>('/api/env/models', body)
+
+export interface RunningHubOperation {
+  id: string; path: string; label: string; kind: string; deprecated: boolean; content_type: string
+  documentation_url: string
+  schema: { properties?: Record<string, { type?: string; default?: unknown; enum?: unknown[]; minimum?: number }>; required?: string[] }
+}
+export const fetchRunningHubCatalog = () => getJSON<{
+  revision: string; apis: RunningHubOperation[]
+  models: Partial<Record<ModelSlot, { id: string; label: string }[]>>
+  note?: string
+}>('/api/runninghub/catalog')
+export const submitRunningHub = (endpoint: string, payload: Record<string, unknown>) =>
+  postJSON<{ ok: boolean; result: Record<string, unknown>; err?: string }>('/api/runninghub/submit', { endpoint, payload })
+export const queryRunningHub = (task_id: string, download = true, legacy = false) =>
+  postJSON<{ ok: boolean; result: Record<string, unknown>; files?: { path: string; url: string }[]; err?: string }>('/api/runninghub/query', { task_id, download, legacy })
 
 /** 整理项目目录：apply=false 返回 dry-run 计划（字符串列表），apply=true 执行。 */
 export const normalizeProject = (project: string, apply: boolean) =>
@@ -844,6 +879,7 @@ export interface Episode {
   id: string
   title?: string
   text?: string
+  planning_review_required?: boolean
   hook?: string
   cliff?: string
   summary?: string
@@ -857,18 +893,55 @@ export interface Episode {
 export interface CharacterItem { id: string; name?: string; role?: string; basis?: string; dialogue_count?: number; parent_ref?: string; relation?: string; derived_from?: string; related_refs?: string[] }
 export interface SceneItem { id: string; name?: string; time?: string; light?: string; interior?: boolean; geometry?: string[]; parent_ref?: string; relation?: string; derived_from?: string; related_refs?: string[] }
 export interface PropItem { id: string; name?: string; kind?: string; owner?: string; shot_hint?: string | null; parent_ref?: string; relation?: string; derived_from?: string; related_refs?: string[] }
+export interface ScriptWorkflow {
+  state: 'empty' | 'review' | 'locked' | 'stale' | 'legacy' | 'imported'
+  managed: boolean
+  can_build: boolean
+  can_complete: boolean
+  episode_count: number
+  target_episodes: number | null
+  completion_blockers: UnitsReport['errors']
+  blockers: UnitsReport['errors']
+  settings_missing: { ref: string; name: string; kind: string; id: string; missing: string[] }[]
+  next_action: 'build' | 'complete_settings' | 'repair' | 'anchor' | 'expand'
+  can_anchor: boolean
+  can_expand: boolean
+  anchor_stale: boolean
+  anchor_rev: number
+  reason: string
+}
 export interface ScriptBundle {
   script: string
+  idea?: string
   script_mode?: string | null
   script_rev?: number
+  script_revision?: string
+  production_progress?: { episodes: EpisodeProgress[] }
   episodes: Episode[] | null
   characters: { characters: CharacterItem[] } | null
   scenes: { scenes: SceneItem[] } | null
   props: { props: PropItem[] } | null
   style?: { anchor?: string; image?: string; script?: string; storyboard?: string; acting?: string }
+  prompt_flow?: { script_workflow?: ScriptWorkflow; stages: Array<{ id: string; name: string; status: 'done' | 'partial' | 'ready' | 'blocked' | 'optional'; output: string; revision?: number | null; completed?: number; total?: number }> }
 }
 export const fetchScriptData = (project: string) =>
   getJSON<ScriptBundle>(`/api/script/data?project=${encodeURIComponent(project)}`)
+export interface EpisodeProgress {
+  id: string; title: string; script_done: boolean; board: string | null; storyboard_review: boolean; shared_board: boolean
+  assets: { done: number; total: number }
+  keyframes: { done: number; total: number; review: number }
+  videos: { done: number; total: number; review: number }
+  shot_videos: { done: number; total: number; review: number }
+  episode_video_done: boolean
+}
+export interface EpisodeEditResult {
+  ok: boolean; changed: boolean; revision: string; episode: Episode; warnings: string[]
+  affected: { boards: Array<{ name: string; shots: string[]; units: string[]; adopted: number }>; asset_refs: string[] }
+}
+export const saveEpisodeText = (body: { project: string; episode: string; text: string; revision: string }) =>
+  postJSON<EpisodeEditResult>('/api/script/episode/save', body)
+export const fetchEpisodeHistory = (project: string, episode = '') =>
+  getJSON<{ ok: boolean; versions: Array<{ id: string; label: string; current: boolean; text: string }> }>(`/api/script/episode/history?project=${encodeURIComponent(project)}&episode=${encodeURIComponent(episode)}`)
 export const importScript = (body: { project: string; text: string }) =>
   postJSON<{ ok: boolean; chars: number }>('/api/script/import', body)
 export const scriptEpisodes = (project: string) =>
@@ -878,7 +951,7 @@ export const scriptOverview = (project: string, episode?: string) =>
 export const scriptExtract = (project: string, episode?: string) =>
   postJSON<RunResult>('/api/script/extract', { project, episode })
 /** 创作构想 → 大纲(=分集)；episode 给定则扩写该集为分场剧本。 */
-export const scriptExpand = (body: { project: string; idea?: string; eps?: number; episode?: string }) =>
+export const scriptExpand = (body: { project: string; idea?: string; eps?: number; episode?: string; allow_gaps?: boolean }) =>
   postJSON<RunResult>('/api/script/expand', body)
 /** 删除分集清单中的一集；全局资产与已生成产物由后端保留。 */
 export const deleteScriptEpisode = (project: string, episode: string) =>
@@ -923,6 +996,7 @@ export interface UnitForeshadow {
 export interface UnitHook { id: string; beat: string; question?: string; ep: string }
 export interface UnitEpisode {
   id: string
+  text?: string
   title?: string
   summary?: string
   hook?: string
@@ -960,6 +1034,7 @@ export interface UnitsBundle {
   ok: boolean
   anchored: boolean
   anchor_rev: number
+  workflow: ScriptWorkflow
   outline: {
     premise?: string
     highlights?: string[]
@@ -974,17 +1049,27 @@ export interface UnitsBundle {
   episodes: UnitEpisode[]
   foreshadows: UnitForeshadow[]
   hooks: UnitHook[]
-  bios: { ref: string; name: string; bio_language?: string; bio_crack?: string; bio_pressure?: string; bio_address?: string; bio_arc?: string; states?: string[] }[]
-  scene_limits: { ref: string; name: string; spatial_limit?: string; action_slots?: string[] }[]
-  prop_boundaries: { ref: string; name: string; usage_boundary?: string }[]
+  bios: { ref: string; name: string; biography?: string; bio_language?: string; bio_crack?: string; bio_pressure?: string; bio_address?: string; bio_arc?: string; appearance?: { [key: string]: unknown; proposals?: Record<string, string | number | null> }; states?: string[] }[]
+  scene_limits: { ref: string; name: string; spatial_limit?: string; action_slots?: string[]; visual_description?: string }[]
+  prop_boundaries: { ref: string; name: string; usage_boundary?: string; visual_description?: string }[]
   index: Record<string, UnitIndexRow>
   report: UnitsReport
+  planning_revision: string
+  viewing_version?: string | null
 }
-export const fetchUnits = (project: string) =>
-  getJSON<UnitsBundle>(`/api/units?project=${encodeURIComponent(project)}`)
-/** 第一步 LLM 生成（走 job）：anchor=true 表示生成完直接锚定 */
-export const buildUnits = (body: { project: string; eps?: number; arc_size?: number; anchor?: boolean;
-                                   stage?: 'all' | 'story' | 'entity' }) =>
+export const fetchUnits = (project: string, version?: string) =>
+  getJSON<UnitsBundle>(`/api/units?project=${encodeURIComponent(project)}${version ? `&version=${encodeURIComponent(version)}` : ''}`)
+export interface PlanningCandidate {
+  id: string; status: 'generating' | 'ready' | 'failed' | 'applied'; label: string; created_at: string
+  error?: string; revision_mode?: string; instructions?: string; can_adopt: boolean; can_resume: boolean
+}
+export const fetchPlanningCandidate = (project:string, id?:string) =>
+  getJSON<{ok:boolean;candidate:PlanningCandidate|null;revision:string;groups?:Array<{label:string;before:string;after:string}>}>(`/api/units/candidate?project=${encodeURIComponent(project)}${id?`&id=${encodeURIComponent(id)}`:''}`)
+/** 生成规划草稿；已有规划使用 complete 只补缺项，确认后单独锁定。 */
+export const buildUnits = (body: { project: string; idea?: string; eps?: number; arc_size?: number;
+                                   stage?: 'all' | 'story' | 'entity' | 'complete' | 'replan'; planning_source?: 'idea' | 'script';
+                                   revision_mode?: 'auto' | 'extend' | 'rewrite'; revision_instructions?: string;
+                                   planning_version?: string; asset_refs?:string[] }) =>
   postJSON<{ ok: boolean; id: number; job: boolean }>('/api/units/build', body)
 export const anchorUnits = (project: string, force = false) =>
   postJSON<{ ok: boolean; anchor_rev?: number; errors?: UnitsReport['errors']; err?: string }>(
@@ -993,8 +1078,10 @@ export const checkUnits = (project: string) => postJSON<UnitsReport>('/api/units
 /** 人工修订：kind=episode|asset|outline|threads；asset 带 lock 即写 locked_fields（之后生成流程不得覆盖） */
 export const editUnits = (body: {
   project: string
-  kind: 'episode' | 'asset' | 'outline' | 'threads'
+  kind: 'episode' | 'episodes' | 'asset' | 'outline' | 'threads' | 'unlock' | 'adopt-plan'
+  items?:Array<{id:string;fields:Record<string,unknown>}>
   id?: string
+  revision?: string
   zone?: string
   fields?: Record<string, unknown>
   lock?: string[]
@@ -1003,7 +1090,7 @@ export const editUnits = (body: {
 }) => postJSON<{ ok: boolean; applied?: string[]; rejected?: string[]; err?: string; report?: UnitsReport }>(
   '/api/units/edit', body)
 /** 资产设定图生图：人物五视图/场景/道具（kind: character|scene|prop|all）。 */
-export const genAssetImage = (body: { project: string; kind: string; id?: string; vendor_id?: string; force?: boolean; states?: 'include' | 'only' | 'skip'; state_id?: string }) =>
+export const genAssetImage = (body: { project: string; kind: string; id?: string; vendor_id?: string; force?: boolean; states?: 'include' | 'only' | 'skip'; state_id?: string; asset_refs?: string[] }) =>
   postJSON<RunResult>('/api/asset/image', body)
 /** 剧情战略图（2D 俯视走位/相机/运镜交互 HTML）。 */
 export const buildStrategy = (project: string, storyboard: string) =>
@@ -1082,6 +1169,11 @@ export interface ActingShot {
   /** ⑤ 过期探针（compile_shot）跑不动时的原因；状态值不变，仅用于提示"就绪"未经核验。 */
   performance_check_error?: string
   performance_locked: boolean; performance?: Record<string, unknown> | null
+  continuity?: {
+    event_order_explicit: boolean; beat_count?: number; warnings: string[]
+    events: Array<{ id: string; label: string; source: unknown }>
+    actors: Array<{ id: string; name: string; facts: Array<{ id: string; text: string; source: unknown }>; state: Record<string, unknown> }>
+  } | null
 }
 export interface ActingCandidate {
   run_id: string; candidate_kind: 'context' | 'performance' | string; status: string
@@ -1126,6 +1218,7 @@ export interface SkillItem {
   name: string
   category: string
   target: string
+  dimension?: string
   enabled: boolean
   builtin: boolean
   description: string
@@ -1146,8 +1239,11 @@ export const fetchProjectFile = <T = unknown>(project: string, p: string) =>
 export const fetchStoryboardRevision = (project: string, name: string) =>
   getJSON<{ ok: boolean; revision: string }>(
     `/api/storyboard/revision?project=${encodeURIComponent(project)}&name=${encodeURIComponent(name)}`)
+
+export const fetchStoryboardReview = (project:string,name:string) =>
+  getJSON<{ok:boolean;revision:string;board:WhiteBoard}>(`/api/storyboard/revision?project=${encodeURIComponent(project)}&name=${encodeURIComponent(name)}&include=board`)
 export const saveStoryboardShots = (project: string, name: string, shots: unknown[], revision: string) =>
-  postJSON<{ ok: boolean; shots: number; revision: string;
+  postJSON<{ ok: boolean; shots: number; revision: string; board?:WhiteBoard;
     unit_warnings?: { code: string; shot_id: string; taboo_id: string; rule: string;
                       hits: { field: string; word: string; snippet: string }[] }[] }>('/api/storyboard/save', { project, name, shots, revision })
 export const exportStoryboardXlsx = (project: string, name: string) =>

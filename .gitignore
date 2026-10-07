@@ -54,6 +54,11 @@ workbench/docs/*
 !workbench/docs/2026-09-21-三层视频创作台设计.md
 !workbench/docs/2026-09-21-角色音色资产与视频衔接.md
 !workbench/docs/2026-09-21-三层视频创作台实施.md
+!workbench/docs/审计整改记录-2026-09-27.md
+!workbench/docs/提示词工程架构与注入清单-2026-09-27.md
+!workbench/docs/短剧制作业务优化-2026-09-28.md
+!workbench/docs/重新分集与规划版本.md
+!workbench/docs/素材写入接口.md
 !workbench/docs/prototypes/
 workbench/docs/prototypes/*
 !workbench/docs/prototypes/video-unit-studio.html
@@ -87,3 +92,9 @@ workbench/update_state.json
 # 本地工具产物（Qoder harness 报告/会话缓存、优雅停机标记）——不属于源码
 .qoder/
 workbench/STOP
+
+!workbench/docs/制作工作区工程化.md
+!workbench/docs/角色工作区.md
+!workbench/docs/空间预演工作区.md
+!workbench/docs/提示词工程契约.md
+!workbench/docs/RunningHub工作流节点映射.md

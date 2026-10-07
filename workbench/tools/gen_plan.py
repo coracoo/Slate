@@ -163,9 +163,10 @@ def generate(project_dir, name=None, scene_desc=None, keyframe=None, zone=None,
         kind = "vision"
     if gen_chat is None:
         cli = VendorClient(pick_vendor(kind, vendor))
+        cli.billing_project = os.path.basename(os.path.normpath(project_dir))
         log(f"[信息] LLM 厂商: {cli.id} / {cli.model(kind)}（{kind}）")
         gen_chat = lambda msgs: cli.chat(msgs, kind=kind, max_tokens=4000, timeout=420,
-                                         temperature=0.4, extra=FAST_THINK)
+                                         temperature=0.4, extra=FAST_THINK, trace_stage="scene_plan")
     if judge_fn is None:
         judge_fn = lambda plan: judge_plan.judge(plan, scene_desc=scene_desc or "", log=log)
     scenes_path = os.path.join(project_dir, "素材", "场景.json")
@@ -262,9 +263,10 @@ def draft_missing_scene_plans(project_dir, vendor=None, log=print, gen_chat=None
         except VendorError as exc:
             log(f"[信息] 平面图初稿跳过：{exc}")
             return {"生成": 0, "跳过": len(scene_ids), "失败": 0}
+        cli.billing_project = os.path.basename(os.path.normpath(project_dir))
         log(f"[信息] 平面图初稿厂商: {cli.id} / {cli.model('text')}")
         gen_chat = lambda msgs: cli.chat(msgs, kind="text", max_tokens=4000, timeout=420,
-                                         temperature=0.4, extra=FAST_THINK)
+                                         temperature=0.4, extra=FAST_THINK, trace_stage="scene_plan_draft")
     stats = {"生成": 0, "跳过": len(scene_ids) - len(todo), "失败": 0}
     import plan_frames
     for sid in todo:

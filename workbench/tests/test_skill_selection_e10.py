@@ -187,6 +187,24 @@ class SkillSnapshotTests(unittest.TestCase):
 class PipelineFreezeTests(unittest.TestCase):
     """三条链路的产物冻结：资产生图索引 / 大纲.json / 分镜 cfg。"""
 
+    def setUp(self):
+        # 风格快照测试只验证本地数据；链式平面图不在本组测试范围内。
+        self._plan_patch = mock.patch("plan_frames.ensure_scene_plan", return_value={})
+        self._plan_patch.start()
+        self.addCleanup(self._plan_patch.stop)
+        # 防止新加入的派生步骤绕过各测试的 fake 客户端触发真实厂商请求。
+        self._network_guards = []
+        for target in ("llm_openai.VendorClient.chat", "socket.socket.connect",
+                       "socket.create_connection"):
+            patcher = mock.patch(target, side_effect=AssertionError("离线测试禁止真实模型或网络调用"))
+            self._network_guards.append(patcher.start())
+            self.addCleanup(patcher.stop)
+
+    def tearDown(self):
+        # 即使业务层 fail-soft 捕获异常，也不能掩盖测试里的意外网络路径。
+        for guard in self._network_guards:
+            guard.assert_not_called()
+
     def test_gen_asset_images_index_carries_snapshot(self):
         import gen_asset_images as gen
 
@@ -270,9 +288,16 @@ class PipelineFreezeTests(unittest.TestCase):
     def test_expand_outline_writes_snapshot(self):
         import creation_pipeline as cp
 
-        outline = {"main_line": "主线", "visual_style": "参考",
-                   "episodes": [{"id": "E1", "title": "起", "summary": "概", "duration_min": 3},
-                                {"id": "E2", "title": "落", "summary": "概", "duration_min": 3}]}
+        # 当前无 episode 的 expand 进入最小单元规划；模拟值必须包含实际分段与加厚分集。
+        # 不在模型响应里伪造 skill_snapshot：冻结值必须来自程序实际采用的 Skill。
+        outline = {"premise": "车站重逢后解开心结", "arcs": [
+            {"id": "ARC1", "ep_from": "E1", "ep_to": "E2", "goal": "从重逢到和解"}],
+            "roster": {"characters": [], "scenes": [], "props": []},
+            "episodes": [{"id": "E1", "arc_id": "ARC1", "title": "起", "summary": "重逢",
+                          "beats": ["故人重逢"], "duration_min": 3},
+                         {"id": "E2", "arc_id": "ARC1", "title": "落", "summary": "和解",
+                          "beats": ["解开心结"], "duration_min": 3}],
+            "foreshadows": [], "hooks": []}
         p1, p2 = _patched()
         with p1, p2, tempfile.TemporaryDirectory() as td:
             project = Path(td)
@@ -281,8 +306,11 @@ class PipelineFreezeTests(unittest.TestCase):
                 json.dumps({"script": "scr-a"}, ensure_ascii=False), encoding="utf-8")
             with mock.patch.object(cp, "pick_vendor", lambda v=None: "fake"), \
                  mock.patch.object(cp, "VendorClient", lambda vid: object()), \
-                 mock.patch.object(cp, "chat_retry", lambda *a, **k: json.dumps(outline, ensure_ascii=False)):
-                cp.cmd_expand(str(project), None, "一个关于夜间站台重逢的故事", 2, None)
+                 mock.patch.object(cp, "chat_retry", return_value=json.dumps(outline, ensure_ascii=False)) as chat:
+                report = cp.cmd_expand(str(project), None, "一个关于夜间站台重逢的故事", 2, None)
+            self.assertTrue(report["ok"], report)
+            chat.assert_called_once()
+            self.assertIn("拆剧甲正文", chat.call_args.args[1][0]["content"])
             data = json.loads((project / "剧本" / "大纲.json").read_text(encoding="utf-8"))
             self.assertEqual(data["skill_snapshot"],
                              {"script": {"id": "scr-a", "name": "拆剧甲", "sha": _sha("scr-a")}})
@@ -294,9 +322,10 @@ class PipelineFreezeTests(unittest.TestCase):
             "shots": [{"id": "S1", "dur": 4, "shot_size": "中景", "camera_move": "固定",
                        "angle": "平视", "cam": "wide", "scene": "room", "action": "甲进门",
                        "prompt_image": "静帧画面描述", "prompt_video": "视频画面描述",
+                       "prompt_grid": "2×2四宫格，依次展示门外、推门、跨入与站定，身份和场景一致，格内无文字",
                        "lines": []}],
             "video_units": [{"shot_ids": ["S1"], "title": "段一",
-                             "prompt_video": "整段视频描述", "prompt_grid": "宫格描述"}],
+                             "prompt_video": "整段视频描述", "prompt_grid": "2×2四宫格，按S1动作顺序展示四个时刻，格内无文字"}],
         }
         p1, p2 = _patched()
         with p1, p2, tempfile.TemporaryDirectory() as td:
@@ -309,12 +338,17 @@ class PipelineFreezeTests(unittest.TestCase):
                 json.dumps({"storyboard": "dir-a"}, ensure_ascii=False), encoding="utf-8")
             with mock.patch.object(cp, "pick_vendor", lambda v=None: "fake"), \
                  mock.patch.object(cp, "VendorClient", lambda vid: object()), \
-                 mock.patch.object(cp, "chat_retry",
-                                   lambda *a, **k: json.dumps(llm_out, ensure_ascii=False)):
+                 mock.patch.object(cp, "chat_retry", return_value=json.dumps(llm_out, ensure_ascii=False)) as chat:
                 cp.cmd_storyboard(str(project), None, "E1")
+            chat.assert_called_once()
+            system = chat.call_args.args[1][0]["content"]
+            self.assertEqual(system.count("导演甲正文"), 1)
+            self.assertEqual(system.count("画风甲正文"), 1)
             cfg = json.loads((project / "分镜" / "剧本_E1.json").read_text(encoding="utf-8"))
             self.assertEqual(cfg["skill_snapshot"],
-                             {"storyboard": {"id": "dir-a", "name": "导演甲", "sha": _sha("dir-a")}})
+                             {"storyboard": {"id": "dir-a", "name": "导演甲", "sha": _sha("dir-a")},
+                              "image": {"id": "img-a", "name": "画风甲", "sha": _sha("img-a")}})
+            self.assertEqual(cfg["shots"][0]["prompt_grid"], llm_out["shots"][0]["prompt_grid"])
 
 
 if __name__ == "__main__":

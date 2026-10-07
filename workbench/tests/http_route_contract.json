@@ -37,6 +37,14 @@
  ],
  [
   "GET",
+  "/api/assets/reconcile"
+ ],
+ [
+  "GET",
+  "/api/assets/visual-review"
+ ],
+ [
+  "GET",
   "/api/auth/status"
  ],
  [
@@ -46,6 +54,10 @@
  [
   "GET",
   "/api/billing/summary"
+ ],
+ [
+  "GET",
+  "/api/characters"
  ],
  [
   "GET",
@@ -157,6 +169,18 @@
  ],
  [
   "GET",
+  "/api/runninghub/aiapp-demo"
+ ],
+ [
+  "GET",
+  "/api/runninghub/catalog"
+ ],
+ [
+  "GET",
+  "/api/runninghub/file"
+ ],
+ [
+  "GET",
   "/api/script/brief"
  ],
  [
@@ -165,11 +189,23 @@
  ],
  [
   "GET",
+  "/api/script/drafts"
+ ],
+ [
+  "GET",
+  "/api/script/episode/history"
+ ],
+ [
+  "GET",
   "/api/skills"
  ],
  [
   "GET",
   "/api/skills/get"
+ ],
+ [
+  "GET",
+  "/api/skills/style"
  ],
  [
   "GET",
@@ -198,6 +234,10 @@
  [
   "GET",
   "/api/units"
+ ],
+ [
+  "GET",
+  "/api/units/candidate"
  ],
  [
   "GET",
@@ -313,7 +353,15 @@
  ],
  [
   "POST",
+  "/api/assets/reconcile"
+ ],
+ [
+  "POST",
   "/api/assets/relations"
+ ],
+ [
+  "POST",
+  "/api/assets/visual-review"
  ],
  [
   "POST",
@@ -330,6 +378,10 @@
  [
   "POST",
   "/api/auth/setup"
+ ],
+ [
+  "POST",
+  "/api/characters/save"
  ],
  [
   "POST",
@@ -382,6 +434,10 @@
  [
   "POST",
   "/api/creation/package"
+ ],
+ [
+  "POST",
+  "/api/env/balance"
  ],
  [
   "POST",
@@ -457,6 +513,10 @@
  ],
  [
   "POST",
+  "/api/media-gateway/test-host"
+ ],
+ [
+  "POST",
   "/api/openblend"
  ],
  [
@@ -517,11 +577,35 @@
  ],
  [
   "POST",
+  "/api/runninghub/query"
+ ],
+ [
+  "POST",
+  "/api/runninghub/submit"
+ ],
+ [
+  "POST",
   "/api/script/brief"
  ],
  [
   "POST",
+  "/api/script/drafts/adopt"
+ ],
+ [
+  "POST",
+  "/api/script/drafts/generate"
+ ],
+ [
+  "POST",
+  "/api/script/drafts/repair"
+ ],
+ [
+  "POST",
   "/api/script/episode/delete"
+ ],
+ [
+  "POST",
+  "/api/script/episode/save"
  ],
  [
   "POST",
@@ -638,6 +722,10 @@
  [
   "POST",
   "/api/units/check"
+ ],
+ [
+  "POST",
+  "/api/units/delete-version"
  ],
  [
   "POST",

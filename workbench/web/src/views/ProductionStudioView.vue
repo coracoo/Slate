@@ -82,7 +82,17 @@ async function genAsset(kind: string, id: string) {
   if (!project || genningAsset.value) return
   genningAsset.value = `${kind}:${id}`; error.value = ''
   try {
-    const r = await postJSON<{ok: boolean; id?: number; err?: string}>('/api/asset/image', {project, kind, id})
+    // 补素材的生图厂商 = ②视觉素材页当前选择（同一持久化键）；无历史选择时取启用顺序第一家（本地优先）并回写共享
+    const key = `wb.${project}.assets.vendor`
+    let vendor = localStorage.getItem(key) || ''
+    if (!vendor) {
+      try {
+        const env = await fetchEnvConfig()
+        const first = (env.vendors || []).find(v => v.enabled && v.models?.image)?.id || ''
+        if (first) { vendor = first; localStorage.setItem(key, first) }
+      } catch { /* 环境接口不可用时留给后端默认（启用顺序第一家） */ }
+    }
+    const r = await postJSON<{ok: boolean; id?: number; err?: string}>('/api/asset/image', {project, kind, id, vendor_id: vendor || undefined})
     if (!r.ok && r.err) throw new Error(r.err)
     if (r.id) void trackJob(r.id, `素材生成 ${KIND_CN[kind] || kind} ${id}`).then(async () => {
       if (app.current === project) { await loadAssets(); await gallery() }
@@ -190,13 +200,9 @@ async function load() {
       const u = result.board.video_units?.find(u => u.shot_ids.includes(s.id))
       const start = u ? result.board.shots.filter(x => u.shot_ids.slice(0, u.shot_ids.indexOf(s.id)).includes(x.id)).reduce((n, x) => n + x.dur, 0) : 0
       for (const field of promptFields) s[field.key] = defaultShotPrompt(s, field.key, start)
-      // 旧三件套模板把 prompt_grid 写成了关键帧式单帧描述（语义错误）：清空，让占位符教学格式生效
-      if (/^【S\d+镜（/.test(s.prompt_grid || '')) s.prompt_grid = ''   // 仅清旧三件套模板签名（镜号+镜（），优化产出的分格说明不受影响
     }
     for (const u of result.board.video_units || []) {
-      // 宫格文案按需人工配置（仅故事板宫格参考模式使用），默认不回填
       u.prompt_video = defaultUnitPrompt(u, result.board.shots, 'prompt_video')
-      retimeUnit(u, result.board.shots)   // timeline 以当前各 S 时长重算，修掉历史陈旧节拍
     }
     if (!result.board.video_units?.some(u => u.id === selectedUnit.value)) selectedUnit.value = result.board.video_units?.[0]?.id || ''
     if (!result.board.shots.some(s => s.id === selectedShot.value)) selectedShot.value = result.board.shots[0]?.id || ''
@@ -288,9 +294,19 @@ async function initialize() {
   try { await studioPost('save', {...base(), initialize: true}); await load() } catch (e) { error.value = String(e) }
 }
 function editDuration(event: Event) {
-  duration.value = (event.target as HTMLInputElement).valueAsNumber
-  if (scope.value === 'S' && shot.value) shot.value.video_duration = duration.value
-  if (scope.value === 'V' && unit.value) unit.value.duration = duration.value
+  const v = (event.target as HTMLInputElement).valueAsNumber
+  if (!Number.isFinite(v) || v <= 0) return
+  duration.value = v
+  if (scope.value === 'S' && shot.value) {
+    shot.value.video_duration = v; shot.value.dur = v
+    const cur = shot.value
+    if (cur) {
+      for (const u of units.value.filter(u => u.shot_ids.includes(cur.id))) retimeUnit(u, allShots.value)
+      // 右侧当前为 S 范围；V 的合计更新保留在编排列，不替换单镜输入值。
+      syncDuration()
+    }
+  }
+  if (scope.value === 'V' && unit.value) unit.value.duration = v
   dirty.value = true
 }
 async function split(sid: string) {
@@ -415,7 +431,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
 <template>
   <div class="page-wide production-studio">
     <header class="mb-5 flex flex-wrap items-end justify-between gap-3">
-      <div><h1 class="grad-text text-2xl font-black">⑦ 创作生成</h1><p class="mt-1 text-xs text-slate-500">按 S 生成关键帧，按 V 生成视频；已采用片段可继续重拍。</p></div>
+      <div><h1 class="grad-text text-2xl font-black">镜头创作</h1><p class="mt-1 text-xs text-slate-500">按 S 生成关键帧，按 V 生成视频；已采用片段可继续重拍。</p></div>
       <div class="flex items-center gap-2">
         <span v-if="dirty" class="text-xs text-amber-200">有未保存修改</span>
         <button class="btn btn-sm" :disabled="busy || !dirty" @click="savePrompts">保存提示词与时长</button>
@@ -424,6 +440,7 @@ onBeforeUnmount(() => window.clearInterval(timer))
     <div v-if="error" role="alert" class="mb-3 rounded-xl bg-rose-950/40 p-3 text-sm text-rose-200">{{ error }}<button class="ml-3" @click="error = ''">×</button></div>
     <!-- 制作规格（E05）：V 总时长超过单集目标时后端 state 给出提示 -->
     <div v-if="data?.brief_notice" class="mb-3 rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs-plus text-amber-200">！{{ data.brief_notice }}</div>
+    <div v-if="data?.script_notice" class="mb-3 rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-sm text-amber-200">{{ data.script_notice }} <RouterLink to="/studio/shots" class="underline">前往分镜</RouterLink></div>
     <p v-if="!app.current" class="p-10 text-slate-400">请先选择项目。</p>
     <div v-else class="studio-columns">
       <aside class="glass studio-sidebar">
@@ -570,23 +587,59 @@ onBeforeUnmount(() => window.clearInterval(timer))
       </div>
       </main>
       <aside class="glass space-y-4 p-4">
-        <div><span class="text-xs text-slate-400">当前创作范围</span><h2 class="mt-1 font-bold text-sky-200">{{ scope === 'S' ? `${selectedShot} · 转场镜头` : `${unit?.label || 'V'} · 分镜视频` }}</h2></div>
-        <div class="flex gap-2"><button class="ref-choice flex-1 text-center" :class="{active: kind === 'image'}" :aria-pressed="kind === 'image'" @click="kind = 'image'">关键帧</button><button class="ref-choice flex-1 text-center" :class="{active: kind === 'video'}" :aria-pressed="kind === 'video'" @click="kind = 'video'">视频</button></div>
+        <div class="rounded-xl border" :class="scope === 'S' ? 'border-cyan-400/40 bg-cyan-400/5' : 'border-sky-400/40 bg-sky-400/5'">
+          <div class="flex items-center gap-2 p-2.5">
+            <span class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-2xs font-black" :class="scope === 'S' ? 'bg-cyan-400/20 text-cyan-200' : 'bg-sky-400/20 text-sky-200'">{{ scope === 'S' ? 'S' : 'V' }}</span>
+            <div class="min-w-0">
+              <div class="truncate text-sm font-bold" :class="scope === 'S' ? 'text-cyan-200' : 'text-sky-200'">{{ scope === 'S' ? `${selectedShot} · 转场镜头` : `${unit?.label || 'V'} · 分镜视频` }}</div>
+              <div class="text-2xs text-slate-500">{{ scope === 'S' ? '单镜创作：关键帧（静帧）/ 视频（单镜直出）' : '整段创作：宫格或关键帧序列作参考，一次生成整 V' }}</div>
+            </div>
+            <span class="ml-auto shrink-0 rounded px-1.5 py-0.5 text-2xs font-bold" :class="scope === 'S' ? 'bg-cyan-400/15 text-cyan-300' : 'bg-sky-400/15 text-sky-300'">{{ scope === 'S' ? '按 S 生成' : '按 V 生成' }}</span>
+          </div>
+        </div>
+        <div class="flex gap-2">
+          <button v-if="scope === 'S'" class="ref-choice flex-1 text-center" :class="{active: kind === 'image'}" :aria-pressed="kind === 'image'" title="生成该 S 的静帧关键帧" @click="kind = 'image'">S · 关键帧</button>
+          <button v-if="scope === 'S'" class="ref-choice flex-1 text-center" :class="{active: kind === 'video'}" :aria-pressed="kind === 'video'" title="单镜直出视频" @click="kind = 'video'">S · 视频</button>
+          <button v-if="scope === 'V'" class="ref-choice flex-1 text-center" :class="{active: kind === 'video'}" title="以宫格或关键帧序列为参考，一次生成整 V" @click="kind = 'video'">V · 整段视频</button>
+        </div>
         <label class="block text-xs text-slate-400">生成模型<select v-model="vendor" class="control mt-1"><option v-for="v in models" :key="v.id" :value="v.id">{{ v.label }} · {{ v.models[kind] }}</option></select></label>
         <p v-if="vendor === 'chatgpt-queue'" class="text-xs text-slate-500">由 <a href="https://github.com/leeguooooo/image-use" target="_blank" rel="noopener">image-use / chrome-use</a> 提供。每个任务独立上传参考图、生成一张并回填。</p>
         <template v-if="kind === 'video'">
           <VideoSettings v-model="videoOptions" :capability="capability" />
           <label v-if="['first_frame','first_last'].includes(videoOptions.mode || '') && tailMode !== 'tail_first_frame'" class="block text-xs text-slate-400">首帧来源<select v-model="firstShot" class="control" @change="saveOptions"><option v-for="s in currentShots" :key="s.id" :value="s.id">{{ s.id }} {{ s.keyframe ? '已采用关键帧' : '尚未采用关键帧' }}</option></select></label>
           <label v-if="['last_frame','first_last'].includes(videoOptions.mode || '')" class="block text-xs text-slate-400">尾帧来源<select v-model="lastShot" class="control" @change="saveOptions"><option v-for="s in currentShots" :key="s.id" :value="s.id">{{ s.id }} {{ s.keyframe ? '已采用关键帧' : '尚未采用关键帧' }}</option></select></label>
-          <div v-if="capability?.transport === 'public_url' && videoOptions.mode !== 'text'" class="space-y-2"><label v-for="s in currentShots" :key="s.id" class="block text-xs">{{ s.id }} 对应帧公网 URL<input v-model="imageUrls[s.id]" class="control" placeholder="https://…" @change="saveOptions" /></label></div>
           <div v-if="videoOptions.mode === 'reference'" class="space-y-2 text-xs">
             <p v-if="(!capability?.max_audio && audioUrls) || (!capability?.max_video && videoUrls)" class="text-amber-200">此前填写的不支持媒体已保留在设置中，本型号不会提交这些输入。</p>
             <MediaReferences v-if="capability?.max_audio" :key="currentTarget + 'audio'" v-model="audioUrls" :project="app.current" kind="audio" :limit="capability.max_audio" @change="saveOptions" />
             <MediaReferences v-if="capability?.max_video" :key="currentTarget + 'video'" v-model="videoUrls" :project="app.current" kind="video" :limit="capability.max_video" @change="saveOptions" />
           </div>
           <button class="btn btn-sm btn-ghost" :disabled="busy" @click="saveOptions">保存视频参数</button>
-          <label class="block text-xs text-slate-400">当前生成时长（秒）<input :value="duration" type="number" step="0.1" min="0.1" class="control mt-1" @input="editDuration" /></label>
+          <label class="block text-xs text-slate-400">{{ scope === 'V' ? 'V 总时长（秒，随成员 S 时长自动合计，也可在此整体覆盖）' : 'S 生成时长（秒）' }}<input :value="duration" type="number" step="0.1" min="0.1" class="control mt-1" @input="editDuration" /></label>
           <p v-if="capability" class="text-xs text-slate-500">当前适配器：{{ capability.min_duration }}–{{ capability.max_duration }} 秒，最多 {{ capability.max_refs }} 张图</p>
+          <section class="reference-options space-y-3 rounded-xl border border-white/10 p-3">
+            <h3 class="text-sm font-bold text-sky-200">参考素材（本次提交将附带）</h3>
+            <template v-if="scope === 'V' && refMode === 'grid'">
+              <p class="text-2xs text-slate-500">故事板宫格 · 整 V 混排，一次生图调用的九宫格作为整段参考</p>
+              <img v-if="gridCandidate" :src="pathUrl(outputPath(gridCandidate))" class="w-full rounded-lg border border-white/10" alt="宫格参考" />
+              <p v-else class="text-2xs text-amber-300">尚未生成宫格——到 ① 整 V 直出点「生成宫格图」</p>
+            </template>
+            <template v-else-if="scope === 'V' && refMode === 'keyframes'">
+              <p class="text-2xs text-slate-500">关键帧序列 · 本 V 各 S 的已采用关键帧，按 S 顺序提交</p>
+              <div class="flex flex-wrap gap-2">
+                <figure v-for="s in shots" :key="s.id" class="w-[104px]">
+                  <img v-if="keyframeThumb(s)" :src="pathUrl(keyframeThumb(s)!.path)" class="aspect-video w-full rounded-md border border-white/10 object-cover" :alt="s.id" />
+                  <div v-else class="flex aspect-video w-full items-center justify-center rounded-md border border-dashed border-white/10 text-[10px] text-amber-300">缺关键帧</div>
+                  <figcaption class="mt-0.5 text-[10px] text-slate-400">{{ s.id }}</figcaption>
+                </figure>
+              </div>
+            </template>
+            <template v-else-if="scope === 'S'">
+              <p class="text-2xs text-slate-500">单镜参考 · 该 S 的已采用关键帧（首尾帧模式取对应帧）</p>
+              <img v-if="shot?.keyframe?.path" :src="pathUrl(shot.keyframe.path)" class="w-full rounded-lg border border-white/10" :alt="selectedShot" />
+              <p v-else class="text-2xs text-amber-300">{{ selectedShot }} 尚未采用关键帧</p>
+            </template>
+            <p v-else class="text-2xs text-slate-500">纯文本生成（无参考图）</p>
+          </section>
           <section class="reference-options space-y-4 rounded-xl border border-white/10 p-3">
             <h3 class="text-sm font-bold text-sky-200">尾帧与角色音色</h3>
             <fieldset><legend>尾帧关联</legend><div class="space-y-2 mt-2">

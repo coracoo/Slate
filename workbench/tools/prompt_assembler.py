@@ -81,7 +81,7 @@ def skill_positive(project_dir):
     """
     try:
         import skill_lib
-        raw = str(skill_lib.style_for(project_dir, "image") or "").strip()
+        raw = str(skill_lib.resolve_asset_style_text(project_dir)[0] or "").strip()
         if not raw:
             return ""
         blocked = ("三视图", "角色设定图", "场景图可", "纯白背景", "自然站姿", "表情中性")
@@ -389,10 +389,12 @@ def _asset_summary(kind, record):
     if not isinstance(record, dict):
         return {}
     if kind == "character":
+        from character_design import appearance_prompt
         appearance = record.get("appearance") if isinstance(record.get("appearance"), dict) else {}
         return {
             "id": record.get("id", ""), "name": record.get("name", ""), "role": record.get("role", ""),
             "look": appearance.get("look") or "", "outfit": appearance.get("outfit") or "",
+            "appearance": appearance, "appearance_prompt": appearance_prompt(record),
             "lens": record.get("lens") or "", "voice": record.get("voice") or "",
             "sheet_prompt": record.get("sheet_prompt") or record.get("prompt") or "",
             "path": record.get("path") or "",
@@ -454,10 +456,11 @@ def assemble_shot_prompt(shot, project):
     except Exception:
         # 旧项目没有资产注册表时继续按原逻辑装配。
         pass
-    style = _style(project_dir)
     # E10：显式 "auto"（仅知识库、不注 skill）视为未选，不能拼出 @style:auto 假引用
-    image_skill = str(style.get("image") or "").strip()
-    if image_skill == "auto":
+    try:
+        import skill_lib
+        image_skill = str(skill_lib.image_visual_skill_id(project_dir) or "").strip()
+    except Exception:
         image_skill = ""
     image_style_text = skill_positive(project_dir)
     board = project.get("board") if isinstance(project, dict) else None
@@ -481,7 +484,8 @@ def assemble_shot_prompt(shot, project):
     if selected_prompt:
         structured_shot["prompt"] = str(selected_prompt).strip()
         structured_shot["prompt_text"] = str(selected_prompt).strip()
-    regenerated = bool((shot.get("prompt_video_source") if media_type == "video" else shot.get("prompt_source")) == "regenerated" and selected_prompt)
+    regenerated = bool((shot.get("prompt_video_source") if media_type == "video" else
+                        (shot.get("prompt_image_source") or shot.get("prompt_source"))) == "regenerated" and selected_prompt)
     if regenerated:
         visible_chars = set(re.findall(r"@character:[\w-]+", str(selected_prompt)))
         visible_props = set(re.findall(r"@prop:[\w-]+", str(selected_prompt)))
@@ -610,10 +614,11 @@ def assemble_shot_prompt(shot, project):
         additions.append("声音与氛围：" + sound)
     if media_type == "video" and line_text and "台词" not in prompt:
         additions.append("台词：" + line_text)
-    if image_style_text and image_style_text not in prompt:
-        additions.append("图像风格技能指令：" + image_style_text)
     if additions and not regenerated:
         prompt = "\n".join([prompt] + additions) if prompt else "\n".join(additions)
+    # 已重写内容跳过旧剧情字段；当前画风仍由唯一风格层注入。
+    if image_style_text and image_style_text not in prompt:
+        prompt += ("\n" if prompt else "") + "图像风格技能指令：" + image_style_text
     negative_parts = [BASE_NEG]
     skill_neg = _skill_negative(image_skill)
     if skill_neg:
@@ -738,8 +743,8 @@ def _board_episode(board_name):
     return m.group(1) if m else None
 
 
-def _state_ref_for_board(project_dir, zone, rec, board_name):
-    """按集号选状态图：索引 states 里 episodes 含当前集且文件存在的那张；无匹配返回 None。"""
+def _state_ref_for_board(project_dir, zone, rec, board_name, shot=None):
+    """以当前档案的集号、场景和时段匹配状态；索引只提供图片路径。"""
     ep = _board_episode(board_name)
     if not ep:
         return None
@@ -750,11 +755,21 @@ def _state_ref_for_board(project_dir, zone, rec, board_name):
     states = entry.get("states")
     if not isinstance(states, dict):
         return None
+    from asset_matching import state_matches_shot
+    from story_units import load_units
+    units = load_units(project_dir)
+    current_row = next((row for row in units['characters'] if row.get('id') == rec.get('id')), None)
+    current_states = {str(s.get('id')): s for s in (current_row or {}).get('states') or [] if isinstance(s, dict)}
     for sid, meta in states.items():
         if not isinstance(meta, dict):
             continue
-        eps = [str(x) for x in (meta.get("episodes") or [])]
-        if ep in eps:
+        if current_row is not None and sid not in current_states:
+            continue
+        current = current_states.get(sid, meta)
+        if current.get('output_asset_ref'):
+            continue
+        eps = [str(x) for x in (current.get("episodes") or [])]
+        if state_matches_shot(eps, ep, shot or {}, units['scenes'], [e['id'] for e in units['episodes']]):
             path = os.path.join(project_dir, str(meta.get("path") or ""))
             if os.path.isfile(path):
                 return path
@@ -840,7 +855,7 @@ def resolve_shot_refs(shot, project_dir, actors=None, board_name=None, max_refs=
                 found = None
         # 状态资产优先：角色在当前集有状态变体图（<id>__<state>.png）时，身份锚点改用状态版，
         # 保证"反派期引用反派形象、盟友期引用盟友形象"——时间维度不错位。
-        state_hit = _state_ref_for_board(project_dir, "人物", rec, board_name)
+        state_hit = _state_ref_for_board(project_dir, "人物", rec, board_name, shot)
         if state_hit:
             add(state_hit, "身份锚点(状态)")
         else:

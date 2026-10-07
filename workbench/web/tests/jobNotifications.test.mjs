@@ -30,4 +30,9 @@ test('成功、失败、中断、丢失均通知一次，排队不提前完成',
   assert.equal(notices.length,4)
   responses.set(5,{status:'done',ok:true});await timers.shift()();await p
   assert.equal(notices.length,5)
+  responses.set(6,{status:'done',ok:true,out:'[后处理未完成] 头部遮盖：五视图布局不明确\n[完成] 图片已保存'})
+  const warning=trackJob(6,'人物生图');await timers.shift()();await warning
+  assert.equal(notices.length,6)
+  assert.equal(notices[5][1],'info')
+  assert.match(notices[5][0],/后处理未完成.*五视图布局不明确/)
 })

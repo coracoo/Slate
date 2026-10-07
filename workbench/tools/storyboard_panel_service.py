@@ -7,23 +7,13 @@ from storyboard_panels import compile_image_request, fingerprint, validate_board
 
 
 def image_policy(project_dir):
-    style_path = os.path.join(project_dir, "剧本", "style.json")
-    try:
-        with open(style_path, encoding="utf-8") as fh:
-            style = json.load(fh)
-    except (OSError, ValueError):
-        style = {}
-    if not isinstance(style, dict):
-        style = {}
+    import skill_lib
     positive = ""  # 画风来自 image skill
-    image_skill = str(style.get("image") or "").strip()
-    if image_skill == "auto":
-        image_skill = ""  # E10：显式"自动"=不注 skill，避免追加空负面词
+    image_skill = skill_lib.image_visual_skill_id(project_dir)
     negative = ["文字", "水印", "边框", "对白框", "字幕"]
     if image_skill:
         try:
-            import skill_lib
-            raw = str(skill_lib.style_for(project_dir, "image") or "")
+            raw = str(skill_lib.resolve_asset_style_text(project_dir)[0] or "")
             # 旧画风 skill 混有资产三视图规则；先只取适用于剧情画格的段落。
             clean = []
             for line in raw.splitlines():

@@ -8,11 +8,16 @@ import {
   runActing, applyActingCandidate, setActingLock, evaluateActing, fetchEnvConfig, compileActingPrompt,
   fetchActingEvals, type ActingContextResponse, type ActingCandidate, type ActingShot, type ActingEval, type Vendor
 } from '../api'
+import { getJSON } from '../api'
+import BatchDiffReview from '../components/BatchDiffReview.vue'
+import { changedGroups, reviewText, type ReviewItem } from '../utils/reviewDiff'
 import { app, toast, projectFiles, loadBasics } from '../stores/app'
 import { trackJob } from '../stores/jobs'
 import StyledSelect from '../components/StyledSelect.vue'
 import StyleSelect from '../components/StyleSelect.vue'
 import EmptyState from '../components/EmptyState.vue'
+
+const props = withDefaults(defineProps<{embedded?: boolean; selectedCharacterId?: string; selectedCharacterName?: string; profileRevision?: string}>(), {embedded: false, selectedCharacterId: '', selectedCharacterName: '', profileRevision: ''})
 
 const boards = computed(() => projectFiles('分镜').filter((f) => f.startsWith('剧本_') && f.endsWith('.json')))
 const board = ref('')
@@ -24,6 +29,8 @@ const saving = ref(false)
 const running = ref(false)
 const runningShot = ref('')
 const applying = ref('')
+const candidateReviewOpen=ref(false), candidateReviewItems=ref<ReviewItem[]>([]), candidateReviewError=ref('')
+let reviewedCandidate: {project:string;board:string;run:string;revision:string} | null=null
 const evaluating = ref(false)
 const preparing = ref(false)
 const revision = ref('')
@@ -69,18 +76,30 @@ const vendorOptions = computed(() => textVendors.value.map((v) => v.id))
 const vendorLabels = computed<Record<string, string>>(() =>
   Object.fromEntries(textVendors.value.map((v) => [v.id, (v.label || v.id) + ' · ' + (v.models?.text || '')]))
 )
-const shots = computed(() => data.value?.shots || [])
+const selectedActorIds = computed(() => {
+  const actors = data.value?.actors || {}
+  const entries = Array.isArray(actors) ? actors.map(actor => [String(actor.id || ''), actor] as const) : Object.entries(actors)
+  return new Set(entries.filter(([id, actor]) => id === props.selectedCharacterId || (props.selectedCharacterName && actor.name === props.selectedCharacterName)).map(([id]) => id))
+})
+const shots = computed(() => (data.value?.shots || []).filter(shot => !props.selectedCharacterId || shot.actor_ids?.some(id => selectedActorIds.value.has(id))))
+const visibleCandidates = computed(() => candidates.value.filter(candidate => !props.selectedCharacterId || candidate.shot_ids?.some(id => shots.value.some(shot => shot.id === id))))
+watch(() => props.selectedCharacterId, () => { selected.value = new Set(selectableShots.value.map(shot => shot.id)); preview.value = null })
+const actingProgress = computed(() => ({
+  eligible: shots.value.filter(s => s.actor_ids?.length).length,
+  adopted: shots.value.filter(s => ['ready', 'locked'].includes(s.performance_status) && s.performance?.status === 'ready' && !s.performance_check_error).length,
+  stale: shots.value.filter(s => ['stale', 'invalid'].includes(s.performance_status)).length,
+}))
 const selectableShots = computed(() => shots.value.filter((s) => !s.performance_locked && !!s.actor_ids?.length))
 const allSelected = computed(() => selectableShots.value.length > 0 && selectableShots.value.every((s) => selected.value.has(s.id)))
 const someSelected = computed(() => selected.value.size > 0 && !allSelected.value)
 const actorEntries = computed(() => {
   const actors = data.value?.actors || {}
-  if (Array.isArray(actors)) return actors.filter((x) => x.is_main !== false).map((x) => [String(x.id || ''), x] as [string, Record<string, unknown>])
-  return Object.entries(actors).filter(([, actor]) => actor?.is_main !== false)
+  if (Array.isArray(actors)) return actors.filter((x) => x.is_main !== false && (!props.selectedCharacterId || selectedActorIds.value.has(String(x.id || '')))).map((x) => [String(x.id || ''), x] as [string, Record<string, unknown>])
+  return Object.entries(actors).filter(([id, actor]) => actor?.is_main !== false && (!props.selectedCharacterId || selectedActorIds.value.has(id)))
 })
 
 function statusLabel(status: string) {
-  return ({ ready: '已有表演', locked: '已锁定', stale: '已过期', invalid: '校验失败', context_ready: '上下文已准备', pending: '待生成' } as Record<string, string>)[status] || status || '待生成'
+  return ({ ready: '已采用', locked: '已锁定', stale: '需重新生成', invalid: '校验失败', context_ready: '上下文已准备', pending: '待生成' } as Record<string, string>)[status] || status || '待生成'
 }
 function statusClass(status: string) {
   return ({ ready: 'bg-emerald-400/15 text-emerald-300', locked: 'bg-amber-400/15 text-amber-300', stale: 'bg-orange-400/15 text-orange-300', invalid: 'bg-rose-400/15 text-rose-300', context_ready: 'bg-cyan-400/15 text-cyan-300' } as Record<string, string>)[status] || 'bg-white/5 text-slate-500'
@@ -89,7 +108,11 @@ function performanceSummary(s: ActingShot) {
   const p = s.performance as any
   const actors = p?.packet?.actors || p?.actors || []
   if (!Array.isArray(actors)) return ''
-  return actors.flatMap((actor: any) => (actor?.beats || []).map((beat: any) => [beat?.intent, beat?.posture, beat?.gaze, beat?.gesture, beat?.expression].filter(Boolean).join('；'))).filter(Boolean).join(' · ')
+  return actors.flatMap((actor: any) => (actor?.beats || []).map((beat: any) => [beat?.visible_action, beat?.posture, beat?.gaze, beat?.gesture, beat?.expression, beat?.voice].filter(Boolean).join('；'))).filter(Boolean).join(' · ')
+}
+function sourceLabel(source: unknown) {
+  if (!source) return '登记事实，未关联原文依据'
+  return typeof source === 'string' ? source : JSON.stringify(source)
 }
 function toggle(id: string) {
   if (!selectableShots.value.some((shot) => shot.id === id)) return
@@ -136,7 +159,7 @@ async function load() {
     actorCards.value = (ctx.actor_cards as Record<string, Record<string, unknown>> || {})
     memoryText.value = String(ctx.notes || '')
     snapshotContext()
-    selected.value = new Set(result.shots.filter((s) => !s.performance_locked && !!s.actor_ids?.length).map((s) => s.id))
+    selected.value = new Set(selectableShots.value.map((s) => s.id))
     if (!vendorId.value && textVendors.value.length) vendorId.value = textVendors.value.at(-1)!.id
     void loadEvals()
   } catch (e) {
@@ -274,13 +297,33 @@ async function lockShot(s: ActingShot) {
 }async function apply(c: ActingCandidate) {
   if (!app.current || !board.value || !['performance', 'context'].includes(c.candidate_kind)) return
   if (!confirmDiscardEdits()) return
+  const project=app.current, name=board.value
   applying.value = c.run_id
   try {
-    const r = await applyActingCandidate({ project: app.current, storyboard: board.value, run_id: c.run_id, revision: revision.value })
+    if(!c.path) throw new Error('候选内容缺失，请刷新候选列表。')
+    const candidate=await getJSON<{context?:Record<string,unknown>;performances?:Record<string,unknown>}>(`/media?p=${encodeURIComponent(`projects/${project}/${c.path}`)}`)
+    if(project!==app.current || name!==board.value) return
+    const groups=c.candidate_kind==='context' ? changedGroups(data.value?.context || {},candidate.context || {},{actor_cards:'角色理解',facts:'事实',events:'连续性事件'})
+      : Object.entries(candidate.performances || {}).map(([id,after])=>({label:`${id} · 镜内表演`,before:reviewText(data.value?.shots.find(s=>s.id===id)?.performance),after:reviewText(after)}))
+    reviewedCandidate={project,board:name,run:c.run_id,revision:revision.value}
+    candidateReviewItems.value=[{id:c.run_id,title:c.candidate_kind==='context'?'角色理解与连续性':'镜内表演',groups,
+      disabledReason:c.status!=='ready'?'候选尚未通过校验，不能采用':undefined}]
+    candidateReviewError.value='';candidateReviewOpen.value=true
+  } catch(e) {toast(e instanceof Error?e.message:'读取候选失败','err')}
+  finally {applying.value=''}
+}
+async function submitCandidate() {
+  const reviewed=reviewedCandidate
+  if(!reviewed || reviewed.project!==app.current || reviewed.board!==board.value) return
+  applying.value=reviewed.run
+  try {
+    const r = await applyActingCandidate({ project: reviewed.project, storyboard: reviewed.board, run_id:reviewed.run, revision:reviewed.revision })
+    candidateReviewOpen.value=false
     revision.value = r.revision
     toast(r.changed_shots.length ? '已应用 ' + r.changed_shots.join('、') + ' 的表演' : '候选已处理', 'ok')
     await load()
   } catch (e) {
+    candidateReviewError.value=e instanceof Error?e.message:'应用候选失败'
     toast(e instanceof Error ? e.message : '应用候选失败', 'err')
     await load()
   } finally { applying.value = '' }
@@ -293,29 +336,43 @@ watch(() => [app.current, app.projects, boards.value.join('|')], () => {
   if (board.value) void load()
   else data.value = null
 }, { immediate: true })
-watch(board, () => { requestSeq++; void load() })
+watch(board, () => { candidateReviewOpen.value=false; requestSeq++; void load() })
+watch(()=>app.current,()=>{candidateReviewOpen.value=false})
+watch(() => props.profileRevision, (value, old) => {
+  if (!old || value === old) return
+  if (contextDirty()) { toast('全剧角色资料已更新；当前镜内未保存编辑已保留，保存后可重新读取。', 'ok'); return }
+  void load()
+})
 useBoardSelection(board, boards, 'acting')
 </script>
 
 <template>
-  <div class="page">
-    <header class="mb-6">
+  <div :class="embedded ? 'min-w-0' : 'page'">
+    <header v-if="!embedded" class="mb-6">
       <h1 class="grad-text text-2xl font-black">⑤ 演员表现</h1>
-      <p class="mt-1 text-xs text-slate-500">主角演员由人物.json 的主角角色档案自动进入；这里的“新生成/重新生成”指本镜表演候选，生成表情、视线、姿态和节奏后可在右侧审核应用。配角和群演不会进入演员层，机位、走位、台词和时长始终由分镜锁定。</p>
+      <p class="mt-1 text-sm text-slate-400">精修主角的动作、视线、情绪与对白节奏。候选经审核采用后，自动进入关键帧与视频提示词。</p>
     </header>
     <EmptyState v-if="!app.current" title="请先在左侧选择项目" />
     <template v-else>
+      <section class="glass mb-4 flex flex-wrap items-center gap-3 p-3 text-xs" aria-label="表演制作状态">
+        <span class="text-slate-300">准备角色理解 → 生成候选 → 审核采用 → 创作生成</span>
+        <span class="ml-auto text-slate-300">主角镜头 {{ actingProgress.eligible }}</span>
+        <span class="text-emerald-300">已采用 {{ actingProgress.adopted }}</span>
+        <span v-if="actingProgress.stale" class="text-amber-300">待更新 {{ actingProgress.stale }}</span>
+        <RouterLink to="/create" class="text-sky-200 hover:underline">前往创作生成 →</RouterLink>
+        <p class="w-full text-slate-400">适用于对白、情绪转折与连续性精修；普通动作镜头可直接创作。过期表演需重新采用，锁定仅保护人工选择。</p>
+      </section>
       <div class="glass mb-4 flex flex-wrap items-end gap-3 p-4">
         <label class="text-xs text-slate-400">分镜
           <StyledSelect v-model="board" class="mt-1 min-w-56" :options="boards" :storage-key="`wb.${app.current}.acting.board`" placeholder="— 选择分镜 —" />
         </label>
         <StyleSelect target="acting" label="表演风格" />
-        <label class="text-xs text-slate-400">文本厂商
+        <label class="text-xs text-slate-400">表演模型
           <StyledSelect v-model="vendorId" class="mt-1 min-w-56" :options="vendorOptions" :labels="vendorLabels" :storage-key="`wb.${app.current}.acting.vendor`" placeholder="— 选择 —" />
         </label>
         <button class="btn" :disabled="saving || loading || !data" @click="() => saveContext()">{{ saving ? '保存中…' : '保存角色卡/记忆' }}</button>
-        <button class="btn btn-ghost" :disabled="!data || loading || preparing || !board" @click="prepare">演员读剧本</button>
-        <button class="btn btn-ghost" :disabled="running || !selected.size || !vendorId" @click="runSelected" title="为选中且关联主角的镜头新生成或重新生成演员表演候选；只补表情、视线、姿态和节奏">{{ running ? '生成中…' : '演员生成表现' }}</button>
+        <button class="btn btn-ghost" :disabled="!data || loading || preparing || !board" @click="prepare">准备角色理解</button>
+        <button class="btn btn-ghost" :disabled="running || !selected.size || !vendorId" @click="runSelected" title="为选中且关联主角的镜头新生成或重新生成演员表演候选；只补表情、视线、姿态和节奏">{{ running ? '生成中…' : '生成表演候选' }}</button>
         <button class="btn btn-ghost" :disabled="evaluating || !selected.size || !vendorId" @click="startEvaluation" title="A=裸分镜 B=+导演风格 C=+风格+角色卡记忆；LLM 裁判逐镜对比评分，不调用生视频">{{ evaluating ? '评分中…' : '演员评分' }}</button>
       </div>
 
@@ -354,11 +411,11 @@ useBoardSelection(board, boards, 'acting')
         <section class="space-y-4">
           <div class="glass p-4">
             <div class="mb-3 flex items-center gap-2">
-              <h2 class="text-sm font-bold text-slate-200">主角角色卡与连续性记忆</h2>
+              <h2 class="text-sm font-bold text-slate-200">镜内角色卡与连续性记忆</h2>
               <span class="text-2xs text-slate-500">仅主角 · 字段保存在 acting_context，不覆盖视觉站位</span>
             </div>
-            <p class="mb-3 text-xs-plus leading-5 text-slate-500">角色卡优先读取人物.json 的 acting 字段；缺失时从大纲角色提示自动补齐。这里只显示主角，重新提炼资产后可获得完整的性格、目标、关系和表达规则。</p>
-            <textarea v-model="memoryText" class="textarea mb-3 min-h-20" placeholder="本项目表演记忆：关系变化、情绪基线、不可违背的角色规则…"></textarea>
+            <p class="mb-3 text-xs-plus leading-5 text-slate-500">角色卡优先读取人物.json 的 acting 字段；缺失时从大纲角色提示自动补齐。这里是本分镜的角色理解与连续性记录；全剧角色资料在上方「角色设定」维护，镜内已采用表演需显式重新生成并采用。</p>
+            <textarea v-model="memoryText" class="textarea mb-3 min-h-20" placeholder="本分镜表演记忆：关系变化、情绪基线、不可违背的角色规则…"></textarea>
             <div class="grid gap-3 md:grid-cols-2">
               <article v-for="[id, actor] in actorEntries" :key="id" class="rounded-xl border border-line bg-black/20 p-3">
                 <div class="mb-2 flex items-center gap-2">
@@ -414,6 +471,20 @@ useBoardSelection(board, boards, 'acting')
                     </div>
                     <p class="mt-1 text-xs-plus leading-relaxed text-slate-400">{{ s.action || s.prompt || '—' }}</p>
                     <p v-if="performanceSummary(s)" class="mt-1 rounded bg-emerald-400/5 px-2 py-1 text-2xs leading-relaxed text-emerald-200/80">表演：{{ performanceSummary(s) }}</p>
+                    <details v-if="s.continuity && s.actor_ids?.length" class="mt-2 rounded-lg border border-line-soft p-2">
+                      <summary class="cursor-pointer text-xs text-sky-200">角色知情与事件依据</summary>
+                      <p v-for="warning in s.continuity.warnings" :key="warning" class="mt-2 text-xs leading-5 text-amber-200">{{ warning }}</p>
+                      <p class="mt-2 text-xs text-slate-400">{{ s.continuity.beat_count ? '展示首个表演节拍的知情快照；后续节拍由各自事件时点计算。' : '当前镜头使用的角色知情快照。' }}</p>
+                      <div v-for="actor in s.continuity.actors" :key="actor.id" class="mt-2 rounded bg-sky-400/5 p-2 text-xs leading-6">
+                        <b class="text-sky-200">{{ actor.name }}</b>
+                        <p v-if="!actor.facts.length" class="text-slate-400">尚无已知事实登记</p>
+                        <div v-for="fact in actor.facts" :key="fact.id" class="mt-1 text-slate-200"><p>{{ fact.id }} · {{ fact.text }}</p><p class="text-slate-400">来源：{{ sourceLabel(fact.source) }}</p></div>
+                        <p v-if="actor.state.emotion" class="text-slate-300">情绪：{{ actor.state.emotion }}</p>
+                        <p v-if="actor.state.relationships" class="text-slate-300">关系：{{ sourceLabel(actor.state.relationships) }}</p>
+                      </div>
+                      <p v-if="s.continuity.events.length" class="mt-2 text-xs text-slate-300">已应用事件：{{ s.continuity.events.map(e => e.id + ' · ' + e.label).join('；') }}</p>
+                      <p class="mt-2 text-xs text-slate-400">剧情事实来自连续性登记；表演动作是候选建议，需人工采用。</p>
+                    </details>
                   </div>
                 </div>
               </article>
@@ -437,13 +508,13 @@ useBoardSelection(board, boards, 'acting')
           <div class="mb-3 flex gap-1.5">
             <button v-for="m in [{k:'style',n:'风格'}, {k:'stateful',n:'状态'}]" :key="m.k" class="flex-1 rounded-lg border px-2 py-1.5 text-2xs" :class="mode === m.k ? 'border-cyan-400/50 bg-cyan-400/10 text-cyan-200' : 'border-line text-slate-500'" @click="mode = m.k as typeof mode">{{ m.n }}</button>
           </div>
-          <div v-if="!candidates.length" class="py-10 text-center text-sm text-slate-500">还没有候选草稿</div>
-          <div v-for="c in candidates" :key="c.run_id" class="mb-2 rounded-lg border border-line bg-black/20 p-2.5">
+          <div v-if="!visibleCandidates.length" class="py-10 text-center text-sm text-slate-500">还没有候选草稿</div>
+          <div v-for="c in visibleCandidates" :key="c.run_id" class="mb-2 rounded-lg border border-line bg-black/20 p-2.5">
             <div class="flex items-center gap-2">
               <b class="text-2xs text-slate-300">{{ c.candidate_kind === 'performance' ? '表演' : '上下文' }}</b>
               <span class="text-2xs text-slate-500">{{ c.status }}</span>
               <span class="flex-1"></span>
-              <button class="btn btn-sm" :disabled="applying === c.run_id" @click="apply(c)">{{ applying === c.run_id ? '应用中…' : '应用' }}</button>
+              <button class="btn btn-sm" :disabled="!!applying" @click="apply(c)">{{ applying === c.run_id ? '处理中…' : '审核采用' }}</button>
             </div>
             <div class="mt-1 text-2xs text-slate-500">{{ (c.shot_ids || []).join('、') }} · {{ c.created_at || '' }}</div>
           </div>
@@ -451,6 +522,7 @@ useBoardSelection(board, boards, 'acting')
       </div>
     </template>
   </div>
+  <BatchDiffReview v-model:open="candidateReviewOpen" title="审核角色表演候选" :items="candidateReviewItems" :busy="!!applying" :error="candidateReviewError" submit-label="确认采用" @confirm="submitCandidate" />
 </template>
 
 

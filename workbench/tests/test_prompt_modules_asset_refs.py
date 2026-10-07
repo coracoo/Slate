@@ -44,11 +44,13 @@ class PromptModuleAssetRefTests(unittest.TestCase):
         self.assertIn("@character:<id>", prepare_sys)
         self.assertIn("@character:<id>", perform_sys)
 
-    def test_storyboard_prompt_requires_natural_prompt_before_json(self):
+    def test_storyboard_prompt_requires_independent_prompts_inside_json(self):
         from prompt_modules import storyboard_prompt
         system, _ = storyboard_prompt("白咲蛛绪从天花板坠落。", [], [], [])
-        self.assertIn("JSON 上方", system)
-        self.assertIn("100~160 字", system)
+        self.assertNotIn("JSON 上方", system)
+        self.assertIn("只输出一个 JSON 对象", system)
+        self.assertIn("prompt_image", system)
+        self.assertIn("prompt_video", system)
         self.assertIn("negative", system)
         self.assertIn("台词由后期叠加", system)
 

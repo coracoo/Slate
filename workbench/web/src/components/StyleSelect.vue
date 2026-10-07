@@ -6,61 +6,75 @@
  *  "auto" 是显式的"自动"，下拉显示为「自动（仅知识库）」，选它会显式写 "auto"
  *  （而不是删键——删键会被后端默认填入重新解析成唯一启用者，违背用户选择）。 */
 import { ref, computed, watch } from 'vue'
-import { getJSON, postJSON, type SkillItem } from '../api'
+import { type SkillItem } from '../api'
 import StyledSelect from './StyledSelect.vue'
 import { app, toast } from '../stores/app'
+import { fetchStyleOptions, saveProjectStyle } from '../utils/styleOptions'
 
-const props = defineProps<{ target: 'storyboard' | 'image' | 'script' | 'acting' | 'anchor'; label: string; hint?: string }>()
+type StyleTarget = 'storyboard' | 'image' | 'script' | 'acting' | 'anchor'
+  | 'script_structure' | 'script_pacing' | 'script_continuity'
+  | 'storyboard_camera' | 'storyboard_keyframe' | 'storyboard_motion' | 'image_identity'
+const props = defineProps<{ target: StyleTarget; label: string; hint?: string }>()
 const emit = defineEmits<{ changed: [] }>()
 const current = defineModel<string>({ default: '' })
 
 const isAnchor = computed(() => props.target === 'anchor')
+const isDimension = computed(() => props.target.startsWith('script_') || props.target.startsWith('storyboard_') || props.target === 'image_identity')
+const legacyTarget = computed(() => props.target.startsWith('script_') ? 'script' : props.target === 'image_identity' ? 'image' : 'storyboard')
+const emptyChoice = computed(() => isDimension.value ? '不使用' : '自动')
 const customMode = ref(false)
 const customText = ref('')
 
 const skills = ref<SkillItem[]>([])
+const allSkills = ref<SkillItem[]>([])
+const projectStyle = ref<Record<string, string>>({})
 const opts = computed(() => isAnchor.value
   ? ['自定义画风'].concat(skills.value.map((x) => x.id))
-  : ['自动'].concat(skills.value.map((x) => x.id)))
+  : [emptyChoice.value].concat(skills.value.map((x) => x.id)))
 const labels = computed<Record<string, string>>(() => {
   const m = Object.fromEntries(skills.value.map((s) => [s.id, `${s.name} — ${s.description.slice(0, 18)}`]))
   if (isAnchor.value) m['自定义画风'] = '自己写一句画风描述'
-  else m['自动'] = '自动（仅知识库）'
+  else m[emptyChoice.value] = isDimension.value ? '不使用此方法' : '自动（仅知识库）'
   return m
 })
 
+let loadSequence = 0
 async function load() {
-  if (!app.current) return
+  const project = app.current, sequence = ++loadSequence
+  if (!project) return
   try {
-    skills.value = ((await getJSON<{ skills: SkillItem[] }>('/api/skills')).skills || [])
-      .filter((s) => s.target === (props.target === 'anchor' ? 'image' : props.target) && s.enabled)
-  } catch { skills.value = [] }
-}
-watch(() => app.current, load, { immediate: true })
-
-// 回显项目当前显式选择（"auto"/缺失都归为「自动」；anchor 模式回显锚定句本身）
-watch(() => app.current, async () => {
-  try {
-    const d = await getJSON<{ style?: Record<string, string> }>(`/api/script/data?project=${encodeURIComponent(app.current)}`)
+    const d = await fetchStyleOptions(project)
+    if (sequence !== loadSequence || project !== app.current) return
+    allSkills.value = d.skills || []
+    skills.value = allSkills.value
+      .filter((s) => (isDimension.value ? s.dimension === props.target
+        : s.target === (props.target === 'anchor' ? 'image' : props.target)
+          && (!['image', 'anchor'].includes(props.target) || s.dimension !== 'image_identity')) && s.enabled)
+    projectStyle.value = d.style || {}
     if (isAnchor.value) {
-      const a = d.style?.anchor || ''
+      const a = projectStyle.value.anchor || ''
       current.value = a || '自定义画风'
       customMode.value = !!a
       customText.value = a
     } else {
-      const v = (d.style?.[props.target] || '').trim()
-      current.value = v && v !== 'auto' ? v : '自动'
+      const direct = (projectStyle.value[props.target] || '').trim()
+      const legacy = isDimension.value ? (projectStyle.value[legacyTarget.value] || '').trim() : ''
+      const value = direct === 'auto' ? ''
+        : (direct && skills.value.some((s) => s.id === direct) ? direct : '')
+          || (skills.value.some((s) => s.id === legacy) ? legacy : '')
+      current.value = value && value !== 'auto' ? value : emptyChoice.value
     }
-  } catch { current.value = isAnchor.value ? '自定义画风' : '自动' }
-}, { immediate: true })
+  } catch { if (sequence === loadSequence) { skills.value = []; toast('风格选项载入失败，请刷新重试', 'err') } }
+}
+watch(() => app.current, load, { immediate: true })
 
 async function persist(mutate: (style: Record<string, string>) => void) {
-  if (!app.current) return false
+  const project = app.current
+  if (!project) return false
   try {
-    const d = await getJSON<{ style?: Record<string, string> }>(`/api/script/data?project=${encodeURIComponent(app.current)}`)
-    const style = { ...(d.style || {}) }
-    mutate(style)
-    await postJSON('/api/skills/style', { project: app.current, style })
+    const style = await saveProjectStyle(project,mutate)
+    if (project !== app.current) return false
+    projectStyle.value = style
     emit('changed')
     return true
   } catch (e) {
@@ -80,18 +94,23 @@ async function onChange(v: string) {
     const hit = skills.value.find((x) => x.id === v)
     customText.value = hit ? `${hit.name}风格` : v
     customMode.value = false
+    const anchor = customText.value
     const saved = await persist((st) => {
-      st.anchor = customText.value
+      st.anchor = anchor
       st.image = v
     })
     if (saved) toast(`画风锚定：${customText.value}`, 'ok', 2500)
     return
   }
   const saved = await persist((style) => {
+    if (props.target === 'image' && !style.image_identity) {
+      const old = allSkills.value.find((s) => s.id === style.image)
+      if (old?.dimension === 'image_identity') style.image_identity = old.id
+    }
     // E10：「自动」写成显式 "auto"——删键会被默认填入当成"未选择"重新解析
-    style[props.target] = v === '自动' ? 'auto' : v
+    style[props.target] = v === emptyChoice.value ? 'auto' : v
   })
-  if (saved) toast(`${props.label}：${v === '自动' ? '自动（仅知识库）' : v}`, 'ok', 2500)
+  if (saved) toast(`${props.label}：${v === emptyChoice.value ? labels.value[emptyChoice.value] : v}`, 'ok', 2500)
 }
 
 async function saveCustom() {

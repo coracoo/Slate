@@ -47,7 +47,13 @@ def build_qwen21_workflow(prompt, negative, model, *, width, height, seed, refer
         graph["4"]["inputs"][f"images.image_{i}"] = [nid, 0]
     if reference_images:
         graph["4"]["inputs"]["vae"] = ["3", 0]
-        # 使用指定画幅的画布，参考图仅作为条件，避免母图三视图尺寸接管输出。
+        # 参考潜空间与采样画布必须同尺寸；解码后再适配请求的输出画幅。
+        graph["7"]["inputs"]["latent_image"] = ["4", 2]
+        del graph["6"]
+        graph["11"] = {"class_type": "ImageScale", "inputs": {
+            "image": ["8", 0], "upscale_method": "lanczos", "width": int(width),
+            "height": int(height), "crop": "center"}}
+        graph["10"]["inputs"]["images"] = ["11", 0]
     return graph
 
 
@@ -393,6 +399,15 @@ class ComfyUIClient:
                         raw = self._bytes("/view?" + params, timeout=60)
                         if not raw:
                             raise ComfyUIError("ComfyUI 返回空图片")
+                        cached = {str(node) for msg in status.get('messages', [])
+                                  if isinstance(msg, list) and len(msg) > 1 and msg[0] == 'execution_cached'
+                                  and isinstance(msg[1], dict) for node in msg[1].get('nodes', [])}
+                        samplers = {str(node) for node, spec in graph.items()
+                                    if isinstance(spec, dict) and spec.get('class_type') in
+                                    ('KSampler', 'KSamplerAdvanced', 'SamplerCustom', 'SamplerCustomAdvanced')}
+                        if samplers:
+                            print(f"[ComfyUI] 节点缓存 {len(cached)}/{len(graph)}；采样节点缓存 "
+                                  f"{len(cached & samplers)}/{len(samplers)}；输出 {image.get('filename', '')}", flush=True)
                         with open(out_path, "wb") as fh:
                             fh.write(raw)
                         return out_path
@@ -497,7 +512,7 @@ def _generate_image(self, prompt, out_path, *, model, negative_prompt="", image_
         "effective_prompt": effective_prompt, "negative_mode": negative_mode,
         "reference_count": len(refs), "mode": mode or "z_image_builtin",
     }
-    print(f"[ComfyUI] 工作流={mode}；模型={model}；参考图={len(refs)}", flush=True)
+    print(f"[ComfyUI] 工作流={mode}；模型={model}；参考图={len(refs)}；随机种子={seed}", flush=True)
     return self.run_workflow(graph, out_path, timeout=timeout)
 
 

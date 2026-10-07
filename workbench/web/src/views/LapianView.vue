@@ -5,7 +5,7 @@ import { ref, computed, watch, nextTick } from 'vue'
 import {
   fetchAnalysisList, fetchAnalysis, saveAnalysis, deleteAnalysis, runAnalysis, exportAnalysisXlsx,
   runAnalysisAi, reshotShots, whiteFromAnalysis, fetchWhiteBoard, fetchAnalysisXlsxView,
-  mergeAnalysisLines, fetchEnvConfig, fmtT, mediaUrl, buildKnowledge, fetchKnowledge,
+  mergeAnalysisLines, fetchEnvConfig, fmtT, mediaUrl,
   type Analysis, type AnalysisMeta, type AnalysisShot, type Vendor, type WhiteBoard
 } from '../api'
 import { app, materialVideos, projectFiles, loadBasics, toast } from '../stores/app'
@@ -55,31 +55,6 @@ const whiteBoard = computed(() => {
   const fn = `${currentName.value}.json`
   return projectFiles('分镜', /\.json$/i).includes(fn) ? fn : ''
 })
-
-/** 把全部拉片成果归纳成经验卡片（自动卡；用户卡片不受影响）。创作时这些卡自动垫上下文。 */
-const kbBusy = ref(false)
-async function precipitate() {
-  kbBusy.value = true
-  try {
-    const before = await fetchKnowledge()
-    await buildKnowledge()
-    setTimeout(async () => {
-      try {
-        const after = await fetchKnowledge()
-        const delta = (after.skills?.length || 0) - (before.skills?.length || 0)
-        toast(`已沉淀 ${after.skills?.length || 0} 张经验卡（新增 ${Math.max(0, delta)}）；可在 Skill 中心「经验卡片」查看/编辑/转为 Skill`, 'ok', 6000)
-      } catch (e) {
-        // 二次统计失败不能当成功报：否则卡片其实没落库，页面却提示"已沉淀"
-        toast('沉淀任务已提交，但读取卡片统计失败：' + (e instanceof Error ? e.message : '未知错误'), 'err', 6000)
-      } finally {
-        kbBusy.value = false
-      }
-    }, 2500)
-  } catch (e) {
-    toast(e instanceof Error ? e.message : '沉淀失败', 'err')
-    kbBusy.value = false
-  }
-}
 
 async function genWhiteBoard() {
   if (!app.current || !currentName.value) return
@@ -542,12 +517,7 @@ watch(() => app.current, () => {
   <div class="page">
     <header class="mb-6">
       <h1 class="grad-text text-2xl font-black">① 拉片结构</h1>
-      <p class="mt-1 text-xs text-slate-500">切点检测 + 关键帧抽取 + 结构化镜头语言（景别 / 运镜 / 角度 / 光线 / 叙事）</p>
-      <button class="btn btn-ghost mt-2" :disabled="kbBusy"
-        title="把全部拉片成果归纳成经验卡片（正反打/快切/对峙/仰视压迫/长镜台词轨…），创作时自动垫上下文；手动卡片不受影响"
-        @click="precipitate">
-        {{ kbBusy ? '沉淀中…' : '⬇ 沉淀为经验卡' }}
-      </button>
+      <p class="mt-1 text-sm text-slate-400">从源视频提取镜头结构，编辑景别、运镜与叙事信息。</p>
     </header>
 
     <!-- 工具条 -->

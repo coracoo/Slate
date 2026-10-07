@@ -16,6 +16,10 @@ import AssetCard from '../components/AssetCard.vue'
 import OverlayViewer from '../components/OverlayViewer.vue'
 import ChatGPTRunPanel from '../components/ChatGPTRunPanel.vue'
 import EmptyState from '../components/EmptyState.vue'
+import BatchDiffReview from '../components/BatchDiffReview.vue'
+import AppearanceReviewButton from '../components/AppearanceReviewButton.vue'
+import { changedGroups, type ReviewItem } from '../utils/reviewDiff'
+import { generationReference, generationReferenceChoices } from '../utils/assetGenerationReference'
 import { assetMentionContext, extractAssetRefs, filterAssetMentionCandidates, type AssetMentionContext } from '../utils/assetMentions'
 
 type CreateKind = 'character' | 'scene' | 'prop'
@@ -27,13 +31,20 @@ type CreateForm = {
   related_refs: string
   role: string
   prop_kind: string
+  derived_from: string
 }
 
 const data = ref<ScriptBundle | null>(null)
+const visualReview = ref<InstanceType<typeof AppearanceReviewButton> | null>(null)
+function reviewVisual(owner:string,state?:string) {
+  detailAsset.value=null
+  visualReview.value?.openTarget(owner,state)
+}
 const assets = ref<AssetRegistryItem[]>([])
 const vendors = ref<Vendor[]>([])
 const vendorId = ref('')
 const episode = ref('')
+const includeUnused = ref(false)
 const busy = ref(false)
 const genning = ref('')
 const imageRevision = ref(0)
@@ -45,11 +56,19 @@ const createParentRef = ref('')
 const createSaving = ref(false)
 const childGenVisible = ref(false)
 const childGenAsset = ref<AssetRegistryItem | null>(null)
-const detailAsset = ref<AssetRegistryItem | null>(null), regenBusy = ref(false)
+const detailAsset = ref<AssetRegistryItem | null>(null)
+const detailChildren = computed(() => (detailAsset.value?.children_refs || []).map(r => assetByRef.value.get(r)?.name || r))
+const detailRelatedOut = computed(() => (detailAsset.value?.related_refs || []).map(r => assetByRef.value.get(r)?.name || r))
 const detailEditing = ref(false)
 const detailSaving = ref(false)
+const assetReviewOpen=ref(false), assetReviewItems=ref<ReviewItem[]>([]), assetReviewError=ref('')
+let reviewedAsset:{project:string;ref:string;patch:Record<string,unknown>;revision?:number} | null=null
 const detailName = ref('')
 const detailPrompt = ref('')
+const detailVisual = ref('')
+const detailDerivedFrom = ref('')
+const detailReferenceChoices = computed(() => generationReferenceChoices(assets.value, detailAsset.value?.ref))
+const createReferenceChoices = computed(() => generationReferenceChoices(assets.value))
 /** 资产级画风覆盖：'' = 跟随项目生图风格；imageSkills = 可选的生图 skill 清单。 */
 const detailStyle = ref('')
 /** 资产级画风自由文本（画风层最高优先级）；空 = 用上方 skill / 项目默认。 */
@@ -85,7 +104,7 @@ const importReady = computed(() => importReview.value.length > 0 &&
   importReview.value.every(row => !!row.jobId) &&
   new Set(importReview.value.map(row => row.jobId)).size === importReview.value.length)
 const createForm = reactive<CreateForm>({
-  kind: 'character', id: '', name: '', prompt: '', related_refs: '', role: '主角', prop_kind: '关联素材'
+  kind: 'character', id: '', name: '', prompt: '', related_refs: '', role: '主角', prop_kind: '关联素材', derived_from: ''
 })
 
 const episodes = computed(() => data.value?.episodes || [])
@@ -133,12 +152,23 @@ const detailRelationAssets = computed(() => {
       return true
     })
 })
-const queueableAssets = computed(() => assets.value.filter(a => a.kind !== 'style' && fromEpisode(a)))
+const plannedAssets = computed(() => data.value?.prompt_flow?.script_workflow?.managed || assets.value.some(a => a.visual_status?.source === '剧本规划设定'))
+const pendingVisualAssets = computed(() => assets.value.filter(a => a.kind !== 'style' && fromEpisode(a) && a.visual_status?.archive_present !== false && a.visual_status && !a.visual_status.ready))
+const requiredVisualAssets = computed(() => pendingVisualAssets.value.filter(a=>a.in_use!==false))
+const unusedVisualAssets = computed(() => pendingVisualAssets.value.filter(a=>a.in_use===false))
+const reviewVisibleRefs = computed(() => assets.value.filter(a=>a.kind!=='style' && a.visual_status?.archive_present!==false && fromEpisode(a)).map(a=>a.ref))
+const queueableAssets = computed(() => assets.value.filter(a => a.kind !== 'style' && fromEpisode(a) && a.visual_status?.archive_present !== false && a.visual_status?.ready !== false))
 
 function assetRef(kind: string, id: string) { return '@' + kind + ':' + id }
 function registryFor(kind: string, id: string) { return assetByRef.value.get(assetRef(kind, id)) }
 function fromEpisode(item: any) {
+  const currentAsset = item?.ref ? assetByRef.value.get(item.ref) : assets.value.find(a=>a.id===item?.id)
+  if(plannedAssets.value && !includeUnused.value && currentAsset?.in_use===false) return false
   if (!episode.value) return true
+  const current = episodes.value.find(e => e.id === episode.value)
+  const refs = [...(current?.cast_refs || []), ...(current?.scene_refs || []), ...(current?.key_asset_refs || [])]
+  const ref = item?.ref || assets.value.find(a => a.id === item?.id)?.ref
+  if (ref && refs.includes(ref)) return true
   const ids = item?.source_episode_ids || item?.source_episodes || []
   return Array.isArray(ids) && ids.map(String).includes(String(episode.value))
 }
@@ -158,12 +188,13 @@ const props = computed(() => (data.value?.props?.props || [])
   .filter((x) => fromEpisode(x))
   .filter((x) => !registryFor('prop', x.id)?.parent_ref))
 const mothers = computed(() => assets.value.filter(a =>
-  a.kind !== 'style' && !a.parent_ref && !a.derived_from && fromEpisode(a)))
+  a.kind !== 'style' && a.visual_status?.archive_present !== false && !a.parent_ref && !a.derived_from && fromEpisode(a)))
 const childCount = computed(() => assets.value.filter(a => a.kind !== 'style' && a.parent_ref).length)
 function childrenOf(ref: string) {
   return assets.value.filter(a => a.kind !== 'style' && a.parent_ref === ref && fromEpisode(a))
 }
 function relationLabel(row: AssetRegistryItem) {
+  if (row.derived_from?.includes('#')) return '子素材 · 参考：' + (generationReference(row, assets.value)?.name || row.derived_from)
   if (row.relation === 'component_of') return '组成部件'
   if (row.relation === 'located_in') return '场景内'
   if (row.relation === 'variant_of') return '变体'
@@ -201,7 +232,9 @@ function openAssetDetails(row?: AssetRegistryItem) {
   detailAsset.value = row
   detailEditing.value = false
   detailName.value = row.name || ''
-  detailPrompt.value = row.prompt || ''
+  detailPrompt.value = row.prompt_editable ?? row.prompt ?? ''
+  detailVisual.value = row.visual_description || ''
+  detailDerivedFrom.value = row.derived_from || ''
   detailStyle.value = row.style || ''
   detailStylePrompt.value = row.style_prompt || ''
   detailPromptRefs.value = extractAssetRefs(detailPrompt.value)
@@ -299,26 +332,42 @@ function removeDetailAssetRef(ref: string) {
 function assetKindLabel(kind?: string) {
   return kind === 'character' ? '人物' : kind === 'scene' ? '场景' : kind === 'prop' ? '道具' : kind || '素材'
 }
-async function saveAssetEdit() {
+function openAssetEditReview() {
   const row = detailAsset.value
   if (!row || !app.current || !detailName.value.trim()) return
+  updateDetailPromptRefs()
+  const patch={
+      name: detailName.value.trim(),
+      ...(detailPrompt.value !== (row.prompt_editable ?? row.prompt ?? '') ? { prompt: detailPrompt.value } : {}),
+      ...(row.kind !== 'character' && detailVisual.value !== (row.visual_description || '') ? {visual_description:detailVisual.value} : {}),
+      related_refs: detailPromptRefs.value,
+      ...(detailDerivedFrom.value !== (row.derived_from || '') ? {derived_from:detailDerivedFrom.value || null} : {}),
+      style: detailStyle.value, style_prompt: detailStylePrompt.value.trim()
+  }
+  const before={name:row.name,prompt:row.prompt_editable ?? row.prompt ?? '',visual_description:row.visual_description || '',related_refs:row.related_refs || [],style:row.style || '',style_prompt:row.style_prompt || '',derived_from:row.derived_from || null}
+  const groups=changedGroups(before,{...before,...patch},{name:'素材名称',prompt:'人工补充描绘',visual_description:'视觉设定',related_refs:'素材引用',style:'画风',style_prompt:'画风补充',derived_from:'生成参考'})
+  reviewedAsset={project:app.current,ref:row.ref,patch,revision:row.asset_revision}
+  assetReviewItems.value=groups.length?[{id:row.ref,title:row.name,groups}]:[]
+  assetReviewError.value='';assetReviewOpen.value=true
+}
+async function saveAssetEdit() {
+  const reviewed=reviewedAsset
+  if(!reviewed || reviewed.project!==app.current || detailSaving.value) return
   detailSaving.value = true
   try {
-    updateDetailPromptRefs()
-    const result = await editAsset({ project: app.current, ref: row.ref, patch: {
-      name: detailName.value.trim(), prompt: detailPrompt.value, related_refs: detailPromptRefs.value,
-      style: detailStyle.value, style_prompt: detailStylePrompt.value.trim()
-    }, expected_revision: row.asset_revision })
+    const result = await editAsset({ project: reviewed.project, ref: reviewed.ref, patch:reviewed.patch, expected_revision:reviewed.revision })
     if (!result.ok) throw new Error((result as any).err || '保存设定失败')
     const count = result.affected?.shots?.length || 0
-    affectedAssetRef.value = row.ref
+    assetReviewOpen.value=false
+    if(reviewed.project!==app.current) {toast('素材修改已保存','ok');return}
+    affectedAssetRef.value = reviewed.ref
     affectedShots.value = result.affected?.shots || []
     await load()
-    detailAsset.value = assets.value.find((item) => item.ref === row.ref) || null
+    detailAsset.value = assets.value.find((item) => item.ref === reviewed.ref) || null
     detailEditing.value = false
     refreshPromptLayers()
     toast(count ? `资产已更新，${count} 个镜头标记为待重建` : '资产设定已更新', 'ok', 5000)
-  } catch (e) { toast(e instanceof Error ? e.message : '保存设定失败', 'err', 6000) }
+  } catch (e) { assetReviewError.value=e instanceof Error?e.message:'保存设定失败';toast(assetReviewError.value, 'err', 6000) }
   finally { detailSaving.value = false }
 }
 async function rebuildAffectedPromptShots() {
@@ -403,6 +452,7 @@ function resetCreate() {
   createForm.name = ''
   createForm.prompt = ''
   createForm.related_refs = ''
+  createForm.derived_from = ''
   createForm.role = createMode.value === 'child' ? '关联角色' : '主角'
   createForm.prop_kind = createMode.value === 'child' ? '关联素材' : '叙事'
 }
@@ -432,9 +482,11 @@ async function submitCreate() {
       name: createForm.name.trim(), prompt: createForm.prompt.trim(),
       role: createForm.kind === 'character' ? createForm.role : undefined,
       prop_kind: createForm.kind === 'prop' ? createForm.prop_kind : undefined,
-      parent_ref: createParentRef.value || null,
-      relation: createParentRef.value ? (createParentRef.value.startsWith('@scene:') ? 'located_in' : 'component_of') : null,
-      related_refs: createForm.related_refs.split(/[，,\s]+/).map((value) => value.trim()).filter(Boolean),
+      parent_ref: createForm.prop_kind === '显现/特效' && createForm.kind === 'prop' ? null : (createParentRef.value || null),
+      derived_from: createForm.derived_from || null,
+      relation: createForm.prop_kind === '显现/特效' && createForm.kind === 'prop' ? null : (createParentRef.value ? (createParentRef.value.startsWith('@scene:') ? 'located_in' : 'component_of') : null),
+      related_refs: [...createForm.related_refs.split(/[，,\s]+/).map((value) => value.trim()).filter(Boolean),
+        ...(createForm.kind === 'prop' && createForm.prop_kind === '显现/特效' && createParentRef.value ? [createParentRef.value] : [])],
       episode: episode.value || undefined
     })
     if (!result.ok) throw new Error((result as any).err || '新增素材失败')
@@ -459,10 +511,11 @@ async function load() {
     assets.value = registry.assets || []
     imageRevision.value = Date.now()
     await refreshChatGPTRunJobs()
-  } catch {
+  } catch (e) {
     if (seq !== loadSeq || project !== app.current) return
     data.value = null
     assets.value = []
+    toast(e instanceof Error ? e.message : '素材载入失败，请重试', 'err')
   }
 }
 async function refreshChatGPTRunJobs() {
@@ -520,35 +573,15 @@ async function doExtractOne(kind: '人物' | '场景' | '道具') {
     busy.value = false
   }
 }
-async function regenPrompt() {
-  if (!app.current || !detailAsset.value) return
-  const kind = detailAsset.value.kind
-  if (kind !== 'character') { toast('场景/道具的提示词随外观事实生成，请在完整提炼中更新', 'info', 5000); return }
-  regenBusy.value = true
-  try {
-    const r = await postJSON<{ok: boolean; id?: number; err?: string}>('/api/asset/regen-prompt',
-      {project: app.current, kind, id: detailAsset.value.id})
-    if (!r.ok || !r.id) throw new Error(r.err || '任务未启动')
-    const j = await trackJob(r.id, '重生成提示词 ' + detailAsset.value.name)
-    if (!j.success) throw new Error(j.err || '重生成失败')
-    toast('提示词已更新为五视图构图', 'ok'); await load()
-    const fresh = assets.value.find((item) => item.ref === detailAsset.value?.ref)
-    if (fresh) detailAsset.value = fresh
-  } catch (e) {
-    toast(e instanceof Error ? e.message : '重生成失败', 'err', 6000)
-  } finally {
-    regenBusy.value = false
-  }
-}
 async function doExtract() {
   if (!app.current) return
   busy.value = true
   try {
     const r = await scriptExtract(app.current, episode.value || undefined)
     if (!r.id) throw new Error(r.err || '任务未启动')
-    const j = await trackJob(r.id, '资产提炼')
-    if (!j.success) throw new Error(j.err || '提炼失败')
-    toast('资产提炼完成', 'ok')
+    const j = await trackJob(r.id, plannedAssets.value ? '素材设定检查' : '资产提炼')
+    if (!j.success) throw new Error(j.err || (plannedAssets.value ? '检查完成，有待确认的视觉设定，请查看下方素材。' : '提炼失败'))
+    toast(plannedAssets.value ? '素材设定已检查，当前设定直接用于生图' : '资产提炼完成', 'ok')
   } catch (e) {
     toast(e instanceof Error ? e.message : '提炼失败', 'err', 6000)
   } finally {
@@ -557,20 +590,23 @@ async function doExtract() {
     await load()
   }
 }
-async function doGen(kind: string, id?: string, force = false, states?: 'include' | 'only' | 'skip', stateId?: string) {
+async function doGen(kind: string, id?: string, force = false, states?: 'include' | 'only' | 'skip', stateId?: string, assetRefs?: string[]) {
+  if (genning.value) return
   if (isChatGPTQueue.value) {
     const ref = `@${kind}:${id || ''}`
-    await queueChatGPTAssetRefs([stateId ? { ref, state_id: stateId } : ref])
+    const refs = assetRefs || (states === 'only' && id && !stateId
+      ? statesOf(kind, id).map(state => ({ref, state_id: state.id}))
+      : [stateId ? { ref, state_id: stateId } : ref])
+    await queueChatGPTAssetRefs(refs)
     return
   }
   if (!app.current || !selectedVendor.value) return
   genning.value = kind + (id || '') + (stateId ? '#' + stateId : '')
   try {
-    const r = await genAssetImage({ project: app.current, kind, id, vendor_id: selectedVendor.value.id, force, states, state_id: stateId })
+    const r = await genAssetImage({ project: app.current, kind, id, vendor_id: selectedVendor.value.id, force, states, state_id: stateId, asset_refs: assetRefs })
     if (!r.id) throw new Error(r.err || '任务未启动')
     const j = await trackJob(r.id, '生图 ' + kind + (id ? ' ' + id : ''))
     if (!j.success) throw new Error(j.err || '生图失败')
-    toast('图片已生成；子素材会继承母素材参考图', 'ok')
   } catch (e) {
     toast(e instanceof Error ? e.message : '生图失败', 'err', 6000)
   } finally {
@@ -579,6 +615,11 @@ async function doGen(kind: string, id?: string, force = false, states?: 'include
     genning.value = ''
     await load()
   }
+}
+
+async function genChildren(ref: string) {
+  const refs = childrenOf(ref).filter(row => row.usage !== 'plan').map(row => row.ref)
+  if (refs.length) await doGen('all', undefined, true, 'skip', undefined, refs)
 }
 
 async function delAssetImage(kind: 'character' | 'scene' | 'prop', id: string) {
@@ -722,7 +763,7 @@ async function submitChildGen() {
   await doGen(row.kind, row.id, true, 'skip')
 }
 function parentAsset(row?: AssetRegistryItem | null) {
-  return row?.parent_ref ? assetByRef.value.get(row.parent_ref) : undefined
+  return row ? generationReference(row, assets.value) : undefined
 }
 </script>
 
@@ -731,8 +772,8 @@ function parentAsset(row?: AssetRegistryItem | null) {
     <header class="mb-6">
       <div class="flex flex-wrap items-end justify-between gap-3">
         <div>
-          <h1 class="grad-text text-2xl font-black">② 素材生成</h1>
-          <p class="mt-1 text-xs text-slate-500">提炼人物、场景和道具，再生成设定图。子素材生成时继承母图参考。</p>
+          <h1 class="grad-text text-2xl font-black">视觉素材</h1>
+          <p class="mt-1 text-xs text-slate-400">维护人物、场景和道具的视觉设定与参考图。</p>
         </div>
         <button class="btn btn-ghost" title="新增独立角色、场景或道具母素材" @click="openCreate('mother')">＋新增母素材</button>
       </div>
@@ -742,16 +783,19 @@ function parentAsset(row?: AssetRegistryItem | null) {
       <div class="mb-5 grid gap-4 xl:grid-cols-2">
         <section class="glass space-y-3 p-4" aria-labelledby="asset-extract-title">
           <div class="flex flex-wrap items-center justify-between gap-2">
-            <h2 id="asset-extract-title" class="text-sm font-bold text-slate-100">提炼素材设定</h2>
+            <h2 id="asset-extract-title" class="text-sm font-bold text-slate-100">{{ plannedAssets ? '剧本设定 → 视觉素材' : '提炼素材设定' }}</h2>
             <span class="text-xs text-slate-400">人物 · 场景 · 道具</span>
           </div>
           <div class="flex flex-wrap items-end gap-3">
             <label class="min-w-40 flex-1 text-xs text-slate-300">分集范围
               <StyledSelect v-model="episode" class="mt-1" :options="['', ...episodes.map(e => e.id)]" :labels="epLabels" placeholder="全剧" />
             </label>
-            <button class="btn" :disabled="busy" @click="doExtract" title="按顺序提炼人物、场景和道具；已有同 ID 资产会复用">{{ busy ? '提炼中…' : episode ? `提炼 ${episode} 素材` : '提炼全剧素材' }}</button>
+            <button class="btn" :disabled="busy" @click="doExtract" :title="plannedAssets ? '检查当前规划档案，不重新提炼或覆盖设定' : '从导入剧本提炼人物、场景和道具'">{{ busy ? '处理中…' : plannedAssets ? '检查素材设定' : episode ? `提炼 ${episode} 素材` : '提炼全剧素材' }}</button>
           </div>
-          <details class="text-xs text-slate-300">
+          <div class="flex flex-wrap items-center gap-3"><label v-if="plannedAssets" class="mr-auto flex items-center gap-2 text-sm text-slate-300"><input v-model="includeUnused" type="checkbox" /> 显示未引用素材</label><AppearanceReviewButton ref="visualReview" v-if="app.current" :project="app.current" :disabled="busy" all-assets :visible-refs="reviewVisibleRefs" @changed="load" /></div>
+          <div v-if="requiredVisualAssets.length" class="flex flex-wrap gap-2 text-xs"><span class="text-amber-200">{{ requiredVisualAssets.length }} 项在用素材需补齐或确认：</span><button v-for="row in requiredVisualAssets.slice(0, 8)" :key="row.ref" class="text-sky-300 underline" @click="openAssetDetails(row)">{{ row.name }}</button></div>
+          <p v-if="unusedVisualAssets.length" class="text-xs text-slate-400">{{unusedVisualAssets.length}} 项未引用素材缺少视觉设定，可在批量审核中补齐；不影响当前剧本生成。</p>
+          <details v-if="!plannedAssets" class="text-xs text-slate-300">
             <summary class="cursor-pointer text-sky-300">只重跑单类素材</summary>
             <div class="mt-2 flex flex-wrap gap-2">
               <button class="btn btn-ghost btn-sm" :disabled="busy || !episode" @click="doExtractOne('人物')">重跑人物</button>
@@ -768,13 +812,14 @@ function parentAsset(row?: AssetRegistryItem | null) {
           </div>
           <div class="flex flex-wrap items-end gap-3">
             <StyleSelect target="image" label="生图风格" :hint="styleHint" @changed="load" />
+            <StyleSelect target="image_identity" label="人物身份方法" hint="只用于人物资产设定图，不进入单镜关键帧或视频提示词" @changed="load" />
             <label class="min-w-48 flex-1 text-xs text-slate-300">生图模型
               <StyledSelect v-model="vendorId" class="mt-1" :options="vendorOptions" :labels="vendorOptionLabels" :storage-key="`wb.${app.current}.assets.vendor`" placeholder="选择生图模型" />
             </label>
           </div>
           <div class="flex flex-wrap items-center gap-2">
-            <button v-if="!isChatGPTQueue" class="btn" :disabled="busy || !!genning || !selectedVendor" @click="doGen('all')" title="仅生成尚未有图片的素材；已有图保持不变">
-              {{ genning === 'all' ? '生成中…' : '生成缺失素材图' }}
+            <button v-if="!isChatGPTQueue" class="btn" :disabled="busy || !!genning || !selectedVendor" @click="doGen('all')" title="处理全项目的缺失素材图，已有图保持不变；页面分集筛选只影响展示">
+              {{ genning === 'all' ? '生成中…' : '批量生成缺失素材图（全项目）' }}
             </button>
             <button v-else class="btn border-cyan-400/30 text-cyan-200" :disabled="busy || !!genning || !queueableAssets.length" title="由 image-use 逐项生成并导入，最多选择 20 项" @click="queueAllChatGPTAssets">{{ genning === 'chatgpt' ? '启动中…' : `加入并执行（${Math.min(queueableAssets.length, 20)} 项）` }}</button>
             <template v-if="isChatGPTQueue">
@@ -809,6 +854,7 @@ function parentAsset(row?: AssetRegistryItem | null) {
             :children="childrenOf(assetRef('character', c.id))" :genning="genning"
             :gen-disabled="!!genning || (!selectedVendor && !isChatGPTQueue)" :drag-target="dragTargetRef"
             @details="openAssetDetails" @show="showAsset" @gen="doGen('character', c.id, true, 'skip')"
+            @batch-states-gen="doGen('character', c.id, true, 'only')" @batch-children-gen="genChildren(assetRef('character', c.id))"
             @create-child="openCreate('child', assetRef('character', c.id))" @child-gen="openChildGen"
             @drag-start="startAssetDrag" @drag-over="dragOverAsset" @drop="dropAsset" @drag-end="endAssetDrag" @restored="load" @deleted="load">
             <template #badge><span class="ml-2 rounded bg-amber-400/15 px-1.5 text-2xs text-amber-300">{{ c.role || '角色' }}</span></template>
@@ -821,6 +867,15 @@ function parentAsset(row?: AssetRegistryItem | null) {
                     <button v-if="stateImageUrl(st)" class="block h-24 w-full overflow-hidden rounded-lg border border-line bg-black/20" @click="showStateImage(st)"><img :src="stateImageUrl(st)" class="h-full w-full object-contain" :alt="st.label" /></button>
                     <div v-else class="flex h-24 items-center justify-center rounded-lg border border-dashed border-line text-2xs text-slate-500">状态图未生成</div>
                     <div class="mt-1 truncate text-xs text-slate-200" :title="st.look_diff">{{ st.label }}</div>
+                    <p class="mt-1 whitespace-pre-wrap break-words text-xs leading-relaxed text-slate-300">{{ st.look_diff || '尚未填写可见差异，请先核对状态设定' }}</p>
+                    <p v-if="st.visual_status?.warnings.length" class="mt-1 text-xs text-amber-200">{{ st.visual_status.warnings.join('；') }}</p>
+                    <div class="mt-1 flex flex-wrap items-center gap-2 text-xs">
+                      <span v-if="st.visual_status?.review_status==='confirmed'" class="rounded bg-emerald-500/15 px-1.5 py-0.5 text-emerald-200">设定已确认</span>
+                      <span v-else-if="st.visual_status?.review_status==='changed'" class="text-amber-200">设定已变更，待确认</span>
+                      <button class="text-sky-200 underline" :disabled="busy" @click="reviewVisual(c.id,st.id)">{{st.visual_status?.review_status==='confirmed'?'编辑设定':'审核设定'}}</button>
+                    </div>
+                    <p v-if="st.visual_status?.image_status === 'outdated'" class="mt-1 text-xs text-amber-200">派生设定已变化 · 此图待更新</p>
+                    <p v-if="st.visual_status?.postprocess_warning" class="mt-1 text-xs text-amber-200">{{ st.visual_status.postprocess_warning }}</p>
                     <div class="text-2xs text-slate-500">派生状态{{ st.camp && st.camp !== '不明' ? ' · ' + st.camp : '' }}</div>
                     <div class="mt-1 flex gap-1"><button class="btn btn-ghost btn-sm flex-1" :disabled="!!genning || (!selectedVendor && !isChatGPTQueue)" :title="'以本角色母图为参考' + (st.path ? '重新生成该状态图（旧版本自动保存）' : '生成该状态图') + '；母图不受影响'" @click="doGen('character', c.id, true, 'only', st.id)">{{ genning === 'character' + c.id + '#' + st.id ? '生成中…' : '生成派生图' }}</button><Versions :path="'projects/' + app.current + '/素材/人物/' + c.id + '__' + st.id + '.png'" kind="image" @restored="load" /></div>
                     <button class="w-full rounded border border-rose-400/30 py-0.5 text-2xs text-rose-300 transition hover:bg-rose-400/10"
@@ -840,7 +895,8 @@ function parentAsset(row?: AssetRegistryItem | null) {
             :asset="registryFor('scene', s.id)" :project="app.current" :image-url-of="imageUrl" :relation-label="relationLabel"
             :children="childrenOf(assetRef('scene', s.id))" :genning="genning"
             :gen-disabled="!!genning || (!selectedVendor && !isChatGPTQueue)" :drag-target="dragTargetRef"
-            @details="openAssetDetails" @show="showAsset" @gen="doGen('scene', s.id, true)"
+            @details="openAssetDetails" @show="showAsset" @gen="doGen('scene', s.id, true, 'skip')" @state-gen="doGen('scene', s.id, true, 'only', $event)"
+            @batch-states-gen="doGen('scene', s.id, true, 'only')" @batch-children-gen="genChildren(assetRef('scene', s.id))"
             @create-child="openCreate('child', assetRef('scene', s.id))" @child-gen="openChildGen"
             @drag-start="startAssetDrag" @drag-over="dragOverAsset" @drop="dropAsset" @drag-end="endAssetDrag" @restored="load" @deleted="load">
             <template #meta>{{ s.id }} · {{ s.time }} · {{ s.light }}</template>
@@ -848,13 +904,14 @@ function parentAsset(row?: AssetRegistryItem | null) {
         </section>
 
         <section class="glass p-4" @dragover.prevent="dragOverAsset()" @drop.prevent="dropAsset()">
-          <h3 class="mb-3 text-sm font-bold text-slate-200">独立道具母素材（{{ props.length }}）</h3>
+          <h3 class="mb-3 text-sm font-bold text-slate-200">道具与特效素材（{{ props.length }}）</h3>
           <div v-if="!props.length" class="text-xs-plus text-slate-500">尚未提炼</div>
           <AssetCard v-for="p in props as PropItem[]" :key="p.id" kind="prop" :id="p.id" :name="p.name"
             :asset="registryFor('prop', p.id)" :project="app.current" :image-url-of="imageUrl" :relation-label="relationLabel"
             :children="childrenOf(assetRef('prop', p.id))" :genning="genning"
             :gen-disabled="!!genning || (!selectedVendor && !isChatGPTQueue)" :drag-target="dragTargetRef"
-            @details="openAssetDetails" @show="showAsset" @gen="doGen('prop', p.id, true)"
+            @details="openAssetDetails" @show="showAsset" @gen="doGen('prop', p.id, true, 'skip')" @state-gen="doGen('prop', p.id, true, 'only', $event)"
+            @batch-states-gen="doGen('prop', p.id, true, 'only')" @batch-children-gen="genChildren(assetRef('prop', p.id))"
             @create-child="openCreate('child', assetRef('prop', p.id))" @child-gen="openChildGen"
             @drag-start="startAssetDrag" @drag-over="dragOverAsset" @drop="dropAsset" @drag-end="endAssetDrag" @restored="load" @deleted="load">
             <template #meta>{{ p.id }} · {{ p.kind || '叙事' }}</template>
@@ -882,13 +939,16 @@ function parentAsset(row?: AssetRegistryItem | null) {
     <div v-if="createVisible" class="overlay p-4" @click.self="closeCreate">
       <form class="glass w-full max-w-xl p-5" @submit.prevent="submitCreate">
         <div class="mb-4 flex items-center justify-between"><h2 class="text-lg font-bold text-slate-100">{{ createMode === 'mother' ? '新增母素材' : '新增子素材' }}</h2><button type="button" class="btn btn-ghost btn-sm" @click="closeCreate">关闭</button></div>
-        <p v-if="createMode === 'child'" class="mb-3 rounded bg-violet-400/10 px-3 py-2 text-xs text-violet-200">母素材：{{ parentName() }}。子图生成时会自动继承母图作为参考。</p>
+        <p v-if="createMode === 'child'" class="mb-3 rounded bg-violet-400/10 px-3 py-2 text-xs text-violet-200">展示归属：{{ parentName() }}。生成参考可独立选择母图或派生图。</p>
+        <label v-if="createMode === 'child'" class="mb-3 block text-xs text-slate-400">生成参考
+          <StyledSelect v-model="createForm.derived_from" class="mt-1" :options="Object.keys(createReferenceChoices)" :labels="createReferenceChoices" placeholder="跟随展示归属的母图" />
+        </label>
         <div class="grid gap-3 sm:grid-cols-2">
           <label class="text-xs text-slate-400">素材类型
             <StyledSelect v-model="createForm.kind" class="mt-1" :options="['character', 'scene', 'prop']" :labels="{ character: '人物', scene: '场景', prop: '道具/关联素材' }" />
           </label>
           <label class="text-xs text-slate-400">稳定 ID（可留空自动生成）
-            <input v-model="createForm.id" class="input mt-1 w-full" placeholder="例如 baixiaozhuxu_collar" />
+            <input v-model="createForm.id" class="input mt-1 w-full" placeholder="例如 character_costume_variant" />
           </label>
         </div>
         <label class="mt-3 block text-xs text-slate-400">素材名称
@@ -898,7 +958,8 @@ function parentAsset(row?: AssetRegistryItem | null) {
           <StyledSelect v-model="createForm.role" class="mt-1" :options="['主角', '配角', '关联角色']" />
         </label>
         <label v-if="createForm.kind === 'prop'" class="mt-3 block text-xs text-slate-400">素材子类型
-          <StyledSelect v-model="createForm.prop_kind" class="mt-1" :options="['关联素材', '服饰', '配饰', '组件', '叙事']" />
+          <StyledSelect v-model="createForm.prop_kind" class="mt-1" :options="['关联素材', '服饰', '配饰', '组件', '叙事', '显现/特效']" />
+          <span v-if="createForm.prop_kind === '显现/特效'" class="mt-1 block text-xs text-slate-300">生成独立显现画面；用关联素材记录来源角色，不使用人物五视图。</span>
         </label>
         <label class="mt-3 block text-xs text-slate-400">生图提示词
           <textarea v-model="createForm.prompt" class="textarea mt-1 min-h-28 w-full" :placeholder="createMode === 'child' ? '只写子素材差异；生图会继承母素材图' : '描述母素材的稳定外观与用途'" />
@@ -915,15 +976,15 @@ function parentAsset(row?: AssetRegistryItem | null) {
           <h2 class="text-lg font-bold text-slate-100">生成子素材图</h2>
           <button class="btn btn-ghost btn-sm" @click="closeChildGen">关闭</button>
         </div>
-        <p class="mb-4 text-xs text-slate-400">子图只描述子素材差异，系统会把母图作为身份、结构、材质和画风参考传入模型。</p>
+        <p class="mb-4 text-xs text-slate-400">系统使用下方实际图片作为生成参考；可在素材详情的“生成参考”中修改。</p>
         <div class="grid gap-4 sm:grid-cols-2">
           <div>
-            <div class="mb-2 text-xs text-slate-400">母素材参考</div>
+            <div class="mb-2 text-xs text-slate-400">实际生成参考</div>
             <button v-if="imageUrl(parentAsset(childGenAsset))" class="block h-48 w-full overflow-hidden rounded-xl border border-line bg-black/20" @click="showAsset(parentAsset(childGenAsset))">
               <img :src="imageUrl(parentAsset(childGenAsset))" class="h-full w-full object-contain" :alt="parentAsset(childGenAsset)?.name || '母素材'" />
             </button>
-            <div v-else class="flex h-48 items-center justify-center rounded-xl border border-dashed border-line text-xs text-slate-500">母图尚未生成，仍可先保存子素材提示词</div>
-            <div class="mt-2 text-xs text-slate-300">{{ parentAsset(childGenAsset)?.name || childGenAsset.parent_ref }}</div>
+            <div v-else class="flex h-48 items-center justify-center rounded-xl border border-dashed border-line text-xs text-amber-200">指定参考图尚未生成，请先补齐参考图</div>
+            <div class="mt-2 text-xs text-slate-300">{{ parentAsset(childGenAsset)?.name || childGenAsset.derived_from || childGenAsset.parent_ref }}</div>
           </div>
           <div>
             <div class="mb-2 text-xs text-slate-400">当前子素材</div>
@@ -936,20 +997,33 @@ function parentAsset(row?: AssetRegistryItem | null) {
         </div>
         <div class="mt-5 flex justify-end gap-2">
           <button class="btn btn-ghost" @click="closeChildGen">取消</button>
-          <button class="btn" :disabled="!!genning || (!selectedVendor && !isChatGPTQueue)" @click="submitChildGen">{{ genning ? '生成中…' : '继承母图并生成子图' }}</button>
+          <button class="btn" :disabled="!!genning || (!selectedVendor && !isChatGPTQueue) || (!!childGenAsset.derived_from?.includes('#') && !imageUrl(parentAsset(childGenAsset)))" @click="submitChildGen">{{ genning ? '生成中…' : '使用当前参考生成子图' }}</button>
         </div>
       </div>
     </div>
     <div v-if="detailAsset" class="overlay p-4" @click.self="closeAssetDetails">
       <section class="glass modal-h-lg w-full max-w-3xl overflow-y-auto p-5">
-        <div class="mb-4 flex items-center justify-between gap-3"><div><h2 class="text-lg font-bold text-slate-100">{{ detailEditing ? '编辑资产设定' : detailAsset.name }}</h2><p class="mt-1 text-2xs text-slate-500">{{ detailAsset.ref }} · {{ detailAsset.parent_ref ? '子素材' : '母素材' }} · v{{ detailAsset.asset_revision || 1 }}</p></div><div class="flex gap-2"><button v-if="!detailEditing && detailAsset.kind === 'character'" class="btn btn-sm" :disabled="regenBusy" title="按五视图构图重写该角色的生图提示词（不动外观事实）；旧三视图提示词的图会与素材链不一致" @click="regenPrompt">{{ regenBusy ? '重生成中…' : '重新生成提示词' }}</button><button v-if="!detailEditing" class="btn btn-ghost btn-sm" @click="detailEditing = true">编辑设定</button><button class="btn btn-ghost btn-sm" @click="closeAssetDetails">关闭</button></div></div>
-        <p v-if="detailAsset.kind === 'character' && (detailAsset.sheet_prompt || '').includes('三视图') && !(detailAsset.sheet_prompt || '').includes('45度')" class="mb-3 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-200">！该角色的设定图提示词仍是旧版三视图构图，建议点「重新生成提示词」更新为五视图，再重新生成设定图。</p>
+        <div class="mb-4 flex items-center justify-between gap-3"><div><h2 class="text-lg font-bold text-slate-100">{{ detailEditing ? '编辑资产设定' : detailAsset.name }}</h2><p class="mt-1 text-2xs text-slate-500">{{ detailAsset.ref }} · {{ detailAsset.parent_ref ? '子素材' : '母素材' }} · v{{ detailAsset.asset_revision || 1 }} · {{ detailAsset.visual_status?.source }}</p></div><div class="flex gap-2"><RouterLink v-if="detailAsset.kind === 'character'" class="btn btn-sm" :to="{path:'/studio/characters',query:{character:detailAsset.id}}">角色设定</RouterLink><button v-if="!detailEditing" class="btn btn-ghost btn-sm" @click="detailEditing = true">编辑设定</button><button class="btn btn-ghost btn-sm" @click="closeAssetDetails">关闭</button></div></div>
+        <div v-if="detailChildren.length || detailRelatedOut.length" class="mb-3 flex flex-wrap items-center gap-2">
+          <span v-if="detailChildren.length" class="rounded bg-sky-400/15 px-2 py-0.5 text-2xs text-sky-200" :title="'关联子素材：' + detailChildren.join('、')">关联 × {{ detailChildren.length }}</span>
+          <span v-if="detailRelatedOut.length" class="rounded bg-blue-400/15 px-2 py-0.5 text-2xs text-blue-200" :title="'引用其它素材：' + detailRelatedOut.join('、')">引用其它素材 × {{ detailRelatedOut.length }}</span>
+        </div>
+        <div v-if="detailAsset.visual_status && !detailAsset.visual_status.ready" class="mb-3 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-200">待处理：{{ [...detailAsset.visual_status.field_labels,...detailAsset.visual_status.warnings].join('；') }}<button class="btn btn-sm ml-2" @click="reviewVisual(detailAsset.kind==='character'?detailAsset.id:detailAsset.ref)">在此审核设定</button></div>
+        <div v-if="detailAsset.visual_status && !detailAsset.visual_status.ready" class="mb-3 rounded-lg border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-xs text-amber-200">待处理：{{ [...detailAsset.visual_status.field_labels,...detailAsset.visual_status.warnings].join('；') }}<button class="btn btn-sm ml-2" @click="reviewVisual(detailAsset.kind==='character'?detailAsset.id:detailAsset.ref)">在此审核设定</button></div>
+        <p v-if="!detailEditing && (detailAsset.parent_ref || detailAsset.derived_from)" class="mb-3 text-xs text-cyan-200">生成参考：{{ parentAsset(detailAsset)?.name || detailAsset.derived_from || detailAsset.parent_ref }}</p>
+        <p v-else-if="detailAsset.visual_status?.review_status==='confirmed'" class="mb-3 text-sm text-emerald-200">设定已确认，当前提示词已同步；图片状态见下方，无需再次确认。</p>
+        <p v-if="detailAsset.visual_status?.image_reasons.length" class="mb-3 text-xs text-amber-200">{{ detailAsset.visual_status.image_reasons.join('；') }}；修改提示词不会改变已生成的图片。</p>
+        <p v-if="detailAsset.visual_status?.postprocess_warning" class="mb-3 text-xs text-amber-200">{{ detailAsset.visual_status.postprocess_warning }}</p>
         <button v-if="imageUrl(detailAsset)" class="mb-4 block max-h-[45vh] w-full overflow-hidden rounded-xl border border-line bg-black/20" title="点击查看大图" @click="showAsset(detailAsset)"><img :src="imageUrl(detailAsset)" class="max-h-[45vh] w-full object-contain" :alt="detailAsset.name" /></button>
         <div v-else class="mb-4 flex h-32 items-center justify-center rounded-xl border border-dashed border-line text-xs text-slate-500">尚未生成图片</div>
         <div class="mb-4 flex flex-wrap items-center gap-2"><span class="rounded bg-white/5 px-2 py-1 text-2xs text-slate-400">{{ detailAsset.usage || detailAsset.kind }}</span><span v-if="detailAsset.relation" class="rounded bg-cyan-400/10 px-2 py-1 text-2xs text-cyan-200">{{ relationLabel(detailAsset) }}</span><span v-if="detailAsset.style" class="rounded bg-violet-400/10 px-2 py-1 text-2xs text-violet-200" title="该资产生图使用自己的画风，不跟随项目生图风格">画风：{{ detailStyleLabels[detailAsset.style] || detailAsset.style }}</span><Versions v-if="assetFilePath(detailAsset)" :path="assetFilePath(detailAsset)" kind="image" @restored="load" /></div>
         <div v-if="affectedAssetRef === detailAsset.ref && affectedShots.length" class="mb-4 rounded-lg border border-amber-400/20 bg-amber-400/5 p-3"><div class="text-xs-plus text-amber-200">本次修改影响 {{ affectedShots.length }} 个镜头：{{ affectedShots.join('、') }}</div><button class="btn btn-ghost btn-sm mt-2" :disabled="rebuildingAffected" @click="rebuildAffectedPromptShots">{{ rebuildingAffected ? '重建中…' : '只重建这些镜头提示词' }}</button></div>
         <div v-if="detailEditing" class="space-y-3">
           <label class="block text-xs text-slate-400">素材名称<input v-model="detailName" class="input mt-1 w-full" /></label>
+          <label v-if="detailAsset.parent_ref || detailAsset.derived_from" class="block text-xs text-slate-400">生成参考
+            <StyledSelect v-model="detailDerivedFrom" class="mt-1" :options="Object.keys(detailReferenceChoices)" :labels="detailReferenceChoices" placeholder="跟随展示归属的母图" />
+            <span class="mt-1 block text-xs text-slate-400">选择母图或具体派生图；展示归属保持不变。</span>
+          </label>
           <label class="block text-xs text-slate-400">画风覆盖
             <span class="ml-2 text-2xs text-slate-500">默认跟随项目生图风格；给单个资产指定可实现一部剧多画风混搭</span>
             <StyledSelect v-model="detailStyle" class="mt-1" :options="['', ...imageSkills.map(s => s.id)]" :labels="detailStyleLabels" placeholder="项目默认" />
@@ -958,7 +1032,8 @@ function parentAsset(row?: AssetRegistryItem | null) {
             <span class="ml-2 text-2xs text-slate-500">留空 = 用上方 skill 或项目默认；填写后该资产完全按此画风生成</span>
             <textarea v-model="detailStylePrompt" class="textarea mt-1 min-h-16 w-full" placeholder="例：日式动漫赛璐璐插画风格，平涂上色，柔和阴影…" />
           </label>
-          <label class="block text-xs text-slate-400">外观提示词（只写外观/场景/物件事实，不写画风）
+          <label v-if="detailAsset?.kind !== 'character'" class="block text-xs text-slate-400">当前视觉设定（形制、材质、结构与辨识细节）<textarea v-model="detailVisual" class="textarea mt-1" rows="3" placeholder="只填写稳定视觉设定，画风由下方风格层控制" /></label>
+          <label class="block text-xs text-slate-400">人工补充描绘（与当前设定一起使用）
             <span class="ml-2 text-2xs text-slate-500">输入 @ 或素材名称检索全局资产，选中后写入规范引用</span>
             <div class="relative mt-1">
               <textarea
@@ -995,10 +1070,10 @@ function parentAsset(row?: AssetRegistryItem | null) {
               </span>
             </div>
           </div>
-          <div class="flex justify-end gap-2"><button class="btn btn-ghost" :disabled="detailSaving" @click="detailEditing = false">取消</button><button class="btn" :disabled="detailSaving" @click="saveAssetEdit">{{ detailSaving ? '保存中…' : '保存设定并标记受影响镜头' }}</button></div>
+          <div class="flex justify-end gap-2"><button class="btn btn-ghost" :disabled="detailSaving" @click="detailEditing = false">取消</button><button class="btn" :disabled="detailSaving" @click="openAssetEditReview">审核并保存设定</button></div>
         </div>
         <div v-else class="space-y-3">
-          <div><h3 class="mb-1 text-xs font-semibold text-slate-300">外观提示词</h3><pre class="max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-black/25 p-3 text-xs-plus leading-relaxed text-slate-300">{{ promptLayers?.subject || detailAsset.prompt || '暂无已保存提示词' }}</pre></div>
+          <div><h3 class="mb-1 text-xs font-semibold text-slate-300">生图主体 · 当前设定自动同步</h3><pre class="max-h-40 overflow-auto whitespace-pre-wrap rounded-lg bg-black/25 p-3 text-xs-plus leading-relaxed text-slate-300">{{ promptLayers?.subject || detailAsset.prompt || '请先补充已采用的外观设定' }}</pre></div>
           <div><h3 class="mb-1 text-xs font-semibold text-slate-300">画风提示词 <span class="ml-1 rounded bg-white/10 px-1.5 py-0.5 text-2xs font-normal text-slate-400">{{ ({ asset_text: '本资产自由文本', asset_skill: '本资产指定 skill', project: '项目生图风格', none: '未配置' } as Record<string, string>)[promptLayers?.style_source || 'none'] }}</span></h3><pre class="max-h-32 overflow-auto whitespace-pre-wrap rounded-lg bg-black/25 p-3 text-xs-plus leading-relaxed text-violet-200">{{ promptLayers?.style || '（未配置画风，按模型默认）' }}</pre></div>
           <div v-if="promptLayers?.constraint"><h3 class="mb-1 text-xs font-semibold text-slate-300">类别硬约束（生成时强制，不可被覆盖）</h3><pre class="whitespace-pre-wrap rounded-lg bg-black/25 p-3 text-xs-plus leading-relaxed text-amber-200">{{ promptLayers.constraint }}</pre></div>
           <div><h3 class="mb-1 text-xs font-semibold text-slate-300">负面提示词（全局统一，只读）</h3><pre class="max-h-24 overflow-auto whitespace-pre-wrap rounded-lg bg-black/25 p-3 text-xs-plus leading-relaxed text-rose-200/80">{{ promptLayers?.negative || '—' }}</pre></div>
@@ -1010,4 +1085,5 @@ function parentAsset(row?: AssetRegistryItem | null) {
     </div>
     <OverlayViewer :images="lightboxImage ? [lightboxImage] : []" :index="0" :visible="lightboxVisible" @close="lightboxVisible = false" />
   </div>
+  <BatchDiffReview v-model:open="assetReviewOpen" title="审核素材设定" :items="assetReviewItems" :busy="detailSaving" :error="assetReviewError" submit-label="确认保存" @confirm="saveAssetEdit" />
 </template>

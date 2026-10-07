@@ -3,6 +3,7 @@ id: actor-neutral
 name: 演员·克制写实
 category: acting
 target: acting
+dimension: acting_style
 enabled: true
 builtin: true
 description: 以可见动作、视线、停顿和语气节拍驱动角色，不改剧情事实

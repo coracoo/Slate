@@ -3,6 +3,7 @@ id: actor-controlled
 name: 演员·爽点节拍
 category: acting
 target: acting
+dimension: acting_style
 enabled: true
 builtin: true
 description: 面向短剧的反应、压迫、揭露和反转节拍

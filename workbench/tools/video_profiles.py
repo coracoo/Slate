@@ -18,7 +18,17 @@ def capabilities(cfg, model=None):
              resolutions=['720p'], ratios=RATIOS.copy(), frame_adaptive=False,
              transport='inline', adapter='', endpoint='', integer_duration=True,
              audio_output=False, seed=False)
-    if vid == 'local-comfyui' and ('minimax_h3' in low or not low):
+    if vid == 'runninghub':
+        from runninghub_catalog import operation, video_profile
+        try:
+            rh = video_profile(operation(name))
+        except ValueError:
+            rh = None
+        if rh:
+            p.update(rh)
+        else:
+            p.update(known=False, modes=[], max_refs=0, resolutions=[], ratios=[])
+    elif vid == 'local-comfyui' and ('minimax_h3' in low or not low):
         p.update(adapter='comfyui', modes=['reference', 'text'], max_refs=9, max_audio=3, max_video=3,
                  resolutions=['workflow'], ratios=['16:9'], integer_duration=False)
     elif vid == 'minimax' and low in ('minimax-h3', 'minimax-h3-max'):
@@ -62,15 +72,20 @@ def capabilities(cfg, model=None):
 def settings(cfg, options=None, *, model=None):
     """输出规范化参数；不裁剪时长、不换厂商、不丢弃用户参数。"""
     p = capabilities(cfg, model); o = dict(options or {})
-    if not p['known']: raise ValueError(f"尚未适配视频型号 {p['model']}，请使用已声明型号；不自动套用相似名称的协议")
+    if not p['known']:
+        if cfg.get('id') == 'runninghub' and str(p['model']).startswith('workflow:'):
+            raise ValueError('当前制作线未配置此工作流的节点与能力契约；可通过 RH 原生请求入口调用工作流')
+        raise ValueError(f"尚未适配视频型号 {p['model']}，请使用已声明型号；不自动套用相似名称的协议")
     allowed = {'mode','duration','resolution','ratio','seed','generate_audio'}
     if set(o) - allowed: raise ValueError('未声明的视频参数：' + '、'.join(sorted(set(o)-allowed)))
     mode = o.get('mode') or p['default_mode']
     if mode not in p['modes']: raise ValueError('当前型号不支持模式：' + str(mode))
-    duration = float(o.get('duration', 5))
+    duration = float(o.get('duration', p.get('default_duration', 5)))
     if not math.isfinite(duration) or not p['min_duration'] <= duration <= p['max_duration']:
         raise ValueError(f"当前型号时长须为 {p['min_duration']}–{p['max_duration']} 秒；请修改时长或拆分 V")
     if p['integer_duration'] and not duration.is_integer(): raise ValueError('当前云端视频模型时长必须是整数秒')
+    if p.get('duration_choices') and duration not in p['duration_choices']:
+        raise ValueError('当前型号时长须从以下秒数选择：' + '、'.join(str(int(v)) for v in p['duration_choices']))
     resolution = o.get('resolution') or p['resolutions'][0]
     if resolution not in p['resolutions']: raise ValueError('当前型号不支持分辨率：' + str(resolution))
     ratio = o.get('ratio') or p['ratios'][0]

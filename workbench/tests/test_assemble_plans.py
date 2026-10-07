@@ -108,6 +108,14 @@ class AssemblePlansTests(unittest.TestCase):
         self.assertFalse(rows[0]["validate_ok"])
         self.assertIsNone(rows[0]["canvas_html"])
 
+    def test_collect_plans_exposes_semantic_approval_and_reasons(self):
+        rejected = dict(PLAN_NEW, _judge={"ok": False, "backend": "mock", "reasons": ["动线穿过桌案"]})
+        make_plan_file(self.proj, rejected, time.time())
+        row = cp.collect_plans(self.proj)[0]
+        self.assertEqual(row["approval_state"], "rejected")
+        self.assertFalse(row["judge_ok"])
+        self.assertEqual(row["judge_reasons"], ["动线穿过桌案"])
+
     def test_scene_ref_majority_match_beats_mtime(self):
         """底图选择：分镜多数镜 scene_ref 命中的 plan 胜出——哪怕它 mtime 更旧；
         同场景 S1/S2 共用同一张 _plan 底图；manifest plans 带 scene_ref。"""

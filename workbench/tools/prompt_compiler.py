@@ -97,20 +97,20 @@ def _performance_text(performance, actors, media_type="video"):
             if not isinstance(beat, dict):
                 continue
             at = beat.get("at", 0); dur = beat.get("duration", 0)
-            parts = [str(beat.get(k)).strip() for k in ("intent", "posture", "gaze", "gesture", "expression", "voice")
+            # 生成图只能消费可见姿态；动机留在演员上下文，声音走 voice_notes。
+            parts = [str(beat.get(k)).strip() for k in ("visible_action", "posture", "gaze", "gesture", "expression")
                      if beat.get(k)]
             if parts:
-                rows.append(f"{at}s-{float(at or 0)+float(dur or 0):g}s {name}：" + "；".join(parts))
+                timing = "" if media_type == "image" else f"{at}s-{float(at or 0)+float(dur or 0):g}s "
+                rows.append(timing + f"{name}：" + "；".join(parts))
     return rows
 
 
-def _actor_card_text(shot, board):
-    context = board.get("acting_context") if isinstance(board.get("acting_context"), dict) else {}
-    cards = context.get("actor_cards") if isinstance(context.get("actor_cards"), dict) else {}
-    if not cards:
-        return []
+def _shot_actor_ids(shot, actors, cards=None):
+    """只解析本镜引用；旁白和全剧未入镜演员不属于可见表演范围。"""
+    from narration import is_narrator
+    cards = cards or {}
     ids = []
-    actors = board.get("actors") or {}
     for value in [shot.get("speaker"), shot.get("host"), shot.get("target"), shot.get("focus")]:
         actor_id = _actor_id_from_ref(value, actors, cards)
         if actor_id and actor_id not in ids:
@@ -133,8 +133,13 @@ def _actor_card_text(shot, board):
             actor_id = _actor_id_from_ref(value, actors, cards)
             if actor_id and actor_id not in ids:
                 ids.append(actor_id)
-    if not ids:
-        ids = [str(key) for key in cards]
+    return [actor_id for actor_id in ids if not is_narrator(actor_id, actors.get(actor_id))]
+
+
+def _actor_card_text(shot, board):
+    context = board.get("acting_context") if isinstance(board.get("acting_context"), dict) else {}
+    cards = context.get("actor_cards") if isinstance(context.get("actor_cards"), dict) else {}
+    ids = _shot_actor_ids(shot, board.get("actors") or {}, cards)
     rows = []
     for actor_id in ids:
         card = cards.get(actor_id)
@@ -194,6 +199,21 @@ def compile_shot(board, shot_id, mode="baseline", media_type="video", supports_a
     use_performance = performance_fresh and ((mode in ("stateful", "actor", "performance")) or (mode == "style" and performance_mode == "style"))
     if (mode in ("stateful", "actor", "performance") or (mode == "style" and performance_mode == "style")) and isinstance(performance, dict) and performance.get("status") == "ready" and not performance_fresh:
         warnings.append("演员表演候选来源已过期，已回退基础提示词")
+    actor_ids = _shot_actor_ids(shot, actors)
+    if use_performance:
+        # 每个输出通道共用同一份已采用、未过期、属于本镜的表演副本。
+        performance = copy.deepcopy(performance)
+        packet = performance.get("packet") if isinstance(performance.get("packet"), dict) else performance
+        # 表演包存在本镜 shot 上，本身就是"该演员属于本镜可见表演范围"的镜头级证据——
+        # 旧格式分镜可能没有 speaker/staging 等显式引用（E07 回归实证：无引用时被过滤光），
+        # 过滤只拦"全剧演员回填"，不拦表演包自己声明的演员：两者取并集。
+        allowed = set(actor_ids)
+        for row in packet.get("actors") or []:
+            if isinstance(row, dict) and row.get("actor_id"):
+                allowed.add(str(row["actor_id"]))
+        # 画外演员（未入镜引用）的节拍不进提示词——只保留入镜者的表演副本。
+        packet["actors"] = [row for row in packet.get("actors") or []
+                            if isinstance(row, dict) and str(row.get("actor_id") or "") in allowed]
     performance_rows = _performance_text(performance, actors, media_type) if use_performance else []
     actor_card_rows = []
     if mode in ("stateful", "actor", "performance"):
@@ -208,32 +228,8 @@ def compile_shot(board, shot_id, mode="baseline", media_type="video", supports_a
         sections.append("输出连续动作，严格保持本镜时长内的节奏和角色身份。")
 
     # 演员层和图像层消费同一份结构化资产引用，角色卡不再复制外观档案。
-    actor_ids = []
-    for value in [shot.get("speaker"), shot.get("host"), shot.get("target"), shot.get("focus")]:
-        actor_id = _actor_id_from_ref(value, actors)
-        if actor_id and actor_id not in actor_ids:
-            actor_ids.append(actor_id)
-    for line in shot.get("lines") or []:
-        if isinstance(line, dict):
-            actor_id = _actor_id_from_ref(line.get("speaker"), actors)
-            if actor_id and actor_id not in actor_ids:
-                actor_ids.append(actor_id)
-    for actor_id in (shot.get("staging") or {}):
-        actor_id = _actor_id_from_ref(actor_id, actors)
-        if actor_id and actor_id not in actor_ids:
-            actor_ids.append(actor_id)
-    refs = shot.get("actor_refs") or shot.get("character_refs") or shot.get("cast") or []
-    if isinstance(refs, str):
-        refs = [refs]
-    if isinstance(refs, (list, tuple, set)):
-        for value in refs:
-            actor_id = _actor_id_from_ref(value, actors)
-            if actor_id and actor_id not in actor_ids:
-                actor_ids.append(actor_id)
-    if not actor_ids and isinstance(actors, dict):
-        actor_ids = [str(key) for key in actors]
     action_by_actor = {}
-    if isinstance(performance, dict) and isinstance(performance.get("packet"), dict):
+    if use_performance and isinstance(performance.get("packet"), dict):
         for actor in performance["packet"].get("actors") or []:
             if not isinstance(actor, dict) or not actor.get("actor_id"):
                 continue
@@ -310,7 +306,7 @@ def compile_shot(board, shot_id, mode="baseline", media_type="video", supports_a
     else:
         mode_used = "style" if mode == "style" else "baseline"
     voice_notes = []
-    packet = performance.get("packet") if isinstance(performance, dict) and isinstance(performance.get("packet"), dict) else {}
+    packet = performance.get("packet") if use_performance and isinstance(performance.get("packet"), dict) else {}
     for actor in packet.get("actors") or []:
         beats = list(actor.get("beats") or [])
         if media_type == "image" and beats:
@@ -321,6 +317,8 @@ def compile_shot(board, shot_id, mode="baseline", media_type="video", supports_a
     if voice_notes and not supports_audio:
         warnings.append("当前出口未声明音频能力，配音提示仅作为 voice_notes 保留")
     prompt = "\n".join(sections if prompt_json is None else prompt_sections)
+    if voice_notes and supports_audio and media_type == "video":
+        prompt += "\n配音表演：" + "；".join(voice_notes)
     return {"shot_id": str(shot_id), "mode": mode_used, "mode_used": mode_used,
             "media_type": media_type, "prompt": prompt, "text": prompt,
             "baseline_prompt": baseline_prompt, "prompt_json": prompt_json,
@@ -408,18 +406,30 @@ def compile_stage_prompt(stage, shot, project_dir, mode="generate", board=None):
         return {"system_prompt": _STAGE_SYSTEM[stage], "content_prompt": content,
                 "negative_prompt": "", "asset_refs": refs, "asset_revisions": {}, "text": content}
 
-    media_type = "image" if stage in ("storyboard_image", "asset_image") else "video"
-    from prompt_assembler import assemble_shot_prompt
-    normalized = dict(shot)
-    normalized["asset_refs"] = refs
-    normalized["actor_refs"] = [r.split(":", 1)[1] for r in refs if r.startswith("@character:")]
-    normalized["prop_refs"] = [r.split(":", 1)[1] for r in refs if r.startswith("@prop:")]
-    scene_ref = next((r for r in refs if r.startswith("@scene:")), "")
-    if scene_ref:
-        normalized["scene_ref"] = scene_ref
-    project = {"dir": project_dir, "media_type": media_type,
-               "board": board if isinstance(board, dict) else _stage_board(project_dir, normalized, refs)}
-    assembled = assemble_shot_prompt(normalized, project)
+    if stage == "asset_image":
+        from skill_lib import ASSET_KIND_CONSTRAINTS, compose_asset_image_prompt
+        kind = str(shot.get("kind") or shot.get("asset_kind") or "").strip()
+        if kind not in ASSET_KIND_CONSTRAINTS:
+            raise ValueError("资产设定图必须指定 kind：character/scene/prop")
+        source = shot.get("sheet_prompt") or shot.get("image_prompt") or shot.get("prompt") or shot.get("content")
+        if not str(source or "").strip():
+            raise ValueError("资产设定图缺少外观或结构描述")
+        content, negative = compose_asset_image_prompt(
+            project_dir, source, skill_id=shot.get("style"), kind=kind, style_prompt=shot.get("style_prompt"))
+        assembled = {"prompt_assembled": content, "negative": negative, "asset_refs": refs}
+    else:
+        media_type = "image" if stage == "storyboard_image" else "video"
+        from prompt_assembler import assemble_shot_prompt
+        normalized = dict(shot)
+        normalized["asset_refs"] = refs
+        normalized["actor_refs"] = [r.split(":", 1)[1] for r in refs if r.startswith("@character:")]
+        normalized["prop_refs"] = [r.split(":", 1)[1] for r in refs if r.startswith("@prop:")]
+        scene_ref = next((r for r in refs if r.startswith("@scene:")), "")
+        if scene_ref:
+            normalized["scene_ref"] = scene_ref
+        project = {"dir": project_dir, "media_type": media_type,
+                   "board": board if isinstance(board, dict) else _stage_board(project_dir, normalized, refs)}
+        assembled = assemble_shot_prompt(normalized, project)
     all_refs = list(refs)
     revisions = {}
     try:

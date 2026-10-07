@@ -8,6 +8,7 @@ import { runWhiterange, whiteFromAnalysis, exportPreviz, fetchAnalysisList, fetc
 import { app, projectFiles, materialVideos, toast, loadBasics } from '../stores/app'
 import { trackJob } from '../stores/jobs'
 import StyledSelect from '../components/StyledSelect.vue'
+import SpatialWorkspaceNav from '../components/SpatialWorkspaceNav.vue'
 import DelBadge from '../components/DelBadge.vue'
 import Versions from '../components/Versions.vue'
 import UploadButton from '../components/UploadButton.vue'
@@ -278,23 +279,21 @@ useBoardSelection(storyboard, boards, 'white')
 </script>
 
 <template>
-  <div class="page">
-    <header class="mb-6">
-      <h1 class="grad-text text-2xl font-black">① 辅助·白模</h1>
-      <p class="mt-1 text-xs text-slate-500">按分镜 JSON 渲染指定镜头区间的白模视频（锁机位/走位/景别/节奏，不做美术）</p>
-    </header>
-
+  <div class="page-wide">
+    <SpatialWorkspaceNav active="white" />
+    <div class="grid items-start gap-4 xl:grid-cols-[360px_minmax(0,1fr)]">
+    <aside class="min-w-0">
     <!-- 参数条 -->
-    <div class="glass mb-5 flex flex-wrap items-end gap-3 p-4">
-      <label class="min-w-64 text-xs text-slate-400">
-        分镜 JSON（分镜/）
+    <div class="glass mb-4 flex flex-col gap-3 p-4">
+      <label class="text-xs text-slate-400">
+        分镜
         <StyledSelect v-model="storyboard" class="mt-1" :options="boards" :storage-key="`wb.${app.current}.white.board`" placeholder="— 选择分镜 —" />
       </label>
-      <label class="w-36 text-xs text-slate-400">
+      <label class="text-xs text-slate-400">
         镜头区间
         <input v-model="shots" class="input mt-1 tabular-nums" placeholder="S3-S8" />
       </label>
-      <label class="w-44 text-xs text-slate-400">
+      <label class="text-xs text-slate-400">
         引擎
         <StyledSelect
           v-model="engine"
@@ -308,6 +307,8 @@ useBoardSelection(storyboard, boards, 'white')
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path :d="icons.cube" stroke-linecap="round" stroke-linejoin="round"/></svg>
         {{ running ? '渲染中…' : '渲染白模' }}
       </button>
+      <details class="border-t border-line-soft pt-3">
+        <summary class="mb-2 cursor-pointer text-xs text-slate-400">导出参考素材</summary>
       <button
         class="btn btn-ghost"
         :disabled="exporting || !storyboard"
@@ -317,26 +318,29 @@ useBoardSelection(storyboard, boards, 'white')
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 3v12m0 0l-4-4m4 4l4-4M4 17v2a2 2 0 002 2h12a2 2 0 002-2v-2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         {{ exporting ? '导出中…' : '导出预演包' }}
       </button>
+      </details>
     </div>
 
     <!-- 从拉片解构生成分镜 -->
-    <div v-if="app.current" class="glass mb-5 flex flex-wrap items-end gap-3 p-4">
+    <details v-if="app.current" class="glass mb-4 p-4" :open="!boards.length">
+      <summary class="cursor-pointer text-xs font-bold text-slate-300">从拉片生成示意分镜</summary>
+      <div class="mt-3 flex flex-col gap-3">
       <div class="mr-auto">
-        <p class="text-xs font-bold text-slate-300">没有分镜？从拉片结构一键生成</p>
-        <p class="mt-0.5 text-xs-plus text-slate-500">把解构镜头表翻译成白模引擎契约：景别→机位、台词→镜内字幕（取 AI 归属后的真实人名）</p>
+        <p class="mt-0.5 text-xs-plus text-slate-500">按识别的景别与台词生成示意；人物站位和场景布局仍需核对。</p>
       </div>
-      <label class="min-w-56 text-xs text-slate-400">
+      <label class="text-xs text-slate-400">
         拉片版本
         <StyledSelect v-model="analysis" class="mt-1" :options="analyses.map((a) => a.name)" :storage-key="`wb.${app.current}.white.analysis`" placeholder="— 选择解构版本 —" />
       </label>
-      <label class="w-44 text-xs text-slate-400">
+      <label class="text-xs text-slate-400">
         人物姿态
         <StyledSelect v-model="pose" class="mt-1" :options="['stand', 'seated']" :labels="POSE_LABELS" :storage-key="`wb.${app.current}.white.pose`" />
       </label>
       <button class="btn btn-ghost" :disabled="converting || !analyses.length" @click="genFromAnalysis">
         {{ converting ? '生成中…' : '从解构生成分镜' }}
       </button>
-    </div>
+      </div>
+    </details>
 
     <EmptyState v-if="!app.current" title="请先在左侧选择项目" />
 
@@ -363,7 +367,7 @@ useBoardSelection(storyboard, boards, 'white')
           <button
             v-for="(s, i) in boardShots"
             :key="s.id || i"
-            class="flex w-full items-start gap-3 rounded-lg px-3 py-2 text-left transition"
+            class="flex w-full flex-wrap items-start gap-2 rounded-lg px-3 py-2 text-left transition"
             :class="rangeIdx.has(i)
               ? 'bg-sky-400/15 ring-1 ring-sky-400/40'
               : anchorId === s.id
@@ -390,11 +394,13 @@ useBoardSelection(storyboard, boards, 'white')
       </template>
     </section>
 
+    </aside>
+    <section class="min-w-0" aria-label="预演结果">
     <!-- 原片 vs 白模 对比（有白模视频时默认展开） -->
     <section v-if="app.current && products.length" class="glass mb-5 p-4">
       <h3 class="mb-3 flex items-center gap-2 text-xs font-bold text-slate-400">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="2"><path :d="icons.film" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        原片 vs 白模（播放/暂停/拖动双向联动）
+        原片与动态白模 · 联动播放
       </h3>
       <div class="grid grid-cols-1 gap-3 lg:grid-cols-2">
         <div class="overflow-hidden rounded-xl border border-line-soft bg-black/40">
@@ -455,13 +461,15 @@ useBoardSelection(storyboard, boards, 'white')
 
     <!-- 产物 -->
     <section v-if="app.current">
-      <h3 class="mb-2 text-xs font-bold text-slate-500">白模产物（白模/*.mp4）</h3>
+      <h3 class="mb-2 text-xs font-bold text-slate-500">已生成预演</h3>
       <div v-if="!products.length" class="glass p-12 text-center">
         <svg class="mx-auto mb-3 opacity-40" width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#38bdf8" stroke-width="1.5"><path :d="icons.cube" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <p class="text-sm text-slate-300">该项目还没有白模视频</p>
-        <p class="mt-2 text-xs text-slate-500">没有分镜 JSON？先用上方「从解构生成分镜」把拉片版本转成白模分镜，再选择区间渲染</p>
+        <p class="mt-2 text-xs text-slate-500">选择分镜与镜头区间后渲染，可在这里检查动作和切镜节奏。</p>
       </div>
-      <div v-else class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+      <details v-else>
+        <summary class="mb-3 cursor-pointer text-xs text-slate-400">全部预演与版本（{{ products.length }}）</summary>
+        <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <div v-for="p in products" :key="p.path" class="glass glass-hover group relative overflow-hidden" :style="{ '--glow': 'rgba(56,189,248,0.35)' }">
           <DelBadge :path="`白模/${p.file}`" :label="p.file" />
           <video :src="mediaUrl(p.path)" controls class="aspect-video w-full bg-black" preload="metadata"></video>
@@ -473,8 +481,11 @@ useBoardSelection(storyboard, boards, 'white')
             </a>
           </div>
         </div>
-      </div>
+        </div>
+      </details>
     </section>
+    </section>
+    </div>
   </div>
 </template>
 

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // -*- coding: utf-8 -*-
-/** Skill 中心：影视创作垂直 skill 库（拆剧本/导演风格/生图风格），SKILL.md 格式，编辑即下次运行生效 */
-import { ref, computed, onMounted } from 'vue'
+/** Skill 中心：项目内的创作策略文本与系统提示词。 */
+import { ref, computed, onMounted, watch } from 'vue'
 import { getJSON, postJSON, fetchSkillText, saveSkill, fetchKnowledge, saveCard, deleteCard, buildKnowledge, type KnowledgeSkill, type UserCard, type SkillItem } from '../api'
 interface AnyItem extends SkillItem { overridden?: boolean; text?: string }
 import { toast } from '../stores/app'
@@ -21,7 +21,7 @@ const saving = ref(false)
 const createVisible = ref(false)
 const newName = ref('')
 const newCat = ref('导演风格')
-const newTarget = ref('storyboard')
+const newDimension = ref('不指定')
 const newDesc = ref('')
 const newText = ref('')
 
@@ -30,6 +30,20 @@ const newText = ref('')
 const CAT_LABELS:Record<string,string> = { directing:'导演风格', 'image-style':'生图风格', script:'拆剧本', acting:'演员表演' }
 const CAT_SLUGS:Record<string,string> = { '导演风格':'directing', '生图风格':'image-style', '拆剧本':'script', '演员表演':'acting' }
 const TARGET_LABELS:Record<string,string> = { storyboard:'分镜', image:'生图', script:'剧本', acting:'表演' }
+const CATEGORY_TARGET:Record<string,string> = { '导演风格':'storyboard', '生图风格':'image', '拆剧本':'script', '演员表演':'acting' }
+const DIMENSION_LABELS:Record<string,string> = {
+  script_structure:'叙事结构', script_pacing:'剧情节奏', script_continuity:'连续性方法',
+  storyboard_camera:'镜头语言', storyboard_keyframe:'关键帧方法', storyboard_motion:'运动提示方法',
+  image_visual:'视觉画风', image_identity:'人物身份方法', acting_style:'表演方法'
+}
+const DIMENSIONS:Record<string,string[]> = {
+  script:['script_structure','script_pacing','script_continuity'],
+  storyboard:['storyboard_camera','storyboard_keyframe','storyboard_motion'],
+  image:['image_visual','image_identity'], acting:['acting_style']
+}
+const newTarget = computed(() => CATEGORY_TARGET[newCat.value] || 'script')
+const dimensionOptions = computed(() => ['不指定', ...(DIMENSIONS[newTarget.value] || [])])
+watch(newCat, () => { newDimension.value = '不指定' })
 const catLabel=(c?:string)=>CAT_LABELS[String(c||'')] || String(c||'')
 const targetLabel=(t?:string)=>TARGET_LABELS[String(t||'')] || String(t||'')
 const targetClass=(t?:string)=> t==='storyboard' ? 'bg-sky-400/15 text-sky-300'
@@ -141,11 +155,12 @@ async function create() {
   try {
     await postJSON('/api/skills/create', {
       category: CAT_SLUGS[newCat.value] || 'script', name: newName.value.trim(), target: newTarget.value,
+      dimension: dimensionOptions.value.includes(newDimension.value) && newDimension.value !== '不指定' ? newDimension.value : '',
       description: newDesc.value.trim(), text: newText.value
     })
-    toast('已创建（自定义，可直接拷入网上 SKILL.md 内容）', 'ok')
+    toast('创作策略已创建', 'ok')
     createVisible.value = false
-    newName.value = ''; newDesc.value = ''; newText.value = ''
+    newName.value = ''; newDesc.value = ''; newText.value = ''; newDimension.value = '不指定'
     await load()
   } catch (e) { toast(e instanceof Error ? e.message : '创建失败', 'err') }
 }
@@ -156,8 +171,8 @@ async function create() {
     <header class="mb-6">
       <h1 class="grad-text text-2xl font-black">③ Skill 配置</h1>
       <p class="mt-1 text-xs text-slate-500">
-        影视创作垂直 skill 库（SKILL.md 开放格式）：拆剧本 / 导演风格 / 生图风格。
-        项目在 ①②③ 页选定风格后，管线自动注入对应 LLM 调用；编辑正文即下次运行生效。网上社区 skill 可直接拷入新建。
+        创作策略用于剧本、分镜、画风和表演。系统提示词负责输出格式与任务边界；项目选择的策略仅影响对应阶段。
+        这里的策略是工作台 Markdown 文本，不会自动执行外部 Agent Skill 的工具或步骤。
       </p>
     </header>
 
@@ -180,6 +195,7 @@ async function create() {
             :class="targetClass(s.target)">
             {{ targetLabel(s.target) }}
           </span>
+          <span v-if="s.dimension" class="rounded bg-white/10 px-1.5 text-2xs text-slate-300">{{ DIMENSION_LABELS[s.dimension] || s.dimension }}</span>
           <span v-if="s.category === '系统提示词'" class="rounded bg-cyan-400/15 px-1.5 text-2xs text-cyan-300">系统提示词</span>
           <span v-if="(s as AnyItem).overridden" class="rounded bg-amber-400/15 px-1.5 text-2xs text-amber-300">已覆盖</span>
           <span v-if="!s.builtin && s.category !== '系统提示词'" class="rounded bg-violet-400/15 px-1.5 text-2xs text-violet-300">自定义</span>
@@ -195,7 +211,7 @@ async function create() {
       <div class="mb-3 flex flex-wrap items-center gap-3">
         <h3 class="text-sm font-bold text-slate-200">经验卡片 <span class="text-xs-plus font-normal text-slate-500">拉片沉淀 · 创作时自动垫上下文</span></h3>
         <span class="flex-1"></span>
-        <button class="btn btn-ghost" :disabled="kbRebuilding" @click="rebuildKb">{{ kbRebuilding ? '重建中…' : '从拉片重建' }}</button>
+        <button class="btn btn-ghost" :disabled="kbRebuilding" @click="rebuildKb">{{ kbRebuilding ? '更新中…' : '从拉片更新经验卡' }}</button>
         <button class="btn" @click="cardEditing = {}; cardForm = { skill: '', trigger: '', prescription: '', example: '' }">＋ 沉淀我的经验</button>
       </div>
       <p class="mb-3 text-xs-plus text-slate-500">
@@ -283,7 +299,7 @@ async function create() {
     <Teleport to="body">
       <div v-if="createVisible" class="overlay" @click.self="createVisible = false">
         <div class="glass w-full max-w-xl p-5">
-          <h3 class="mb-3 text-sm font-bold text-slate-200">新建 Skill（可粘贴网上社区 SKILL.md 正文）</h3>
+          <h3 class="mb-3 text-sm font-bold text-slate-200">新建创作策略</h3>
           <div class="mb-2 grid grid-cols-2 gap-2">
             <label class="text-xs text-slate-400">名称
               <input v-model="newName" class="input mt-1" placeholder="如：诺兰式时间结构" />
@@ -291,8 +307,9 @@ async function create() {
             <label class="text-xs text-slate-400">类别
               <StyledSelect v-model="newCat" class="mt-1" :options="['导演风格', '生图风格', '拆剧本', '演员表演']" storage-key="wb.skills.new.cat" />
             </label>
-            <label class="text-xs text-slate-400">注入目标
-              <StyledSelect v-model="newTarget" class="mt-1" :options="['storyboard', 'image', 'script', 'acting']" storage-key="wb.skills.new.target" />
+            <label class="text-xs text-slate-400">适用维度
+              <StyledSelect v-model="newDimension" class="mt-1" :options="dimensionOptions"
+                :labels="{ '不指定': '旧版通用槽位', ...DIMENSION_LABELS }" />
             </label>
             <label class="text-xs text-slate-400">一句话说明
               <input v-model="newDesc" class="input mt-1" />

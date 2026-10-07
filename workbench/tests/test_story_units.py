@@ -179,6 +179,20 @@ class StoryUnitsTests(unittest.TestCase):
         self.addCleanup(td3.cleanup)
         self.assertFalse(story_units.gap_report(str(root3), "E1", "神秘人：你是谁")["enabled"])
 
+    def test_gap_report_accepts_known_role_actions_and_crowd_dialogue(self):
+        import story_units
+        td, root = self.make_project(anchored=True)
+        self.addCleanup(td.cleanup)
+        text = '【场景：教室／日】\n蛛绪把本子放回桌面：我知道。\n佐藤回望，掌心微颤：等等。\n佐藤高举本子，他拉起蛛绪：跟我走。\n佐藤（低声）：别走。\n众人：谁来了？\n众声：等等！\n人群声（远近错落）：怎么了？\n另一侧民夫：发生什么事了？'
+        self.assertFalse(story_units.gap_report(root, 'E1', text)['blocking'])
+
+    def test_gap_report_does_not_conflate_relatives_or_numbered_new_roles(self):
+        import story_units
+        td, root = self.make_project(anchored=True)
+        self.addCleanup(td.cleanup)
+        report = story_units.gap_report(root, 'E1', '佐藤父亲：回家。\n佐藤甲：这边走。\n路人甲：我来。\n神秘人：停下。')
+        self.assertEqual([r['name'] for r in report['missing_speakers']], ['佐藤父亲', '佐藤甲', '路人甲', '神秘人'])
+
 
 class StoryUnitsWriteTests(unittest.TestCase):
     """第一步产物落盘：名册建档 / 幂等 / 设定投影 / 状态派生 / ② 投影约束块。"""
@@ -286,6 +300,13 @@ class StoryUnitsWriteTests(unittest.TestCase):
         self.su.apply_entities(str(self.root), {"characters": [{"ref": "@character:old_hero",
                                                                "bio_crack": "数头发"}]})
         self.assertEqual(self.su.authority_note(str(self.root), "人物"), "", "未锚定不注入")
+        self.su.apply_entities(str(self.root), {'characters': [
+            {'ref': ref, **{k: '完整设定' for k in self.su.CHAR_TEXT_KEYS if k != 'bio_crack'}, 'bio_crack': '数头发',
+             'appearance': dict(face='宽额', hair='短发', body_type='瘦高', outfit='布衣')}
+            for ref in ('@character:old_hero', '@character:rival')]})
+        self.su.apply_entities(str(self.root), {
+            'scenes': [{'ref': '@scene:room', 'spatial_limit': '门口可通行', 'action_slots': ['窗边']}],
+            'props': [{'ref': '@prop:leg', 'usage_boundary': '仅夜间发亮'}]})
         story_units_anchor = self.su.anchor(str(self.root))
         if not story_units_anchor.get("ok"):
             # 复用旧 id 后 hero 的 gender 缺失等 warn 不阻断；此处仍不通就是真缺陷
@@ -313,7 +334,8 @@ class StoryUnitsWiringTests(unittest.TestCase):
         import inspect
         import creation_pipeline
         import prompt_modules as PM
-        src_expand = inspect.getsource(creation_pipeline.cmd_expand)
+        self.assertIn("generate_episode_text", inspect.getsource(creation_pipeline.cmd_expand))
+        src_expand = inspect.getsource(creation_pipeline.generate_episode_text)
         self.assertIn("story_units.units_block", src_expand, "扩写要从 story_units 取注入块")
         self.assertEqual(src_expand.count("units_block"), 1, "不得在 cmd_expand 里再拼一份锚定文本")
         # 渲染函数本体只此一处
@@ -540,12 +562,38 @@ class UnitsHttpRouteTests(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertIn("E99", body["err"])
 
+    def test_expansion_gate_and_unlock_are_enforced_before_job(self):
+        root = self.make_project()
+        path = root / '剧本' / '大纲.json'
+        doc = json.loads(path.read_text(encoding='utf-8'))
+        doc['units_version'] = 1
+        path.write_text(json.dumps(doc), encoding='utf-8')
+        import story_units
+        chars_path = root / '素材' / '人物.json'
+        chars = json.loads(chars_path.read_text(encoding='utf-8'))
+        for row in chars['characters']:
+            row.update({key: row.get(key) or '完整人物设定' for key in story_units.CHAR_TEXT_KEYS})
+            row['appearance'] = dict(face='宽额', hair='短发', body_type='瘦高', outfit='布衣')
+        chars_path.write_text(json.dumps(chars, ensure_ascii=False), encoding='utf-8')
+        with patch.object(self.server.H, 'spawn_job', return_value=93) as spawn:
+            code, body = self.call('/api/script/expand', 'POST', {'project': 'unitstest', 'episode': 'E1'})
+            self.assertEqual(code, 409)
+            self.assertIn('确认', body['err'])
+            spawn.assert_not_called()
+            self.assertEqual(self.call('/api/units/anchor', 'POST', {'project': 'unitstest'})[0], 200)
+            self.assertEqual(self.call('/api/script/expand', 'POST', {'project': 'unitstest', 'episode': 'E1'})[0], 200)
+            self.assertEqual(spawn.call_count, 1)
+            self.assertEqual(self.call('/api/units/build', 'POST', {'project': 'unitstest'})[0], 409)
+            self.assertEqual(spawn.call_count, 1)
+            self.assertEqual(self.call('/api/units/edit', 'POST', {'project': 'unitstest', 'kind': 'unlock'})[0], 200)
+            self.assertFalse(self.call('/api/units?project=unitstest')[1]['workflow']['can_expand'])
+
     def test_build_dispatches_job_and_validates_project(self):
         root = self.make_project()
         self.assertEqual(self.call("/api/units/build", "POST", {"project": "nope"})[0], 400)
         with patch.object(self.server.H, "spawn_job", return_value=91) as spawn:
             code, body = self.call("/api/units/build", "POST",
-                                   {"project": "unitstest", "arc_size": 5, "anchor": True})
+                                   {"project": "unitstest", "arc_size": 5, "stage": "complete"})
         self.assertEqual((code, body["ok"], body["job"], body["id"]), (200, True, True, 91))
         self.assertEqual(spawn.call_args.args[0], "creation", "必须走既有 job 体系，前端才能看任务日志")
         cmd = spawn.call_args.args[1]
@@ -553,7 +601,11 @@ class UnitsHttpRouteTests(unittest.TestCase):
         self.assertEqual(cmd[2], "units")
         self.assertEqual(os.path.realpath(cmd[3]), os.path.realpath(str(root)), "项目目录没传对")
         self.assertEqual(cmd[cmd.index("--arc-size") + 1], "5")
-        self.assertIn("--anchor", cmd)
+        self.assertNotIn("--anchor", cmd)
+        self.assertEqual(cmd[cmd.index("--stage") + 1], "complete")
+        with patch.object(self.server.H, "spawn_job") as rejected:
+            self.assertEqual(self.call("/api/units/build", "POST", {"project": "unitstest", "anchor": True})[0], 400)
+            rejected.assert_not_called()
         # 不传 eps 时不该硬塞 --eps（否则会把默认 6 集覆盖掉 brief 的目标集数）
         with patch.object(self.server.H, "spawn_job", return_value=92) as spawn2:
             self.call("/api/units/build", "POST", {"project": "unitstest"})
@@ -616,11 +668,11 @@ class UnitsOrchestrationTests(unittest.TestCase):
         calls = self.patch_chat(['{"premise": "p", "arcs": [{"id": "ARC1", "ep_from": "E1", "ep_to": "E3"',
                                  json.dumps(self.good_payload(), ensure_ascii=False),
                                  json.dumps(self.good_payload(("E4", "E5", "E6"), "E6", "ARC2"), ensure_ascii=False),
-                                 json.dumps(self.U2_EMPTY)])
+                                 json.dumps(self.U2_EMPTY), json.dumps(self.U2_EMPTY)])
         rep = creation_pipeline.cmd_units(str(self.root), None, eps_n=6, arc_size=3)
-        self.assertEqual(len(calls), 4, "第一次截断→第二次重试同一批→第二段→U2")
+        self.assertEqual(len(calls), 5, "骨架截断重试→第二段→U2 无效批次拆分→单实体失败停止")
         self.assertIn("只输出一个 JSON 对象", json.dumps(calls[1][-1], ensure_ascii=False))
-        self.assertEqual(rep.get("incomplete"), [])
+        self.assertTrue(all(f.startswith('U2') for f in rep.get('incomplete', [])), rep)
         ids = [e["id"] for e in self.su.load_units(str(self.root))["episodes"]]
         self.assertEqual(ids[:6], ["E1", "E2", "E3", "E4", "E5", "E6"], "两段补齐后 6 集都在")
 
@@ -651,8 +703,34 @@ class UnitsOrchestrationTests(unittest.TestCase):
                                  RuntimeError("厂商 503"), RuntimeError("厂商 503"),         # 段2 两次都败
                                  json.dumps(self.U2_EMPTY)])
         rep = creation_pipeline.cmd_units(str(self.root), None, eps_n=6, arc_size=3, do_anchor=True)
-        self.assertEqual(len(rep["incomplete"]), 1)
+        self.assertEqual(len([f for f in rep['incomplete'] if not f.startswith('U2')]), 1)
         self.assertEqual(self.su.anchor_rev(str(self.root)), 0, "有段没补齐就不许锚定，否则权威底是半张")
+
+    def test_failed_check_never_forces_anchor(self):
+        """体检有 blocker 时只能保留草稿，自动流程不得反向 force 锚定。"""
+        import creation_pipeline
+        self.patch_chat([
+            json.dumps(self.good_payload(("E1", "E2", "E3", "E4", "E5", "E6"), "E6"), ensure_ascii=False),
+            json.dumps(self.U2_EMPTY, ensure_ascii=False),
+        ])
+        failed_report = {"ok": False, "errors": [{"code": "BLOCK", "path": "剧本", "message": "未通过"}],
+                         "warnings": [], "counts": {"errors": 1}}
+        with patch.object(creation_pipeline.story_units, "check", return_value=failed_report), \
+             patch.object(creation_pipeline.story_units, "anchor", return_value={"ok": False}) as anchor:
+            rep = creation_pipeline.cmd_units(str(self.root), None, eps_n=6, arc_size=6, do_anchor=True)
+        self.assertFalse(rep["ok"])
+        anchor.assert_not_called()
+
+    def test_asset_repository_reads_the_chinese_canonical_files(self):
+        """单类重跑必须读 人物/场景/道具.json，不能把英文 key 当文件名。"""
+        import creation_pipeline
+        (self.root / "素材" / "人物.json").write_text(json.dumps({"characters": [
+            {"id": "e1_hero", "name": "第一集人物", "episodes": ["E1"]},
+        ]}, ensure_ascii=False), encoding="utf-8")
+        documents, combined = creation_pipeline.load_asset_documents(str(self.root))
+        self.assertEqual([row["id"] for row in combined["characters"]], ["e1_hero"])
+        self.assertIn("人物", documents)
+        self.assertEqual(documents["人物"]["characters"][0]["name"], "第一集人物")
 
 
     def test_second_batch_merges_arcs_instead_of_wiping_them(self):
@@ -672,7 +750,9 @@ class UnitsOrchestrationTests(unittest.TestCase):
         self.assertEqual(next(a for a in outline["arcs"] if a["id"] == "ARC2")["ep_from"], "E3", "旧字段不能被后批留空擦掉")
         self.assertEqual(next(a for a in outline["arcs"] if a["id"] == "ARC2")["goal"], "第二段改文")
         self.assertEqual([r["id"] for r in outline["rules"]], ["R1", "R2"])
-        self.assertEqual(self.su.check(str(self.root))["errors"], [])
+        errors = self.su.check(str(self.root))["errors"]
+        self.assertEqual([e for e in errors if e['code'] not in ('CHARACTER_SETTINGS_INCOMPLETE', 'ASSET_SETTINGS_INCOMPLETE')], [])
+        self.assertIn('CHARACTER_SETTINGS_INCOMPLETE', [e['code'] for e in errors], '剧情骨架合并完成后仍须补人物设定')
 
     def test_stale_arc_reference_triggers_a_fresh_batch(self):
         """分段被覆写成分裂状态时（分集指向不存在的段），cmd_units 必须自己补回来而不是当已完成。"""
@@ -686,11 +766,11 @@ class UnitsOrchestrationTests(unittest.TestCase):
         calls = self.patch_chat([json.dumps(self.good_payload(("E1", "E2"), "E2"), ensure_ascii=False),
                                  json.dumps(self.good_payload(("E3", "E4", "E5", "E6"), "E6", "ARC2"),
                                             ensure_ascii=False),
-                                 json.dumps(self.U2_EMPTY)])
+                                 json.dumps(self.U2_EMPTY), json.dumps(self.U2_EMPTY)])
         rep = creation_pipeline.cmd_units(str(self.root), None, eps_n=6, arc_size=2)
-        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(calls), 4, "分段修复后，空设定响应须拆批并在单实体失败时停止")
         self.assertIn("E3", json.dumps(calls[1], ensure_ascii=False), "第二批必须去补 E3~E6")
-        self.assertEqual(rep.get("incomplete"), [])
+        self.assertTrue(all(f.startswith('U2') for f in rep.get('incomplete', [])), rep)
         codes = [e["code"] for e in self.su.check(str(self.root))["errors"]]
         self.assertNotIn("EP_ARC_REF", codes, "补批后分段引用应重新自洽")
         arcs = json.loads((self.root / "剧本" / "大纲.json").read_text(encoding="utf-8"))["arcs"]
@@ -832,7 +912,8 @@ class UnitsOrchestrationTests(unittest.TestCase):
             row = {"id": f"c{i}", "name": f"人物{i}"}
             if i == 0:
                 row.update({k: "已填" for k in ("bio_language", "bio_crack", "bio_pressure",
-                                                "bio_address", "bio_arc")})
+                                                "bio_address", "bio_arc", "biography")})
+                row['appearance'] = dict(face='宽额', hair='短发', body_type='瘦高', outfit='布衣')
             rows.append(row)
         (self.root / "素材" / "人物.json").write_text(json.dumps({"characters": rows}, ensure_ascii=False), encoding="utf-8")
         pend = self.su.pending_settings(str(self.root), per_round=12)

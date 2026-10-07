@@ -24,6 +24,7 @@ export interface StudioState {
   asset_previews?: {path: string; purpose: string; shot_id: string}[]
   /** 制作规格（E05）：V 总时长超过单集目标时长时后端给出的提示。 */
   brief_notice?: string
+  script_notice?: string
 }
 /** 局部修补（重做片段）候选的锚点溯源信息：redo.t0–t1 为拼回窗口，anchors 为原片首尾锚点帧。 */
 export interface RedoInfo {t0: number; t1: number; anchors?: {head: string; tail: string}; source_output?: {item_id: string; output_index: number; path?: string}; defer?: boolean; merged?: boolean; version?: string; version_name?: string; from_item?: string}

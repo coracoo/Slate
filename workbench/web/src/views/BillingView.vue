@@ -91,8 +91,8 @@ onMounted(load)
     <section class="mb-5 grid grid-cols-1 gap-3 sm:grid-cols-3">
       <div class="glass p-4" :style="{ '--glow': GLOW }">
         <div class="text-2xs text-slate-500">调用次数</div>
-        <div class="mt-1 text-2xl font-black text-slate-100">{{ summary?.total.calls ?? '—' }}</div>
-        <div class="mt-0.5 text-2xs text-slate-500">成功 {{ summary?.total.ok ?? 0 }} · 失败 {{ summary?.total.fail ?? 0 }}</div>
+        <div class="mt-1 text-2xl font-black text-slate-100">{{ summary?.total.ok ?? '—' }}</div>
+        <div class="mt-0.5 text-2xs text-slate-500">成功调用 · 失败 {{ summary?.total.fail ?? 0 }} 次（不计入）</div>
       </div>
       <div class="glass p-4" :style="{ '--glow': GLOW }">
         <div class="text-2xs text-slate-500">成功率</div>

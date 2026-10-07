@@ -12,6 +12,7 @@ import os
 import re
 import sys
 from pathlib import Path
+from functools import wraps
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -25,8 +26,31 @@ if CORE not in sys.path:
 
 import asset_relations
 import project_store
+import asset_repository
 from asset_registry import AssetRegistry, AssetReferenceError, normalize_asset_ref
 from production_state import bump_asset_revision, mark_stale_for_asset
+from narration import is_narrator
+from asset_matching import identity_match
+
+
+class AssetRelationError(ValueError):
+    status = 422
+
+    def __init__(self, message, issues):
+        super().__init__(message)
+        self.issues = issues
+
+
+class AssetConflict(ValueError):
+    status = 409
+
+
+def _asset_transaction(fn):
+    @wraps(fn)
+    def locked(project_dir, *args, **kwargs):
+        with asset_repository.locks(project_dir):
+            return fn(project_dir, *args, **kwargs)
+    return locked
 
 _META = {
     "character": ("人物.json", "characters", "人物"),
@@ -89,6 +113,7 @@ def _target_row(combined, kind, ident):
 
 
 def _write_changed(file_data, normalized, changed_kinds, snapshot):
+    docs, bases = {}, {}
     for kind in changed_kinds:
         path, raw, key = file_data[kind]
         rows = normalized.get(key, [])
@@ -96,13 +121,12 @@ def _write_changed(file_data, normalized, changed_kinds, snapshot):
         if current == rows:
             continue
 
-        def mutate(data, key=key, rows=rows):
-            if not isinstance(data, dict):
-                data = {}
-            data[key] = rows
-            return data
-
-        project_store.update_json(str(path), mutate, create_default={key: rows}, snapshot=snapshot)
+        name = '素材/'+path.name
+        bases[name] = raw if path.is_file() else None
+        docs[name] = {**raw, key: rows}
+    if docs:
+        result = asset_repository.commit(path.parent.parent, docs, source='manual', bases=bases)
+        asset_repository.require_applied(result)
 
 
 def _snapshot():
@@ -121,6 +145,19 @@ def _validate_target(normalized, kind, ident):
     # 关系归一化会保留 issues；只阻止当前对象的问题，旧档案中的孤立
     # 引用作为 warning，不阻断新素材保存。
     return target, target_ref
+
+
+def _relation_issues(normalized, issues, refs):
+    selected = set(refs)
+    result = [issue for issue in issues if issue.get('ref') in selected]
+    rows = {_ref(kind, str(row.get('id'))): row for kind, (_file, key, _zone) in _META.items()
+            for row in normalized.get(key, [])}
+    for ref in selected:
+        parent = rows.get(rows.get(ref, {}).get('parent_ref'))
+        if parent and parent.get('parent_ref'):
+            result.append({'ref': ref, 'field': 'parent_ref',
+                           'message': '资产关系最多两层，不能把资产挂到子素材下'})
+    return result
 
 
 def _prompt_refs(text: str, combined: dict) -> list[str]:
@@ -161,23 +198,29 @@ def _sync_prompt_relations(item: dict, prompt_refs: list[str]) -> None:
         item.pop("prompt_refs", None)
 
 
+@_asset_transaction
 def create_asset(project_dir: str, *, kind: str, id: str | None = None,
                  name: str, prompt: str = "", parent_ref: str | None = None,
                  relation: str | None = None, related_refs: list[str] | None = None,
-                 episode: str | None = None, fields: dict | None = None) -> dict:
+                 episode: str | None = None, fields: dict | None = None,
+                 derived_from: str | None = None, prop_kind: str | None = None) -> dict:
     """创建母素材或子素材，返回规范化后的注册表记录。"""
     project_dir = os.path.abspath(os.fspath(project_dir))
     kind = str(kind or "").strip()
     if kind not in _META or not str(name or "").strip():
         raise ValueError("项目、kind 或素材名不合法")
+    if kind == 'character' and (is_narrator(id) or is_narrator(name)):
+        raise ValueError('旁白是声音轨，不能创建人物素材；请在角色设定中绑定旁白音色')
     files, file_data, combined = _load(project_dir)
     ident = str(id or "").strip().lower()
     if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,63}", ident):
         ident = re.sub(r"[^a-z0-9]+", "_", str(name).lower()).strip("_")[:56] or "asset"
     if any(str(row.get("id") or "") == ident for rows in combined.values() for row in rows):
-        raise ValueError(f"资产 id 已存在：{ident}")
+        raise AssetConflict(f"资产 id 已存在：{ident}")
     item = {"id": ident, "name": str(name).strip(), "asset_revision": 1,
             "source_episode_ids": [str(episode).strip()] if str(episode or "").strip() else []}
+    item['parent_ref'] = str(parent_ref).strip() if parent_ref else None
+    item['locked_fields'] = ['parent_ref']
     if kind == "character":
         item.update({"role": "配角" if parent_ref else "主角", "is_collective": False,
                      "basis": "手工新增素材", "sheet_prompt": str(prompt or "").strip()})
@@ -185,7 +228,7 @@ def create_asset(project_dir: str, *, kind: str, id: str | None = None,
         item.update({"time": "日", "light": "日光", "interior": True, "geometry": [],
                      "image_prompt": str(prompt or "").strip()})
     else:
-        item.update({"kind": "关联素材" if parent_ref else "叙事", "asset_required": True,
+        item.update({"kind": prop_kind or ("关联素材" if parent_ref else "叙事"), "asset_required": True,
                      "owner": str(parent_ref or ""), "actions": [],
                      "image_prompt": str(prompt or "").strip(), "shot_hint": None})
     if isinstance(fields, dict):
@@ -195,21 +238,33 @@ def create_asset(project_dir: str, *, kind: str, id: str | None = None,
     if parent_ref:
         item["parent_ref"] = parent_ref
         item["relation"] = relation or ("located_in" if str(parent_ref).startswith("@scene:") else "component_of")
+        item['locked_fields'] = list(dict.fromkeys([*(item.get('locked_fields') or []), 'parent_ref', 'relation']))
+    if derived_from:
+        item['derived_from'] = str(derived_from).strip()
+        item['locked_fields'] = list(dict.fromkeys([*(item.get('locked_fields') or []), 'derived_from']))
     if isinstance(related_refs, list) and related_refs:
         item["related_refs"] = list(related_refs)
     prompt_field = "sheet_prompt" if kind == "character" else "image_prompt"
+    if item.get(prompt_field):
+        item['locked_fields'] = list(dict.fromkeys([*(item.get('locked_fields') or []), prompt_field]))
     _sync_prompt_relations(item, _prompt_refs(item.get(prompt_field, ""), combined))
     combined[_META[kind][1]].append(item)
     normalized, issues = asset_relations.normalize_asset_relations(combined)
     target, target_ref = _validate_target(normalized, kind, ident)
-    blocking = [issue for issue in issues if issue.get("ref") == target_ref]
+    blocking = _relation_issues(normalized, issues, [target_ref])
     if blocking:
-        raise ValueError("新素材关系无法解析：" + "；".join(str(x.get("message")) for x in blocking))
+        raise AssetRelationError("新素材关系无法解析：" + "；".join(str(x.get("message")) for x in blocking), blocking)
+    decision = target.get('identity_decision') if isinstance(target.get('identity_decision'), dict) else {}
+    if decision.get('action') != 'new':
+        existing = identity_match([row for row in normalized[_META[kind][1]] if row.get('id') != ident], target)
+        if existing:
+            raise AssetConflict(f"该身份已登记：{existing.get('name')}（{_ref(kind, existing['id'])}）；请复用现有素材或明确审核为独立身份")
     _write_changed(file_data, normalized, {kind}, _snapshot())
     registry = AssetRegistry(project_dir)
     return registry.resolve(target_ref)
 
 
+@_asset_transaction
 def edit_asset(project_dir: str, ref: str, patch: dict, *, expected_revision: str | None = None) -> dict:
     """编辑单个母/子素材设定并递增该素材修订号。"""
     if not isinstance(patch, dict):
@@ -230,7 +285,7 @@ def edit_asset(project_dir: str, ref: str, patch: dict, *, expected_revision: st
         except (TypeError, ValueError):
             actual = 1
         if expected != actual:
-            raise ValueError(f"资产版本已变化：当前 v{actual}，提交的是 v{expected}，请重新读取后再保存")
+            raise AssetConflict(f"资产版本已变化：当前 v{actual}，提交的是 v{expected}，请重新读取后再保存")
     before = copy.deepcopy(current)
     prompt_changed = False
     prompt_value = ""
@@ -242,22 +297,35 @@ def edit_asset(project_dir: str, ref: str, patch: dict, *, expected_revision: st
             prompt_changed = True
             prompt_value = str(value or "").strip()
             key = "sheet_prompt" if kind == "character" else "image_prompt"
-        if value in (None, "") and key in ("parent_ref", "relation", "derived_from", "related_refs"):
+        if key == 'parent_ref' and value in (None, ''):
+            current[key] = None
+        elif value in (None, "") and key in ("relation", "derived_from", "related_refs"):
             current.pop(key, None)
         else:
             current[key] = value
     if prompt_changed:
+        field = 'sheet_prompt' if kind == 'character' else 'image_prompt'
+        current['locked_fields'] = list(dict.fromkeys([*(current.get('locked_fields') or []), field]))
         _sync_prompt_relations(current, _prompt_refs(prompt_value, combined))
     elif current.get("prompt_refs"):
-        # 关系面板只改 related_refs 时，继续保留提示词自动关联。
         _sync_prompt_relations(current, list(current.get("prompt_refs") or []))
+    if 'visual_description' in patch:
+        if not isinstance(patch['visual_description'], str):
+            raise ValueError('视觉设定必须为文本')
+        current['locked_fields'] = list(dict.fromkeys([*(current.get('locked_fields') or []), 'visual_description']))
+    if 'derived_from' in patch:
+        current['locked_fields'] = list(dict.fromkeys([*(current.get('locked_fields') or []), 'derived_from', 'parent_ref']))
+    if 'parent_ref' in patch:
+        current['locked_fields'] = list(dict.fromkeys([*(current.get('locked_fields') or []), 'parent_ref']))
+    if kind == 'character' and is_narrator(current.get('id'), current):
+        raise ValueError('旁白是声音轨，不能把人物改为旁白素材')
     if current == before:
         registry = AssetRegistry(project_dir)
         return {"asset": registry.resolve(target_ref), "affected": {"shots": [], "reasons": {}}}
     bump_asset_revision(current)
     normalized, issues = asset_relations.normalize_asset_relations(combined)
     target, _ = _validate_target(normalized, kind, ident)
-    blocking = [issue for issue in issues if issue.get("ref") == target_ref]
+    blocking = _relation_issues(normalized, issues, [target_ref])
     if blocking:
         raise ValueError("资产关系无法保存：" + "；".join(str(x.get("message")) for x in blocking))
     _write_changed(file_data, normalized, {kind}, _snapshot())
@@ -275,4 +343,53 @@ def revision(project_dir: str, ref: str) -> int:
         return 1
 
 
-__all__ = ["create_asset", "edit_asset", "revision"]
+def set_relations(project_dir: str, updates: list, *, expected_revisions: dict | None = None) -> dict:
+    """在同一事务中保存整批关系；任一无效项不落盘。"""
+    if not isinstance(updates, list) or not updates or any(not isinstance(row, dict) for row in updates):
+        raise ValueError('关系更新必须是非空对象列表')
+    if expected_revisions is not None and not isinstance(expected_revisions, dict):
+        raise ValueError('expected_revisions 必须是对象')
+    with asset_repository.locks(project_dir):
+        _files, file_data, combined = _load(project_dir)
+        for kind, (path, raw, key) in file_data.items():
+            expected = (expected_revisions or {}).get(path.name) or (expected_revisions or {}).get(kind)
+            if expected is not None and expected != project_store.current_revision(path):
+                raise project_store.RevisionConflict(f'{path.name} 已有新修改，请重新读取后保存')
+        changed, seen = [], set()
+        for update in updates:
+            kind, ident, ref = _parse_ref(update.get('ref'))
+            if '#' in ident or ref in seen:
+                raise ValueError('关系更新需选择唯一的母或子素材，不能提交派生状态或重复项')
+            seen.add(ref)
+            row = _target_row(combined, kind, ident)
+            if row is None:
+                raise FileNotFoundError(f'找不到资产：{ref}')
+            before = copy.deepcopy(row)
+            for field in ('parent_ref', 'relation', 'derived_from', 'related_refs'):
+                if field not in update:
+                    continue
+                value = update[field]
+                if field == 'parent_ref' and value in (None, ''):
+                    row[field] = None
+                elif value in (None, ''):
+                    row.pop(field, None)
+                else:
+                    row[field] = [value] if field == 'related_refs' and isinstance(value, str) else value
+                row['locked_fields'] = list(dict.fromkeys([*(row.get('locked_fields') or []), field]))
+                if field == 'derived_from':
+                    row['locked_fields'] = list(dict.fromkeys([*row['locked_fields'], 'parent_ref']))
+            if row != before:
+                bump_asset_revision(row)
+                changed.append(ref)
+        normalized, issues = asset_relations.normalize_asset_relations(combined)
+        blocking = _relation_issues(normalized, issues, seen)
+        if blocking:
+            raise AssetRelationError('资产关系无法保存', blocking)
+        _write_changed(file_data, normalized, set(_META), _snapshot())
+        if changed:
+            mark_stale_for_asset(project_dir, changed)
+        return {'ok': True, 'updated': changed, 'assets': AssetRegistry(project_dir).list(),
+                'warnings': [issue for issue in issues if issue.get('ref') not in seen]}
+
+
+__all__ = ["create_asset", "edit_asset", "set_relations", "revision"]

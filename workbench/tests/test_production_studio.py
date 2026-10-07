@@ -125,8 +125,9 @@ class ProductionContractTests(unittest.TestCase):
         self.assertNotIn('prompt_video', shot)
         self.assertNotIn('prompt_grid', shot)
         with self.assertRaises(ValueError): require_prompts([shot])
-        # 宫格是按需人工字段：两类齐全即通过，不因缺宫格被拒
         shot['prompt_video'] = '起身连续动作'
+        with self.assertRaises(ValueError): require_prompts([shot])
+        shot['prompt_grid'] = '3×3，按起身动作分格'
         require_prompts([shot])
 
     def test_old_shot_editor_keeps_new_fields_and_bindings(self):
@@ -171,10 +172,11 @@ class ProductionExecutionTests(unittest.TestCase):
     def test_compile_request_uses_camera_safe_style_directive(self):
         """⑦ 提交必须吃镜头侧过滤后的画风词：整篇 skill 含「三视图/纯白背景」会把画面拉成白底设定图。"""
         (self.root / '剧本').mkdir()
-        (self.root / '剧本' / 'style.json').write_text(json.dumps({'image': 'identity-anchor'}), encoding='utf-8')
+        (self.root / '剧本' / 'style.json').write_text(json.dumps({'image': 'cinematic-real', 'image_identity': 'identity-anchor'}), encoding='utf-8')
         from production_requests import compile_request
         req = compile_request(self.root, self.body, self.cfg)
         self.assertIn('画风：', req['prompt'], '项目画风未注入 ⑦ 请求')
+        self.assertNotIn('身份锚点', req['prompt'])
         self.assertNotIn('三视图', req['prompt'])
         self.assertNotIn('纯白背景', req['prompt'])
 
@@ -275,7 +277,7 @@ class ProductionExecutionTests(unittest.TestCase):
             studio.save_units(self.root, self.path.name, self.board['video_units'], rev)
 
     def test_llm_prompts_refresh_keeps_prompt_grid(self):
-        # 宫格文案不被 LLM 刷新覆盖/清空——它是确定性排版的元数据，按需人工配置
+        self.board['shots'][0]['prompt_grid_source'] = 'authored'
         from production_jobs import llm_task
         _, rev = studio.read_board(self.root, self.path.name)
         client = Mock()
@@ -298,15 +300,18 @@ class ProductionExecutionTests(unittest.TestCase):
         self.board['shots'][0]['keyframe']['source_hash'] = media_source_hash([self.board['shots'][0]], 'image')
         self.path.write_text(json.dumps(self.board), encoding='utf-8')
         r2 = compile_request(self.root, body, self.cfg)
-        self.assertIn('表演指导', r2['prompt']); self.assertIn('施压', r2['prompt'])
+        self.assertIn('表演指导', r2['prompt']); self.assertIn('前倾按案', r2['prompt'])
+        self.assertNotIn('施压', r2['prompt'])
         def strip(p): return p.split('\n表演指导')[0]
         self.assertEqual(strip(r1['prompt']), strip(r2['prompt']))   # 表演段之外逐字不变
         perf['packet']['actors'][0]['beats'][0]['intent'] = '隐忍'
+        perf['packet']['actors'][0]['beats'][0]['posture'] = '低头收手'
         self.board['shots'][0]['performance'] = copy.deepcopy(perf)
         self.board['shots'][0]['keyframe']['source_hash'] = media_source_hash([self.board['shots'][0]], 'image')
         self.path.write_text(json.dumps(self.board), encoding='utf-8')
         r3 = compile_request(self.root, body, self.cfg)
-        self.assertNotEqual(r2['prompt'], r3['prompt']); self.assertIn('隐忍', r3['prompt'])
+        self.assertNotEqual(r2['prompt'], r3['prompt']); self.assertIn('低头收手', r3['prompt'])
+        self.assertNotIn('隐忍', r3['prompt'])
         # 过期表演（source_hash 不匹配）静默不注入
         self.board['shots'][0]['performance'] = {**copy.deepcopy(perf), 'source_hash': 'stale'}
         self.board['shots'][0]['keyframe']['source_hash'] = media_source_hash([self.board['shots'][0]], 'image')
@@ -322,7 +327,8 @@ class ProductionExecutionTests(unittest.TestCase):
         self.board['shots'][0]['keyframe']['source_hash'] = media_source_hash([self.board['shots'][0]], 'image')
         self.path.write_text(json.dumps(self.board), encoding='utf-8')
         r5 = compile_request(self.root, {**body, 'scope': 'S', 'target': 'S1', 'type': 'image'}, self.cfg)
-        self.assertIn('落定', r5['prompt']); self.assertNotIn('起势', r5['prompt'])
+        self.assertIn('直锁对方', r5['prompt']); self.assertNotIn('后仰', r5['prompt'])
+        self.assertNotIn('落定', r5['prompt'])
         # 采用表演 → 图片与视频指纹联动；关键帧也消费演员最终姿态，必须重生成或重新采用。
         unit = self.board['video_units'][0]
         with_perf = media_source_hash(self.board['shots'], 'video', unit)
@@ -550,11 +556,11 @@ class StoryboardGenerationChainTests(unittest.TestCase):
         import creation_pipeline as cp
         shots = [{"id": f"S{i}", "dur": 4, "shot_size": "中景", "camera_move": "固定",
                   "angle": "平视", "cam": "wide", "scene": "room", "action": "甲走动",
-                  "prompt_image": f"静帧{i}", "prompt_video": f"运动{i}", "lines": []}
+                  "prompt_image": f"静帧{i}", "prompt_video": f"运动{i}", "prompt_grid": f"3×3，动作{i}分格", "lines": []}
                  for i in range(1, 7)]
         llm_out = {"shots": shots,
                    "video_units": [{"shot_ids": [f"S{i}" for i in range(1, 7)],
-                                    "title": "整段", "prompt_video": "整段汇总视频描述"}]}
+                                    "title": "整段", "prompt_video": "整段汇总视频描述", "prompt_grid": "3×3，按S顺序分格"}]}
         with tempfile.TemporaryDirectory() as td:
             project = Path(td)
             (project / "剧本").mkdir()

@@ -270,11 +270,10 @@ async function runNormApply() {
     <!-- 大标题 -->
     <header class="mb-10">
       <h1 class="grad-text text-4xl font-black tracking-[0.08em] md:text-5xl" style="--c1:#22d3ee;--c2:#e879f9">
-        AI 短片分析工作台
+        Slate · 视频创作工作台
       </h1>
       <p class="mt-3 max-w-2xl text-sm leading-relaxed text-slate-400">
-        从源视频到台词时间轴、拉片解构、逐帧取样、深度校准与白模预演——一切以结构化数据为源，
-        让每一镜的镜头语言都可拆解、可复刻、可再创作。
+        从剧本制作或成片拆解开始，在同一个项目中管理分镜、素材与视频产出。
       </p>
     </header>
 
@@ -290,13 +289,9 @@ async function runNormApply() {
           </span>
           <div>
             <div class="text-lg font-black text-slate-100">制作 · 剧本创作</div>
-            <div class="text-xs-plus tracking-wider text-pink-300/80">SCRIPT → SHOTS → WHITEBOX</div>
           </div>
         </div>
-        <p class="text-xs leading-relaxed text-slate-400">
-          本地剧本 → LLM 分集 → 人物/场景/道具 → 分镜（知识库注入）→ Blender 白模 + 平面运镜图 + 拍摄资料包。
-          无片可拆、从零创作从这里进。
-        </p>
+        <p class="text-sm leading-relaxed text-slate-300">从构想或已有剧本开始，制作分集、分镜、素材和成片。</p>
       </button>
       <button
         class="glass glass-hover group relative overflow-hidden p-6 text-left"
@@ -308,13 +303,9 @@ async function runNormApply() {
           </span>
           <div>
             <div class="text-lg font-black text-slate-100">拆片 · 拉片解构</div>
-            <div class="text-xs-plus tracking-wider text-fuchsia-300/80">VIDEO → STRUCTURE</div>
           </div>
         </div>
-        <p class="text-xs leading-relaxed text-slate-400">
-          成片反推结构：拉片解构 / 台词归属 / 逐帧 / 深度校准 / 白模对位。
-          手里有片要学镜头语言、做逐帧复刻从这里进。
-        </p>
+        <p class="text-sm leading-relaxed text-slate-300">导入成片，提取镜头结构、台词和逐帧素材。</p>
       </button>
     </div>
 
@@ -329,13 +320,11 @@ async function runNormApply() {
       </button>
       <button class="btn btn-ghost" @click="openImport">
         <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path :d="icons.download" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        从 Downloads 导入
+        导入服务器本地视频
       </button>
-      <button class="btn btn-ghost" @click="openNorm">
-        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path :d="icons.folder" stroke-linecap="round" stroke-linejoin="round"/></svg>
-        整理项目
-      </button>
-      <span class="text-xs-plus text-slate-500">新建 = 项目目录 + 首个素材视频；导入 = 把 Downloads 源视频复制进已有项目 拉片素材/</span>
+      <details class="text-sm text-slate-300"><summary class="cursor-pointer">项目维护</summary>
+        <button class="btn btn-ghost btn-sm mt-2" @click="openNorm">整理项目目录</button>
+      </details>
     </div>
 
     <!-- 已隐藏开关：有隐藏项目时出现，临时查看/取消隐藏 -->
@@ -352,7 +341,7 @@ async function runNormApply() {
       <svg class="mx-auto mb-4 opacity-50" width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="1.5"><path :d="icons.folder" stroke-linecap="round" stroke-linejoin="round"/></svg>
       <p class="font-bold text-slate-200">还没有任何项目</p>
       <p class="mt-2 text-xs leading-relaxed text-slate-500">
-        从新建项目开始：填项目名 + 选一个本地视频<br />工作台会创建 projects/&lt;项目名&gt;/ 并导入首个素材
+        新建制作项目只需项目名；拆片项目还需导入一段视频。
       </p>
       <button
         class="btn mx-auto mt-5 px-6 py-2.5 text-sm shadow-[0_0_28px_-6px_rgba(34,211,238,0.7)]"
@@ -477,9 +466,6 @@ async function runNormApply() {
           <input v-model="createName" class="input" placeholder="如：08_我的短片" />
           <p v-if="createNameError" class="mt-1 text-xs-plus text-rose-300">{{ createNameError }}</p>
 
-          <label class="mb-1 mt-3 block text-2xs text-slate-500">
-            {{ createType === '制作' ? '上传参考视频（可选，作为拉片素材引用）' : '上传本地视频（必选，写入 拉片素材/）' }}
-          </label>
           <div class="mb-3 flex gap-2">
             <button
               v-for="t in (['拆片', '制作'] as const)"
@@ -494,6 +480,9 @@ async function runNormApply() {
               <span class="block text-2xs font-normal opacity-70">{{ t === '制作' ? '纯剧本创作，无需视频' : '有视频，走拉片解构' }}</span>
             </button>
           </div>
+          <label class="mb-1 mt-3 block text-xs text-slate-300">
+            {{ createType === '制作' ? '参考视频（可选）' : '源视频（必选）' }}
+          </label>
           <input
             type="file"
             accept=".mp4,.mkv,.mov"

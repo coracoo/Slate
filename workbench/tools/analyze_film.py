@@ -23,7 +23,7 @@ AI 字段含 transition（转场，受控词表）；词表见 VOCAB。
 依赖: ffmpeg/ffprobe(关键帧必需)；opencv(切点)；厂商 key 或 GLM key(AI 可选)。
 退出码: 0=成功 1=失败
 """
-import sys, os, json, re, glob, argparse, subprocess, shutil, datetime, base64, time
+import sys, os, json, re, glob, argparse, subprocess, shutil, datetime, base64, time, tempfile, threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -34,6 +34,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 VIDEO = os.path.realpath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 import llm_openai   # 厂商薄客户端（providers.json vendors 结构）
+sys.path.insert(0, os.path.join(VIDEO, 'previs_system', 'tools'))
+import project_store
+import versions
 
 # ---------- 小工具 ----------
 
@@ -310,9 +313,9 @@ def _compose_prompt(intro, transition_rule):
 - "camera_move": 运镜
 - "angle": 拍摄角度
 - "transition": 本镜是如何切入的（转场方式）
-- "lighting": 光线描述（一句短语，可空字符串）
-- "action": 画面中可见动作（一句短语，可空字符串）
-- "story": 该镜剧情信息（一句短语，可空字符串）
+- "lighting": 光线描述（一句短语，证据不足填「不确定」）
+- "action": 画面中可见动作（一句短语，证据不足填「不确定」）
+- "story": 该镜剧情信息（一句短语，证据不足填「不确定」）
 - "dialogue": 镜头内台词数组，每项 {{"speaker":"说话角色代称(如 c/v/unknown)","text":"台词"}}；无台词则为 []
 - "prompt_cn": 用这段画面重建镜头的文生视频中文提示词（一两句，含景别运镜主体动作）
 判据纪律（证据优先，禁止猜测）:
@@ -322,7 +325,7 @@ def _compose_prompt(intro, transition_rule):
 - "shot_size"/"angle" 同理：画面无法支撑判断（如黑场、严重模糊）就填 "不确定"。
 以下字段必须严格从给定词表选值（不要用词表外的值，不要用 null；"不确定" 是合法值，表示证据不足）:
 {VOCAB_LINES}
-lighting/action/story 是自由字符串（证据不足可留空字符串）。全部字段必须是字符串或数组。"""
+lighting/action/story 是自由字符串，证据不足时显式填「不确定」，不要漏字段或留空字符串。全部字段必须是字符串或数组。"""
 
 # 转场判据三档（E03 增强：转场交界帧）——按实际附上的交界帧数量选用
 _TR_RULE_FULL = """- "transition": 前 2 帧就是本镜的切入交界（上一镜结尾 vs 本镜开头），必须依据这两帧的
@@ -413,25 +416,175 @@ def ai_with_retry(fn, *args, retries=3, base=5):
                 continue
             raise
 
-def apply_ai_result(s, r):
+AI_TEXT_FIELDS = ('shot_size', 'camera_move', 'angle', 'lighting', 'action', 'story', 'prompt_cn', 'transition')
+
+
+def missing_ai_fields(shot):
+    from completion_values import has_text
+    return [field for field in AI_TEXT_FIELDS if not has_text(shot.get(field))]
+
+
+def apply_ai_result(s, r, *, only_empty=False):
     """把 AI 返回的 dict 应用到 shot（含 transition 词表校验，非法值置"无"并警告）。
     只改 AI 字段，绝不碰 t_in/t_out/duration/id/keyframes。"""
-    for k in ["shot_size", "camera_move", "angle", "lighting", "action", "story", "prompt_cn"]:
-        if isinstance(r.get(k), str): s[k] = r[k]
+    from completion_values import has_text
+    for k in AI_TEXT_FIELDS[:-1]:
+        if has_text(r.get(k)) and not (only_empty and has_text(s.get(k))): s[k] = r[k]
     tr = r.get("transition")
-    if isinstance(tr, str) and tr.strip():
+    if only_empty and has_text(s.get('transition')):
+        pass
+    elif isinstance(tr, str) and tr.strip():
         tr = tr.strip()
         if tr in VOCAB["transition"]: s["transition"] = tr
         else:
             print(f"[警告] {s.get('id','?')}: transition「{tr}」不在受控词表，置为「无」")
             s["transition"] = "无"
     elif "transition" not in s:
-        s["transition"] = "无"
-    if isinstance(r.get("dialogue"), list):
+        s["transition"] = ""   # 模型漏字段不能由程序默认值冒充完成。
+    if isinstance(r.get("dialogue"), list) and not (only_empty and 'dialogue' in s):
         s["dialogue"] = [{"speaker": str(d.get("speaker", "unknown")),
                           "text": str(d.get("text", "")),
                           "t_in": s["t_in"], "t_out": s["t_out"]}
-                         for d in r["dialogue"] if isinstance(d, dict) and d.get("text")]
+                          for d in r["dialogue"] if isinstance(d, dict) and d.get("text")]
+
+
+def ai_target_scope(shots, *, no_ai=False, available=True, max_ai=0):
+    """AI 的本次目标按镜头顺序限定；已复用的镜也计入前 N 镜配额。"""
+    if max_ai < 0:
+        raise ValueError('--max-ai 不能为负数')
+    if no_ai or not available:
+        return []
+    return list(shots[:max_ai] if max_ai else shots)
+
+
+def ai_progress(targets, failures, *, running=False, skipped=None, scope='all'):
+    """首次识别与 fill 共用完成判据；显式「不确定」有效，缺字段与空白仍未完成。"""
+    missing = {s['id']: fields for s in targets if (fields := missing_ai_fields(s))}
+    failed = {s['id']: failures[s['id']] for s in targets if s['id'] in failures}
+    complete = [s['id'] for s in targets if s['id'] not in missing and s['id'] not in failed]
+    status = 'skipped' if skipped is not None else 'running' if running else 'partial' if missing or failed else 'complete'
+    result = {'status': status, 'scope': scope, 'target_ids': [s['id'] for s in targets],
+              'completed_ids': complete, 'missing_fields': missing, 'failures': failed}
+    if skipped is not None:
+        result['skip_reason'] = skipped
+    return result
+
+
+def source_identity(video):
+    """同路径视频被替换时不能复用此前的识别；旧断点至少检查源路径与全部切点。"""
+    stat = os.stat(video)
+    return {'path': os.path.normcase(os.path.realpath(video)), 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns}
+
+
+def matching_checkpoint_shots(previous, video, segs, cut_detection, identity):
+    """仅原视频、切点与检测参数一致时保留旧字段；完整镜的复用由 missing_ai_fields 判定。"""
+    if not previous or os.path.normcase(os.path.realpath(previous.get('source') or '')) != os.path.normcase(os.path.realpath(video)):
+        return {}
+    if previous.get('source_identity') is not None and previous['source_identity'] != identity:
+        return {}
+    if previous.get('cut_detection') != cut_detection:
+        return {}
+    old = previous.get('shots') or []
+    if len(old) != len(segs):
+        return {}
+    for index, (shot, (start, end)) in enumerate(zip(old, segs)):
+        if (shot.get('id') != f'S{index + 1}' or
+            round(float(shot.get('t_in', -1)), 3) != round(start, 3) or
+            round(float(shot.get('t_out', -1)), 3) != round(end, 3)):
+            return {}
+    return dict(enumerate(old))
+
+
+class AnalysisCheckpoint:
+    """原子保存结构与有效识别字段，版本冲突或断点失败立即停止继续调用模型。"""
+    def __init__(self, path, analysis, revision=None):
+        self.path = os.path.abspath(path)
+        self.analysis = analysis
+        self.revision = revision
+        self.first_write = True
+        self.flag = os.path.join(os.path.dirname(self.path), '_partial.flag')
+
+    def save(self, *, partial=True):
+        try:
+            def replace(current):
+                if self.revision is None and os.path.isfile(self.path):
+                    raise project_store.RevisionConflict('分析文档已由别处创建，未覆盖')
+                current.clear()
+                current.update(self.analysis)
+            _, self.revision = project_store.update_json(self.path, replace, expected_revision=self.revision,
+                create_default={}, snapshot=versions.snapshot if self.first_write else None)
+            self.first_write = False
+            if partial:
+                fd, temporary = tempfile.mkstemp(prefix='._partial.', dir=os.path.dirname(self.path))
+                try:
+                    with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                        stream.write('partial')
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, self.flag)
+                finally:
+                    if os.path.isfile(temporary): os.unlink(temporary)
+        except Exception as exc:
+            print(f'[错误] 逐镜断点未能落盘，已停止后续模型调用：{exc}', flush=True)
+            raise
+
+    def finish(self):
+        """完成版已保存及登记后才清标记；删除失败不能伪报整次成功。"""
+        try:
+            os.remove(self.flag)
+        except FileNotFoundError:
+            pass
+
+
+def run_ai_targets(targets, analyze, checkpoint, failures, *, only_empty=False, workers=1, parallel=False):
+    """逐镜接受结果并保存；并行仅保留 workers 个在途任务，保存失败不再启动新镜。"""
+    checkpoint()
+    stop = threading.Event()
+    done = 0
+    def one(shot):
+        if stop.is_set(): raise RuntimeError('断点保存失败，取消未开始的识别')
+        return analyze(shot)
+    def accept(shot, future=None):
+        nonlocal done
+        try:
+            result = future.result() if future is not None else one(shot)
+            if not isinstance(result, dict): raise ValueError('识别结果必须是对象')
+            apply_ai_result(shot, result, only_empty=only_empty)
+            missing = missing_ai_fields(shot)
+            # 重新识别要求本次响应也完整；旧镜已有字段不能掩盖空对象或截断响应。
+            if not only_empty: missing = sorted(set(missing) | set(missing_ai_fields(result)))
+            if missing: raise ValueError('识别结果仍缺：' + '、'.join(missing))
+            failures.pop(shot['id'], None)
+            done += 1
+            print(f"  {shot['id']} AI 完成 ({done}/{len(targets)})")
+        except Exception as exc:
+            failures[shot['id']] = str(exc)
+            print(f"[警告] {shot['id']} AI 识别未完成（有效字段保留）：{exc}")
+        checkpoint()   # 保存错误不属于单镜模型错误，必须向外抛出。
+    workers = max(1, min(workers, 16))
+    if not parallel or workers == 1 or len(targets) < 2:
+        for shot in targets: accept(shot)
+    else:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        pending = {}
+        remaining = iter(targets)
+        try:
+            for _ in range(min(workers, len(targets))):
+                shot = next(remaining)
+                pending[executor.submit(one, shot)] = shot
+            while pending:
+                future = next(as_completed(pending))
+                shot = pending.pop(future)
+                accept(shot, future)
+                following = next(remaining, None)
+                if following is not None: pending[executor.submit(one, following)] = following
+        except BaseException:
+            stop.set()
+            for future in pending: future.cancel()
+            raise
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
+    return done
 
 # ---------- 输出生成 ----------
 
@@ -470,17 +623,29 @@ def write_markdown(a, outdir):
 def register_version(lapian_dir, name, entry):
     """向 拉片/_versions.json 追加版本记录；同名自动加 _vN 后缀。返回最终 name。"""
     vf = os.path.join(lapian_dir, "_versions.json")
-    vers = []
-    if os.path.isfile(vf):
-        try: vers = json.load(open(vf, encoding="utf-8"))
-        except Exception: vers = []
-    names = {v.get("name") for v in vers}
-    final = name; n = 2
-    while final in names:
-        final = f"{name}_v{n}"; n += 1
-    entry["name"] = final
-    vers.append(entry)
-    json.dump(vers, open(vf, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+    # 清单沿用数组契约；复用项目存储的文件锁，锁内读并原子替换，损坏时不回退空清单。
+    with project_store._exclusive(vf):
+        vers = []
+        if os.path.isfile(vf):
+            with open(vf, encoding='utf-8') as stream: vers = json.load(stream)
+        if not isinstance(vers, list) or any(not isinstance(row, dict) for row in vers):
+            raise ValueError('版本清单不是有效数组，未覆盖')
+        names = {v.get("name") for v in vers}
+        final = name; n = 2
+        while final in names:
+            final = f"{name}_v{n}"; n += 1
+        entry = {**entry, 'name': final}
+        vers.append(entry)
+        fd, temporary = tempfile.mkstemp(prefix='._versions.', dir=lapian_dir)
+        try:
+            with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+                json.dump(vers, stream, ensure_ascii=False, indent=1, allow_nan=False)
+                stream.flush()
+                os.fsync(stream.fileno())
+            if os.path.isfile(vf): versions.snapshot(vf)
+            os.replace(temporary, vf)
+        finally:
+            if os.path.isfile(temporary): os.unlink(temporary)
     return final
 
 # ---------- 台词并入（台词页合并结果 -> 独立音轨 dialogue_track + 各镜 dialogue 引用视图） ----------
@@ -550,7 +715,8 @@ def merge_lines_mode(a):
     aj = os.path.join(ad, "analysis.json")
     if not os.path.isfile(aj):
         print(f"[错误] analysis.json 不存在: {ad}"); sys.exit(1)
-    analysis = json.load(open(aj, encoding="utf-8"))
+    with open(aj, encoding='utf-8') as stream:
+        analysis = json.load(stream)
     n = merge_script_lines(analysis, os.path.dirname(os.path.dirname(ad)))
     errors, warnings = self_validate(analysis)
     for w in warnings: print(f"[警告] {w}")
@@ -596,16 +762,10 @@ def fill_mode(a):
     aj = os.path.join(ad, "analysis.json")
     if not os.path.isfile(aj):
         print(f"[错误] analysis.json 不存在: {ad}"); sys.exit(1)
-    analysis = json.load(open(aj, encoding="utf-8"))
+    analysis, revision = project_store.read_json(aj)
     shots = analysis.get("shots") or []
     if not shots:
         print("[错误] analysis.json 无 shots"); sys.exit(1)
-
-    client, gc, engine, why = pick_engine(a.vendor)
-    if not (client or gc):
-        print(f"[错误] {why}；无法跑 AI 填充（可配 GLM key 或用 --vendor 指定厂商）"); sys.exit(1)
-    print(f"[提示] {why}")
-    analysis["engine"] = engine
 
     if a.shots:
         wanted = {x.strip() for x in str(a.shots).split(",") if x.strip()}
@@ -613,20 +773,29 @@ def fill_mode(a):
         miss = wanted - {s.get("id") for s in targets}
         if miss: print(f"[警告] 这些镜号不存在，已跳过: {sorted(miss)}")
     elif a.only_empty:
-        targets = [s for s in shots if not s.get("shot_size") and not s.get("story")]
+        targets = [s for s in shots if missing_ai_fields(s)]
         print(f"[提示] --only-empty: 命中 {len(targets)} 镜空字段")
     else:
         targets = list(shots)
-    if a.max_ai: targets = targets[:a.max_ai]
+    targets = ai_target_scope(targets, max_ai=a.max_ai)
     if not targets:
         print("[提示] 没有需要识别的镜头"); return
 
-    okc = failc = 0
-    aj = os.path.join(ad, "analysis.json")
-    def _dump():
-        try: json.dump(analysis, open(aj, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
-        except Exception: pass
-    def _one(s):
+    store = AnalysisCheckpoint(aj, analysis, revision)
+    client, gc, engine, why = pick_engine(a.vendor) if not getattr(a, 'no_ai', False) else (None, None, 'none', '--no-ai')
+    print(f"[提示] {why}")
+    if not (client or gc):
+        analysis['ai'] = ai_progress([], {}, skipped=why, scope='fill')
+        analysis['ai']['requested_ids'] = [s['id'] for s in targets]
+        store.save(partial=True)
+        print('[错误] AI 补填未执行，结构与既有字段已保留，请配置可用厂商后继续')
+        raise SystemExit(1)
+    analysis['engine'] = engine
+    failures = {}
+    def checkpoint():
+        analysis['ai'] = ai_progress(targets, failures, running=True, scope='fill')
+        store.save(partial=True)
+    def one(s):
         kfl = [f0 for f0 in (s.get("keyframes") or []) if os.path.isfile(os.path.join(ad, f0))]
         if not kfl: raise FileNotFoundError("无关键帧文件")
         b, m = split_boundary_frames(kfl)
@@ -637,35 +806,16 @@ def fill_mode(a):
             b = ensure_boundary_frames(analysis, shots, idx, ad)
         fl = b + m   # 交界帧在前、镜内帧在后，与提示词描述一致
         if client:
-            return s, ai_with_retry(ai_analyze_shot_vendor, client,
+            return ai_with_retry(ai_analyze_shot_vendor, client,
                                     [os.path.join(ad, f0) for f0 in fl], len(b))
-        return s, ai_with_retry(ai_analyze_shot_glm, gc,
+        return ai_with_retry(ai_analyze_shot_glm, gc,
                                 [open(os.path.join(ad, f0), "rb").read() for f0 in fl], len(b))
     w = max(1, min(a.workers, 16))
     t0 = time.time()
-    if client and w > 1 and len(targets) > 1:
-        print(f"[提示] 厂商 vision 并发 {w} 路（--workers 可调）")
-        with ThreadPoolExecutor(max_workers=w) as ex:
-            for fut in as_completed({ex.submit(_one, s): s for s in targets}):
-                s = None
-                try:
-                    s, r = fut.result()
-                    apply_ai_result(s, r); okc += 1
-                    print(f"  {s['id']} 重识别完成 ({okc}/{len(targets)})")
-                except Exception as e:
-                    failc += 1
-                    print(f"[警告] {(s or {}).get('id', '?')} AI 识别失败（该镜保留原值）: {e}")
-                _dump()   # 逐镜落盘：中断不丢已识别结果
-    else:
-        for s in targets:
-            try:
-                _, r = _one(s)
-                apply_ai_result(s, r); okc += 1
-                print(f"  {s['id']} 重识别完成 ({okc}/{len(targets)})")
-            except Exception as e:
-                failc += 1
-                print(f"[警告] {s.get('id')} AI 识别失败（该镜保留原值）: {e}")
-            _dump()
+    if client and w > 1: print(f"[提示] 厂商 vision 并发 {w} 路（--workers 可调）")
+    okc = run_ai_targets(targets, one, checkpoint, failures, only_empty=a.only_empty, workers=w, parallel=bool(client))
+    analysis['ai'] = ai_progress(targets, failures, scope='fill')
+    failc = len(set(analysis['ai']['failures']) | set(analysis['ai']['missing_fields']))
     print(f"AI 阶段完成: 识别 {okc} / 失败 {failc}，耗时 {time.time() - t0:.0f}s")
 
     analysis["updated_at"] = datetime.datetime.now().isoformat(timespec="seconds")
@@ -675,12 +825,16 @@ def fill_mode(a):
     for w in warnings: print(f"[警告] {w}")
     if errors:
         for e in errors: print(f"[错误] {e}")
-        print("[错误] 自检未通过，未写出"); sys.exit(1)
-    json.dump(analysis, open(aj, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+        analysis['ai']['status'] = 'partial'
+        analysis['ai']['validation_errors'] = errors
+    store.save(partial=bool(errors or failc))
     write_markdown(analysis, ad)
-    print(f"完成: 识别 {okc} 镜 / 失败 {failc} 镜 -> {aj}")
+    print(f"{'未完成' if errors or failc else '完成'}: 识别 {okc} 镜 / 失败 {failc} 镜 -> {aj}")
     print(f"OUTPUT:{aj}")
     print(f"STATS:识别{okc}镜,失败{failc}镜")
+    if errors or failc:
+        raise SystemExit(1)
+    store.finish()
 
 def main():
     ap = argparse.ArgumentParser()
@@ -688,7 +842,7 @@ def main():
     ap.add_argument("--out", help="输出目录: projects/<项目>/拉片/<分析名>/（--fill 不需要）")
     ap.add_argument("--no-ai", action="store_true", help="跳过 AI 分析，字段留空")
     ap.add_argument("--vendor", default=None, help="指定厂商 id（缺省自动选 providers.json 里可用厂商）")
-    ap.add_argument("--max-ai", type=int, default=0, help="只对前 N 镜调 AI（防大片烧钱），0=不限")
+    ap.add_argument("--max-ai", type=int, default=0, help="本次仅要求前 N 镜完成 AI（含断点复用镜）；fill 按筛选顺序取前 N 镜，0=不限")
     ap.add_argument("--workers", type=int, default=4, help="厂商 vision 并发数（默认 4；429 限流时调小，1=串行）")
     ap.add_argument("--thresh", type=float, default=13.0, help="切点灵敏度阈值（透传 extract_shots.py，默认 13）")
     ap.add_argument("--min-dur", type=float, default=2.0, help="碎镜合并阈值(秒)，短于此并入相邻较长镜，0=不合并")
@@ -696,12 +850,13 @@ def main():
     ap.add_argument("--fill", metavar="分析目录", help="AI 填充模式：对已存在版本单独跑 AI（跳过切点/抽帧）")
     ap.add_argument("--merge-lines", metavar="分析目录", help="只把 台词脚本.json 并入已有版本 dialogue（无 AI，秒级）")
     ap.add_argument("--shots", default=None, help="--fill 用：只重识这些镜号，逗号分隔（如 S3,S5）")
-    ap.add_argument("--only-empty", action="store_true", help="--fill 用：只补 shot_size/story 均空的镜")
+    ap.add_argument("--only-empty", action="store_true", help="--fill 用：按 AI 字段补空缺，保留已有识别和人工内容")
     ap.add_argument("--transition-frames", dest="transition_frames", action="store_true",
                     default=True, help="抽转场交界帧供 AI 判断切入转场（默认开启）")
     ap.add_argument("--no-transition-frames", dest="transition_frames", action="store_false",
                     help="不抽交界帧（省抽帧耗时；transition 证据不足只能填「不确定」）")
     a = ap.parse_args()
+    if a.max_ai < 0: ap.error('--max-ai 不能为负数')
     if a.merge_lines:
         merge_lines_mode(a); return
     if a.fill:
@@ -716,12 +871,13 @@ def main():
         print("[错误] 未找到 ffmpeg（关键帧抽取必需）"); sys.exit(1)
 
     # AI 引擎选择：厂商（指定/自动）优先 -> GLM 环境变量兜底 -> no-ai
-    client = None; gc = None; engine = "none"
+    client = None; gc = None; engine = "none"; skipped = '--no-ai' if a.no_ai else None
     if not a.no_ai:
         client, gc, engine, why = pick_engine(a.vendor)
         print(f"[提示] {why}")
         if not client and not gc:
             print("[提示] 无可用厂商且未配 GLM key，自动走 --no-ai")
+            skipped = why
 
     det = detect_shots(video, ff, a.thresh)
     if not det or not det[0]:
@@ -739,11 +895,16 @@ def main():
     def _occupied(base):
         vf=os.path.join(lapian_dir,"_versions.json")
         if os.path.isfile(vf):
-            try:
-                if base in {v.get("name") for v in json.load(open(vf,encoding="utf-8"))}: return True
-            except Exception: pass
-        return os.path.isfile(os.path.join(lapian_dir,base,"analysis.json")) and \
-               not os.path.isfile(os.path.join(lapian_dir,base,"_partial.flag"))
+            with project_store._exclusive(vf):
+                with open(vf, encoding='utf-8') as stream: registered = json.load(stream)
+            if not isinstance(registered, list) or any(not isinstance(row, dict) for row in registered):
+                raise ValueError('版本清单不是有效数组，请修复后继续，未启动模型')
+            if base in {row.get('name') for row in registered}: return True
+        path = os.path.join(lapian_dir, base, 'analysis.json')
+        if not os.path.isfile(path) or os.path.isfile(os.path.join(lapian_dir, base, '_partial.flag')):
+            return False
+        data, _ = project_store.read_json(path)
+        return (data.get('ai') or {}).get('status') not in ('running', 'partial')
     def _unique_name(base):
         if not _occupied(base): return base
         n=2
@@ -756,34 +917,28 @@ def main():
         print(f"[提示] 版本名「{os.path.basename(outdir)}」已存在，本次产物写入「{_final}」（旧版本保留）")
         outdir=os.path.join(lapian_dir,_final)
     os.makedirs(outdir, exist_ok=True)
+    aj = os.path.join(outdir, 'analysis.json')
+    try:
+        previous, revision = project_store.read_json(aj)
+    except FileNotFoundError:
+        previous, revision = None, None
+    identity = source_identity(video)
     kf = extract_keyframes(video, segs, outdir, ff, a.transition_frames)
 
-    # 断点续跑：目录里有 _partial.flag 时，切点一致（同视频/参数）且已有内容的镜直接复用，不再烧钱
-    FLAG=os.path.join(outdir,"_partial.flag")
-    reuse={}
-    if os.path.isfile(FLAG):
-        try:
-            pa=json.load(open(os.path.join(outdir,"analysis.json"),encoding="utf-8"))
-            pm={x.get("id"):x for x in pa.get("shots") or []}
-            for i,(t0,t1) in enumerate(segs):
-                x=pm.get(f"S{i+1}")
-                if x and abs(x.get("t_in",-1)-round(t0,3))<0.05 and abs(x.get("t_out",-1)-round(t1,3))<0.05 \
-                   and (x.get("shot_size") or x.get("story")):
-                    reuse[i]=x
-        except Exception:
-            reuse={}
-        if reuse: print(f"[提示] 检测到上次中断的部分结果，复用 {len(reuse)}/{len(segs)} 镜（切点一致）")
+    # 断点续跑只复用原视频、全部切点与参数一致且 AI 字段完整的镜。
+    continuing = matching_checkpoint_shots(previous, video, segs, cut_detection, identity) if previous else {}
+    prior_failures = ((previous or {}).get('ai') or {}).get('failures') or {}
+    reuse = {i: shot for i, shot in continuing.items() if not missing_ai_fields(shot) and shot['id'] not in prior_failures}
+    if reuse: print(f"[提示] 检测到上次中断的部分结果，复用 {len(reuse)}/{len(segs)} 镜（原视频与切点一致、AI 字段完整）")
 
     shots = []
     for i, (t0, t1) in enumerate(segs):
-        if i in reuse:
-            shots.append(dict(reuse[i])); continue
-        s = {"id": f"S{i+1}", "t_in": round(t0, 3), "t_out": round(t1, 3),
-             "duration": round(t1 - t0, 3),
+        s = dict(continuing[i]) if i in continuing else {
              "shot_size": "", "camera_move": "", "angle": "", "lighting": "",
-             "action": "", "story": "", "dialogue": [], "prompt_cn": "",
-             "transition": "无",
-             "keyframes": kf[i]}
+             "action": "", "story": "", "dialogue": [], "prompt_cn": "", "transition": ""}
+        s.update({"id": f"S{i+1}", "t_in": round(t0, 3), "t_out": round(t1, 3),
+             "duration": round(t1 - t0, 3),
+             "keyframes": kf[i]})
         if i in merged_from:
             # 实际吞并过碎镜的镜保留全部原始切点边界（E02 切点溯源，消费方可选使用）
             s["merged_from"] = merged_from[i]
@@ -792,85 +947,54 @@ def main():
     for i, mf in merged_from.items():
         shots[i].setdefault("merged_from", mf)
 
-    ckpt_warned = []          # 落盘失败只提示一次的开关
-
-    def _checkpoint():
-        """逐镜落盘半成品（含 _partial.flag）：中断后重跑按镜复用，AI 调用费不白烧。"""
-        try:
-            json.dump({"name": os.path.basename(outdir), "version": 3, "source": video,
-                       "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
-                       "engine": engine, "cut_detection": cut_detection, "shots": shots},
-                      open(os.path.join(outdir, "analysis.json"), "w", encoding="utf-8"),
-                      ensure_ascii=False, indent=1)
-            open(FLAG, "w", encoding="utf-8").write("partial")
-        except Exception as exc:
-            # 断点写不进去 = "中断后按镜复用、AI 费不白烧"这个承诺当场失效。
-            # 只报第一次，避免几十镜的日志被同一句刷满。
-            if not ckpt_warned:
-                ckpt_warned.append(1)
-                print(f"[警告] 逐镜断点未能落盘（后续不再重复提示）：{exc}"
-                      f" —— 本次若中断，重跑会重新识别已完成的镜头（重复计费）", flush=True)
-
-    # AI 逐镜分析：厂商路径按 --workers 并发（GLM 兜底路径保持串行），逐镜 checkpoint
-    ai_done = len(reuse)
-    todo = []  # 按 max_ai 配额截取待识别镜
-    quota = a.max_ai if a.max_ai else len(shots)
-    for i, s in enumerate(shots):
-        if i in reuse or not ((client or gc) and kf[i]): continue
-        if quota <= 0: break
-        todo.append((i, s)); quota -= 1
+    analysis = dict(previous) if continuing else {}
+    analysis.update({"name": os.path.basename(outdir), "version": 3, "source": video,
+                "source_identity": identity,
+                "created_at": (previous or {}).get('created_at') or datetime.datetime.now().isoformat(timespec="seconds"),
+                "engine": engine, "cut_detection": cut_detection, "shots": shots})
+    targets = ai_target_scope(shots, no_ai=a.no_ai, available=bool(client or gc), max_ai=a.max_ai)
+    failures = {}
+    scope = 'limited' if a.max_ai else 'all'
+    store = AnalysisCheckpoint(aj, analysis, revision)
+    def checkpoint():
+        analysis['ai'] = ai_progress(targets, failures, running=True, skipped=skipped, scope=scope)
+        store.save(partial=True)
+    target_ids = {s['id'] for s in targets}
+    todo = [s for i, s in enumerate(shots) if s['id'] in target_ids and i not in reuse]
     t_ai0 = time.time()
-    def _run_one(item):
-        i, s = item
-        b, m = split_boundary_frames(kf[i])   # 交界帧在前、镜内帧在后，与提示词描述一致
+    def one(s):
+        available = [f0 for f0 in s['keyframes'] if os.path.isfile(os.path.join(outdir, f0))]
+        if not available: raise FileNotFoundError('无关键帧文件')
+        b, m = split_boundary_frames(available)   # 交界帧在前、镜内帧在后，与提示词描述一致
         fl = b + m
         if client:
-            return i, s, ai_with_retry(ai_analyze_shot_vendor, client,
+            return ai_with_retry(ai_analyze_shot_vendor, client,
                                        [os.path.join(outdir, f0) for f0 in fl], len(b))
-        return i, s, ai_with_retry(ai_analyze_shot_glm, gc,
-                                   [open(os.path.join(outdir, f0), "rb").read() for f0 in fl], len(b))
+        return ai_with_retry(ai_analyze_shot_glm, gc,
+                                    [open(os.path.join(outdir, f0), "rb").read() for f0 in fl], len(b))
+    ai_done = 0
     if todo:
         w = max(1, min(a.workers, 16))
-        if client and w > 1:
-            print(f"[提示] 厂商 vision 并发 {w} 路（--workers 可调）")
-            with ThreadPoolExecutor(max_workers=w) as ex:
-                futs = {ex.submit(_run_one, it): it for it in todo}
-                for fut in as_completed(futs):
-                    it = futs[fut]; s = it[1]
-                    try:
-                        _, _, r = fut.result()
-                        apply_ai_result(s, r); ai_done += 1
-                        print(f"  {s['id']} AI 完成 ({ai_done}/{len(todo) + len(reuse)})")
-                    except Exception as e:
-                        print(f"[警告] {s['id']} AI 分析失败（该镜留空）: {e}")
-                    _checkpoint()
-        else:
-            for it in todo:
-                i, s = it
-                try:
-                    _, _, r = _run_one(it)
-                    apply_ai_result(s, r); ai_done += 1
-                    print(f"  {s['id']} AI 完成 ({ai_done}/{len(todo) + len(reuse)})")
-                except Exception as e:
-                    print(f"[警告] {s['id']} AI 分析失败（该镜留空）: {e}")
-                _checkpoint()
-        print(f"AI 阶段完成: {ai_done - len(reuse)} 镜新识别 / {len(reuse)} 镜复用，"
-              f"耗时 {time.time() - t_ai0:.0f}s")
-
-    analysis = {"name": os.path.basename(outdir), "version": 3, "source": video,
-                "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
-                "engine": engine, "cut_detection": cut_detection, "shots": shots}
+        if client and w > 1: print(f"[提示] 厂商 vision 并发 {w} 路（--workers 可调）")
+        ai_done = run_ai_targets(todo, one, checkpoint, failures, workers=w, parallel=bool(client))
+        print(f"AI 阶段完成: {ai_done} 镜新识别 / {len(targets) - len(todo)} 镜复用，"
+               f"耗时 {time.time() - t_ai0:.0f}s")
+    analysis['ai'] = ai_progress(targets, failures, skipped=skipped, scope=scope)
     _nm = merge_script_lines(analysis, os.path.dirname(lapian_dir))
     if _nm: print(f"[提示] 已并入台词脚本 {_nm} 条（台词以台词页合并结果为准，AI 看帧台词被取代）")
     errors, warnings = self_validate(analysis)
     for w in warnings: print(f"[警告] {w}")
     if errors:
         for e in errors: print(f"[错误] {e}")
-        print("[错误] 自检未通过，未写出"); sys.exit(1)
-    json.dump(analysis, open(os.path.join(outdir, "analysis.json"), "w", encoding="utf-8"),
-              ensure_ascii=False, indent=1)
-    try: os.remove(FLAG)   # 完整落盘：清除断点标记，此后同名重跑会走 _vN 保护
-    except Exception: pass
+        analysis['ai']['status'] = 'partial'
+        analysis['ai']['validation_errors'] = errors
+    incomplete = bool(errors or analysis['ai']['failures'] or analysis['ai']['missing_fields'])
+    store.save(partial=incomplete)
+    if incomplete:
+        write_markdown(analysis, outdir)
+        print('[错误] 本次目标识别未完成，有效结果与断点已保留，未登记完成版本')
+        print(f'OUTPUT:{aj}')
+        raise SystemExit(1)
     lapian_dir = os.path.dirname(outdir)
     final = register_version(lapian_dir, analysis["name"],
                              {"name": analysis["name"], "created_at": analysis["created_at"],
@@ -881,10 +1005,12 @@ def main():
         if not os.path.exists(newdir):
             os.rename(outdir, newdir); outdir = newdir
             analysis["name"] = final
-            json.dump(analysis, open(os.path.join(outdir, "analysis.json"), "w", encoding="utf-8"),
-                      ensure_ascii=False, indent=1)
+            store.path = os.path.join(outdir, 'analysis.json')
+            store.flag = os.path.join(outdir, '_partial.flag')
+            store.save(partial=False)
         print(f"[提示] 版本名冲突，已改为 {final}")
     write_markdown(analysis, outdir)
+    store.finish()
     print(f"完成: {len(shots)} 镜 -> {os.path.join(outdir, 'analysis.json')}")
     print(f"OUTPUT:{os.path.join(outdir, 'analysis.json')}")
 

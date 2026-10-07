@@ -155,6 +155,9 @@ class VendorClient:
 
     def _url(self, kind):
         ep = self.endpoint(kind)
+        if self.id == 'runninghub' and kind in ('text', 'vision'):
+            base = str((self.cfg.get('extra') or {}).get('llm_base_url') or 'https://llm.runninghub.ai/v1').rstrip('/')
+            return base + '/' + ep.lstrip('/')
         if not ep.startswith("/"): ep = "/" + ep
         return self.base + ep
 
@@ -215,7 +218,8 @@ class VendorClient:
         except Exception as e:
             raise VendorError(f"请求异常: {e}")
 
-    def chat(self, messages, model=None, kind=None, max_tokens=2048, timeout=60, temperature=0.5, extra=None):
+    def chat(self, messages, model=None, kind=None, max_tokens=2048, timeout=60, temperature=0.5, extra=None,
+             trace_stage="", trace_sources=None, trace_input_revision=""):
         """chat/completions。kind 缺省时按消息是否包含图片自动选择 vision/text。extra: 厂商私有参数
         （如 Ark 的 {"thinking":{"type":"disabled"}} 关闭思考提速），失败由调用方兜底重试。"""
         if not self.base: raise VendorError(f"厂商 {self.id} 未配置 base_url")
@@ -226,6 +230,23 @@ class VendorClient:
         if model is None:
             model = self.models.get(resolved_kind) or ""
         if not model: raise VendorError(f"厂商 {self.id} 未配置 {kind or 'vision/text'} 模型")
+        self.last_prompt_trace = None
+        self.last_prompt_trace_error = ""
+        self.last_finish_reason = None
+        trace_project = getattr(self, "billing_project", None) or current_billing_project()
+        if trace_project:
+            try:
+                from prompt_trace import record_prompt_run
+                self.last_prompt_trace = record_prompt_run(
+                    trace_project, trace_stage or "chat", messages,
+                    vendor_id=self.id, model=model, kind=resolved_kind,
+                    sources=trace_sources, input_revision=trace_input_revision,
+                    parameters={"max_tokens": max_tokens, "temperature": temperature,
+                                "extra_keys": sorted(str(key) for key in extra) if isinstance(extra, dict) else []},
+                )
+            except Exception as exc:
+                self.last_prompt_trace_error = type(exc).__name__
+                print(f"[提示词追踪] 本次快照写入失败：{type(exc).__name__}", file=sys.stderr)
         if self.id == "gemini":
             from native_media import gemini_chat
             try:
@@ -250,6 +271,7 @@ class VendorClient:
         self.last_usage = data.get("usage") if isinstance(data.get("usage"), dict) else None
         try:
             result = data["choices"][0]["message"]["content"]
+            self.last_finish_reason = data["choices"][0].get('finish_reason')
         except Exception:
             err = VendorError("响应结构无法解析（缺少 choices[0].message.content）: " +
                               json.dumps(data, ensure_ascii=False)[:300])
@@ -321,11 +343,21 @@ class VendorClient:
         批量并发时厂商限流（429/5xx）自动退避重试；**超时不重试**——图可能已经生成并计费，
         重来一次就是二次扣费（文本 chat_retry 可以重试超时，是因为文本没有产出损失）。"""
         image_kind = "image_edit" if str(mode or "generate").lower() == "edit" else "image"
+        if self.id == 'runninghub' and image_refs:
+            image_kind = 'image_edit'
         resolved_model = model or self.models.get(image_kind) or ""
         if self.id in ("local-comfyui", "chatgpt-queue"):
-            return self._generate_image_impl(prompt, out_path, model=model, timeout=timeout, extra=extra,
-                                             negative_prompt=negative_prompt, image_refs=image_refs,
-                                             strict_negative=strict_negative, mode=mode)
+            # 免费通道不计费，但保留明细行（cost=None 不进合计，明细可审计）：
+            # 不计账的生成对账时"查无此行"反而是坑（产物有、账上没有）。
+            try:
+                out = self._generate_image_impl(prompt, out_path, model=model, timeout=timeout, extra=extra,
+                                                 negative_prompt=negative_prompt, image_refs=image_refs,
+                                                 strict_negative=strict_negative, mode=mode)
+                self._bill(image_kind, resolved_model, "generate_image", ok=True, units={"images": 1}, source="free-local")
+                return out
+            except VendorError as e:
+                self._bill(image_kind, resolved_model, "generate_image", ok=False, units={"images": 1}, error=str(e), source="free-local")
+                raise
         wait = 5
         for attempt in range(3):
             try:
@@ -334,7 +366,7 @@ class VendorClient:
                                                 strict_negative=strict_negative, mode=mode)
                 break
             except VendorError as e:
-                if attempt == 2 or not _rate_limited(str(e)):
+                if self.id == 'runninghub' or attempt == 2 or not _rate_limited(str(e)):
                     self._bill(image_kind, resolved_model, "generate_image", ok=False, error=str(e))
                     raise
                 print(f"[限流] {self.id} 生图被拒（{str(e)[:70]}），{wait}s 后第 {attempt + 2} 次", flush=True)
@@ -351,6 +383,9 @@ class VendorClient:
         image_refs: 豆包 Seedream 模型按 image 字段传 URL 或 data:image/*;base64 数据；未适配厂商仍拒绝降级。"""
         refs = list(image_refs or [])
         image_kind = "image_edit" if str(mode or "generate").lower() == "edit" else "image"
+        if self.id == 'runninghub':
+            from runninghub_client import image
+            return image(self, prompt, refs, out_path, model, timeout, extra, negative_prompt, mode)
         resolved_model = model or self.models.get(image_kind) or ""
         limit = reference_limit(self.id, resolved_model, image_kind, getattr(self, "cfg", None))
         if len(refs) > limit:
@@ -412,9 +447,16 @@ class VendorClient:
             if extra.get("duration"): units["seconds"] = extra["duration"]
             if extra.get("resolution"): units["resolution"] = extra["resolution"]
         if self.id == "local-comfyui":
-            return self._generate_video_impl(prompt, image_refs=image_refs, out_path=out_path, model=model,
-                                             timeout=timeout, poll_interval=poll_interval, poll_max=poll_max,
-                                             extra=extra, first_frame=first_frame, last_frame=last_frame)
+            # 免费通道不计费，但保留明细行（同生图口径）
+            try:
+                out = self._generate_video_impl(prompt, image_refs=image_refs, out_path=out_path, model=model,
+                                                 timeout=timeout, poll_interval=poll_interval, poll_max=poll_max,
+                                                 extra=extra, first_frame=first_frame, last_frame=last_frame)
+                self._bill("video", resolved_model, "generate_video", ok=True, units=units or None, source="free-local")
+                return out
+            except VendorError as e:
+                self._bill("video", resolved_model, "generate_video", ok=False, units=units or None, error=str(e), source="free-local")
+                raise
         try:
             out = self._generate_video_impl(prompt, image_refs=image_refs, out_path=out_path, model=model,
                                             timeout=timeout, poll_interval=poll_interval, poll_max=poll_max,
@@ -453,6 +495,10 @@ class VendorClient:
         mode = extra.pop('mode')
         if profile['endpoint']: self.endpoints['video'] = profile['endpoint']
         extra.update(audio_refs=audio_refs, video_refs=video_refs)
+        if self.id == 'runninghub':
+            from runninghub_client import video
+            return video(self, prompt, refs, out_path, resolved_model, timeout, poll_interval, poll_max,
+                         extra, mode, first_frame, last_frame)
         if profile['adapter'] == 'agnes':
             from agnes_video import generate
             return generate(self, prompt, refs, out_path, resolved_model, timeout, poll_interval, poll_max, extra, mode, first_frame, last_frame)
@@ -630,10 +676,17 @@ class VendorClient:
                    units={"chars": len(str(text or ""))})
         return out
 
-    def list_models(self, timeout=15):
+    def list_models(self, timeout=15, kind=None):
         """GET {base}/models 拉取模型列表。OpenAI 风格解析 data[].id；
         Gemini（generativelanguage.googleapis.com）用 ?key= 鉴权、解析 models[].name。"""
         if self.id == "chatgpt-queue": return ["chatgpt-web"]
+        if self.id == 'runninghub':
+            if kind in ('text', 'vision'):
+                base = str((self.cfg.get('extra') or {}).get('llm_base_url') or 'https://llm.runninghub.ai/v1').rstrip('/')
+                data = self._get(base + '/models', timeout)
+                return [m['id'] for m in data.get('data', []) if isinstance(m, dict) and m.get('id')]
+            from runninghub_catalog import model_options
+            return [r['id'] for r in model_options(kind)]
         if self.id == 'agnes': return ['agnes-video-2.5', 'agnes-video-2.5-flash']
         if self.id in {"minimax", "kling", "aliyun"}:
             return sorted(set(x for x in self.models.values() if x))

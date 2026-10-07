@@ -73,6 +73,9 @@ def video(c,prompt,refs,out_path,model,timeout,interval,max_wait,extra,first_fra
     _error(f'轮询超时，保留任务 ID {task}；请查询已有任务，勿重新生成')
 
 def audio(c,kind,text,out_path,model=None,timeout=300,extra=None):
+    if c.id == 'runninghub':
+        from runninghub_client import audio as rh_audio
+        return rh_audio(c,kind,text,out_path,model,timeout,extra)
     if c.id!='minimax':
         # 非 MiniMax 厂商走 OpenAI 兼容 /audio/speech（IndexTTS / Qwen3-TTS / GPT-SoVITS 等本地 TTS 包装服务的事实标准）
         if kind!='speech': _error('音乐生成当前仅支持 MiniMax')

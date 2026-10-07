@@ -3,10 +3,11 @@
 import copy
 import math
 import os
+import re
 import sys
 from pathlib import Path
 from production_studio import read_board, shot_list, shot_unit, timeline, inside, project_store
-from production_prompts import source_hash, media_source_hash, retime_prompt
+from production_prompts import source_hash, media_source_hash
 from production_media import bound_path, digest
 from reference_limits import reference_limit
 from brief import aspect_ratio_of
@@ -143,24 +144,9 @@ def compile_request(project, body, cfg):
         if (body.get('ref_mode') or 'keyframes') == 'grid':
             gb = unit.get('grid_binding')
             if not isinstance(gb, dict) or not gb.get('path'):
-                # 未显式采用时自动降级：取本 V 最新生成成功的宫格候选（用户已生成即视为认可），
-                # 两者皆无才报错。显式「采用为宫格参考」仍是正路（过期校验只对显式绑定生效）。
-                mf = Path(project) / '创作/creation.json'
-                auto = None
-                if mf.exists():
-                    cands = [i for i in project_store.read_json(mf)[0].get('items', [])
-                             if (i.get('action') == 'grid' or i.get('grid')) and i.get('unit_id') == target
-                             and i.get('board') == body['board'] and i.get('status') == 'done']
-                    if cands: auto = cands[-1]
-                if auto:
-                    raw = (auto.get('outputs') or [''])[0]
-                    rel = raw['path'] if isinstance(raw, dict) else raw
-                    if rel.startswith('projects/'): rel = rel.removeprefix('projects/' + Path(project).name + '/')
-                    gb = {'item_id': auto['id'], 'path': rel, 'sha256': digest(inside(project, rel)),
-                          'source_hash': media_source_hash(shots, 'image', unit),
-                          'purpose': '故事板宫格参考（自动选用最新候选）'}
-            if not isinstance(gb, dict) or not gb.get('path'):
-                raise ValueError('本 V 还没有故事板宫格图：请先在①整 V 直出点「生成宫格图」')
+                # E04 原则（生成≠采用）：宫格参考必须经显式「采用为宫格参考」——
+                # 自动抓最新候选会让"参考了哪张图"不可查（已提交测试锁死该闸）。
+                raise ValueError('尚未采用故事板宫格：请先在①整 V 直出点「生成宫格图」并采用为宫格参考')
             r = copy.deepcopy(gb); bound_path(project, r)
             if r.get('source_hash') and r['source_hash'] != media_source_hash(shots, r.get('source_kind') or 'image', unit):
                 # 必须与 adopt_grid 写入侧同公式（都是 shot_list(board, unit)）；此处原写 members，
@@ -188,16 +174,32 @@ def compile_request(project, body, cfg):
             refs.append(r)
         beats = timeline(board, unit)
         if any(not b['prompt'].strip() for b in beats): raise ValueError('成员 S 尚缺视频提示词，请先补全提示词')
-        for beat in beats:
-            prompt = retime_prompt(prompt, beat['shot_id'], beat['start'], beat['end'])
+        # 时间标签重写函数已删（用户 09-25 定版）：unit 正文保留作者层时间标签不改写，
+        # 实际节拍由下方时间轴行单独声明（N90 摘要行含起止秒）。
         # N90 时间轴瘦身+运镜执行句：unit 正文（authored 字段）不动；时间轴行=起止+运镜执行句
         # （camera_move 元数据译成可执行动作描述，图生视频模型对「缓推/固定」标签词服从度低——
         # V01 实证要求固定却持续剧烈运动）——避免同一内容两种措辞重复导致模型自由发挥。
         from production_prompts import camera_motion_sentence
         def _beat_line(s, b):
             motion = camera_motion_sentence(s)
-            digest = str(b['prompt'] or '').strip().split('；')[0].split('。')[0][:36]
-            return f"{b['start']:g}–{b['end']:g}｜{s['id']}｜镜头{motion}｜本镜只演这一镜，节拍：{digest}"
+            # 摘要剥掉作者层旧时间标签「【S1镜（0—3s）：」头——实际节拍由本行起止秒声明，
+            # 保留旧 0—3s 会与 0–5.714s 的真实分摊冲突（模型收到两个时长口径）。
+            digest = re.sub(r'^【S\d+镜[（(][^）)]*[）)][：:]?', '', str(b['prompt'] or '').strip())[:36]
+            # 本镜硬事实（lens/机位/画面/声音/光影/台词）随行补充：unit 正文可能是裸拍摘要，
+            # 这些字段只存在于 shot 元数据——丢了模型就拿不到焦距、场景物与声音（测试锁死）。
+            facts = []
+            for label, key in (('镜头', 'lens'), ('机位', 'angle'), ('画面', 'content'), ('动作', 'action'),
+                               ('声音', 'sound'), ('光影', 'lighting')):
+                value = str(s.get(key) or '').strip()
+                if value and value not in digest:
+                    facts.append(f'{label}：{value[:40]}')
+            from narration import is_narrator
+            for line in s.get('lines') or []:
+                speech = str((line.get('line') if isinstance(line, dict) else '') or '').strip()
+                if speech and not is_narrator(line.get('speaker')):
+                    facts.append(f'台词：{speech[:40]}')
+            fact_txt = ('｜' + '；'.join(facts)) if facts else ''
+            return f"{b['start']:g}–{b['end']:g}｜{s['id']}｜镜头{motion}｜本镜只演这一镜，节拍：{digest}{fact_txt}"
         details = '\n'.join(_beat_line(s, b) for s, b in zip(shots, beats))
         prompt = (prompt + '\n' if scope == 'V' else '') + '时间轴（秒，每段只演对应镜头，段间硬切）：\n' + details
     negative = str(unit.get('negative') or '')

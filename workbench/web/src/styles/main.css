@@ -5,7 +5,7 @@
   --color-panel: #111827;
   --color-line: rgba(148, 163, 184, 0.14);
   --color-line-soft: rgba(148, 163, 184, 0.07);
-  --text-2xs: 0.625rem;
+  --text-2xs: 0.6875rem;
   --text-xs-plus: 0.6875rem;
   --font-sans: 'PingFang SC', 'Microsoft YaHei', 'Noto Sans CJK SC', system-ui,
     -apple-system, 'Segoe UI', sans-serif;
@@ -44,6 +44,12 @@ main {
 }
 .page-wide {
   @apply w-full px-4 py-5;
+}
+
+/* 次要说明和表单标签保持可读，不依赖低对比度灰色呈现操作条件。 */
+.page .text-slate-500,
+.page-wide .text-slate-500 {
+  color: #a9b9ce;
 }
 
 /* ---------- 玻璃拟态卡片 ---------- */
@@ -134,11 +140,12 @@ main {
 .select,
 .textarea {
   width: 100%;
+  min-height: 2.5rem;
   background: rgba(2, 6, 23, 0.55);
   border: 1px solid var(--color-line);
   border-radius: 0.6rem;
   padding: 0.45rem 0.7rem;
-  font-size: 0.85rem;
+  font-size: 0.875rem;
   color: #e2e8f0;
   outline: none;
   transition:
@@ -166,7 +173,7 @@ main {
 }
 .textarea {
   resize: vertical;
-  line-height: 1.5;
+  line-height: 1.6;
 }
 }
 

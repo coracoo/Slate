@@ -11,6 +11,7 @@ from production_studio import project_store, inside, read_board
 from production_media import digest, probe
 from native_media import checked
 import versions
+import asset_repository
 
 try:
     import billing          # 计费账本；缺失时静默跳过
@@ -184,7 +185,7 @@ def bind(project, body):
                                  'name': '角色音乐·' + label, 'state': state_id})
             if variants: row['voice_variants'] = variants
             else: row.pop('voice_variants', None)
-        project_store.update_json(Path(project) / '素材' / '人物.json', mutate_state)
+        asset_repository.update_json(Path(project) / '素材' / '人物.json', mutate_state, source='voice_binding')
         return {'ok': True}
     voice = next((v for v in library(project)['voices'] if v['id'] == body.get('voice_asset_id') and v['revision'] == body.get('revision')), None)
     if not voice or not voice.get('sample'): raise ValueError('请先保存可试听的音色资产')
@@ -211,7 +212,7 @@ def bind(project, body):
         link = {'voice_asset_id': voice['id'], 'revision': voice['revision']}
         if variant: actor.setdefault('voice_variants', []).append({**link, 'name': name})
         else: actor['voice_binding'] = {**link, 'scope': 'project'}
-    project_store.update_json(Path(project) / '素材/人物.json', mutate)
+    asset_repository.update_json(Path(project) / '素材/人物.json', mutate, source='voice_binding')
     return {'ok': True}
 
 
@@ -280,8 +281,13 @@ def prepare(project, body, cfg):
         if voice is None:
             if cfg.get('id') == 'minimax':
                 raise ValueError('该说话人尚未绑定本厂商音色，请先在音色页试听并绑定')
+            default_voice = (cfg.get('extra') or {}).get('voice') or 'alloy'
+            if cfg.get('id') == 'runninghub':
+                default_voice = str((cfg.get('extra') or {}).get('voice_id') or '').strip()
+                if not default_voice:
+                    raise ValueError('该说话人尚未绑定 RH 音色；请绑定音色或在 RH 环境配置填写默认 voice_id')
             voice = {'character_id': str(body.get('character_id') or ''), 'character_name': '', 'id': '',
-                     'voice_id': (cfg.get('extra') or {}).get('voice') or 'alloy', 'profile': packet['profile']}
+                     'voice_id': default_voice, 'profile': packet['profile']}
         board, _ = read_board(project, body['board'])
         texts = []
         for s in board.get('shots', []):

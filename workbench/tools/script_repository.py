@@ -35,11 +35,18 @@ def _read(path, default):
         return default
 
 
+def script_mode(project):
+    """剧本来源口径：显式来源优先，旧分集项目兼容聚合正文。"""
+    book = _read(os.path.join(project, "剧本", "分集.json"), {})
+    source = _read(os.path.join(project, "剧本", "source.json"), {})
+    return book.get("mode") or source.get("mode") or ("generated" if book.get("episodes") else "imported")
+
+
 def load_script(project, episode_id=None):
     """读取项目剧本；generated 模式按分集顺序拼接有效正文。"""
     project = os.path.abspath(project)
     book = _read(os.path.join(project, "剧本", "分集.json"), {})
-    mode = book.get("mode") or _read(os.path.join(project, "剧本", "source.json"), {}).get("mode")
+    mode = script_mode(project)
     episodes = book.get("episodes") or []
     if episode_id:
         for ep in episodes:
@@ -103,7 +110,7 @@ def record_script_import(project):
 def _merge_states(old_states, new_states):
     """状态资产按 id 并集合并：分集提炼各报本集所见状态，轨迹跨集累积不覆盖。
 
-    同 id 状态：episodes 并集；其余字段以新值为准（后集通常描述更完整的变体）。"""
+    同 id 状态：episodes 并集；保留人工锁定及未被更新的扩展字段。"""
     merged = {}
     for st in list(old_states or []) + list(new_states or []):
         if not isinstance(st, dict) or not st.get("id"):
@@ -114,8 +121,15 @@ def _merge_states(old_states, new_states):
             for ep in st.get("episodes") or []:
                 if str(ep) not in eps:
                     eps.append(str(ep))
-            row = dict(st)
-            if eps:
+            previous = merged[sid]
+            locked = set(previous.get('locked_fields') or [])
+            row = dict(previous)
+            row.update({key: value for key, value in st.items() if key not in locked})
+            row['locked_fields'] = list(dict.fromkeys([*(previous.get('locked_fields') or []),
+                                                       *(st.get('locked_fields') or [])]))
+            if not row['locked_fields']:
+                row.pop('locked_fields', None)
+            if eps and 'episodes' not in locked:
                 row["episodes"] = eps
             merged[sid] = row
         else:
@@ -127,15 +141,24 @@ def _merge_item(old, new, episode_id):
     """合并单个资产，locked_fields 防止提炼覆盖人工确认内容。"""
     out = dict(old or {})
     locked = set(out.get("locked_fields") or [])
+    planning_wins = (out.get('source') == 'story_units' or out.get('settings_source') == 'story_units') and (new or {}).get('source') != 'story_units'
     for key, value in (new or {}).items():
         if key == "states":
             continue  # 状态轨在循环外按 id 并集合并，防止后集覆盖前集
         if key in locked or key in ('voice_binding', 'voice_variants'):
             continue
+        if planning_wins and key in ('image_prompt', 'prompt', 'sheet_prompt'):
+            continue
+        if planning_wins and out.get(key) not in (None, '', [], {}):
+            continue
+        if key == "appearance" and isinstance(value, dict):
+            from character_design import merge_generated_appearance
+            out[key] = merge_generated_appearance(out.get(key), value, fill_only=True, locked_fields=locked)
+            continue
         if value is not None and value != "":
             out[key] = value
     new_states = (new or {}).get("states")
-    if new_states:
+    if new_states and 'states' not in locked and not planning_wins:
         out["states"] = _merge_states(out.get("states"), new_states)
     eps = list(out.get("source_episode_ids") or [])
     if episode_id and episode_id not in eps:
@@ -206,7 +229,7 @@ def is_asset_prop(item):
     if not isinstance(item, dict) or not item.get("asset_required", True):
         return False
     kind = str(item.get("kind") or "叙事").strip()
-    return kind == "叙事" or bool(item.get("parent_ref") or item.get("relation") or item.get("derived_from")) or kind in ("关联素材", "服饰", "配饰", "组件")
+    return kind == "叙事" or bool(item.get("parent_ref") or item.get("relation") or item.get("derived_from")) or kind in ("关联素材", "服饰", "配饰", "组件", "显现/特效")
 
 
 _PROP_APPEARANCE_TERMS = (
@@ -365,47 +388,26 @@ def merge_assets(existing, incoming, episode_id=None):
         elif key == "props":
             new_items = [x for x in new_items if is_asset_prop(x)]
             new_items = _compact_prop_families(new_items)
-        by_id = {str(x.get("id")): (i, x) for i, x in enumerate(old_items) if x.get("id")}
-        # 人物/场景是项目级母素材：不同集里同名记录必须合并，保留最先出现
-        # 的稳定 id，其余 id 写入 aliases，供 @引用和父子关系解析。
-        by_name = {}
-        if key in ("characters", "scenes"):
-            for i, old in enumerate(old_items):
-                name_key = _asset_name_key(old.get("name"))
-                if name_key and name_key not in by_name:
-                    by_name[name_key] = (i, old)
         merged = list(old_items)
         for item in new_items:
             aid = str(item.get("id") or "").strip()
             if not aid:
                 continue
-            if aid in by_id:
-                index, old = by_id[aid]
-                merged[index] = _merge_item(old, item, episode_id)
-            elif key in ("characters", "scenes") and _asset_name_key(item.get("name")) in by_name:
-                index, old = by_name[_asset_name_key(item.get("name"))]
-                canonical_id = str(old.get("id") or "").strip()
-                merged_item = _merge_item(old, item, episode_id)
-                # _merge_item 会复制 incoming 的 id，这里恢复项目母素材的首个稳定 id。
-                merged_item["id"] = canonical_id or str(merged_item.get("id") or aid)
-                aliases = list(merged_item.get("aliases") or [])
-                if aid != str(merged_item.get("id") or "") and aid not in aliases:
-                    aliases.append(aid)
-                for alias in item.get("aliases") or []:
-                    if alias and alias not in aliases and alias != str(merged_item.get("id") or ""):
-                        aliases.append(alias)
-                if aliases:
-                    merged_item["aliases"] = aliases
-                merged[index] = merged_item
-                by_id[aid] = (index, merged_item)
+            from asset_matching import identity_match
+            hit = identity_match(merged, item)
+            if hit is not None:
+                canonical_id = str(hit['id'])
+                item = dict(item, id=canonical_id)
+                aliases = list(dict.fromkeys([*(hit.get('aliases') or []), *(item.get('aliases') or []),
+                    *([aid] if aid != canonical_id else []),
+                    *([item['name']] if item.get('name') and item['name'] != hit.get('name') else [])]))
+                item['aliases'] = aliases
+                index = merged.index(hit)
+                merged[index] = _merge_item(hit, item, episode_id)
+                merged[index]['aliases'] = aliases
             else:
                 added = _merge_item(item, {}, episode_id)
                 merged.append(added)
-                by_id[aid] = (len(merged) - 1, added)
-                if key in ("characters", "scenes"):
-                    name_key = _asset_name_key(added.get("name"))
-                    if name_key and name_key not in by_name:
-                        by_name[name_key] = (len(merged) - 1, added)
         if key == "props":
             merged = _compact_prop_families(merged)
         result[key] = merged

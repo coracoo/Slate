@@ -46,23 +46,27 @@ class SingleSource(unittest.TestCase):
         _sys, user = PM.characters_prompt("剧本", known=None)
         text = _sys + user
         self.assertIn(skill_lib.SHEET_VIEW_PANELS_ZH, text, '② 提炼提示词必须用权威五段，否则 LLM 会写出另一种说法')
-        self.assertIn('画面自领口往下', text)
+        self.assertIn('画面从颈部开始到脚底', text)
+        for wording in ('无头', '不带头部', '颈部以上不入画'):
+            self.assertNotIn(wording, text)
 
 
 class LayoutWording(unittest.TestCase):
-    def test_no_chinese_negation_for_the_headless_panels(self):
-        self.assertNotIn('不带头部', skill_lib.SHEET_VIEW_LAYOUT_ZH,
-                         '"不带头部"会被模型读成"不带头盔"，必须换成正面表述')
-        self.assertIn('画面自领口往下', skill_lib.SHEET_VIEW_LAYOUT_ZH)
-        self.assertIn('含头部背面', skill_lib.SHEET_VIEW_LAYOUT_ZH, '⑤ 不写清就会被连带画成无头')
+    def test_panels_use_positive_framing(self):
+        for wording in ('无头', '不带头部', '颈部以上不入画'):
+            self.assertNotIn(wording, skill_lib.SHEET_VIEW_LAYOUT_ZH)
+        self.assertEqual(skill_lib.SHEET_VIEW_LAYOUT_ZH.count('画面从颈部开始到脚底'), 2)
+        self.assertIn('含头部背面', skill_lib.SHEET_VIEW_LAYOUT_ZH)
 
     def test_hard_constraint_carries_an_english_twin(self):
         """图像模型对纯中文指令服从度低（本仓老坑），构图约束必须带英文对照。"""
         text = skill_lib.ASSET_KIND_CONSTRAINTS['character']
         self.assertIn(skill_lib.SHEET_VIEW_PANELS_ZH, text)
-        for needle in ('five panels', 'headless torso front view cropped at the collar',
-                       'nothing above the neck in this panel'):
+        for needle in ('five panels', 'front body view framed from the neck to the soles',
+                       'side body view framed from the neck to the soles'):
             self.assertIn(needle, text, f'英文对照缺了「{needle}」')
+        self.assertNotIn('headless', text)
+        self.assertNotIn('nothing above', text)
 
 
 class StripLayoutIsIdempotent(unittest.TestCase):

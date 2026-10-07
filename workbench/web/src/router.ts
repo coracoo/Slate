@@ -41,8 +41,8 @@ export const routes = [
   {
     path: '/acting',
     name: 'acting',
-    component: () => import('./views/ActingView.vue'),
-    meta: { title: '⑤ 演员表现', c1: '#f59e0b', c2: '#ec4899', icon: 'user' }
+    redirect: '/studio/characters#performance',
+    meta: { title: '角色设定', c1: '#f59e0b', c2: '#ec4899', icon: 'user' }
   },
   {
     path: '/white',
@@ -60,31 +60,32 @@ export const routes = [
     path: '/studio',
     name: 'studio',
     component: () => import('./views/StudioView.vue'),
-    meta: { title: '① 剧本生成', c1: '#ec4899', c2: '#f472b6', icon: 'chat' }
+    meta: { title: '剧本工作区', c1: '#ec4899', c2: '#f472b6', icon: 'chat' }
   },
+  { path: '/studio/characters', name: 'characters', component: () => import('./views/CharacterView.vue'), meta: { title: '角色设定', c1: '#a78bfa', c2: '#ec4899', icon: 'user' } },
   {
     path: '/studio/shots',
     name: 'studioShots',
     component: () => import('./views/StudioShotsView.vue'),
-    meta: { title: '③ 分镜生成', c1: '#f472b6', c2: '#e879f9', icon: 'clapper' }
+    meta: { title: '分镜设计', c1: '#f472b6', c2: '#e879f9', icon: 'clapper' }
   },
   {
     path: '/studio/asset',
     name: 'studioAsset',
     component: () => import('./views/StudioAssetView.vue'),
-    meta: { title: '② 素材生成', c1: '#a78bfa', c2: '#ec4899', icon: 'box3d' }
+    meta: { title: '视觉素材', c1: '#a78bfa', c2: '#ec4899', icon: 'box3d' }
   },
   {
-    path: '/studio/asset/voices', name: 'voiceAssets', component: () => import('./views/VoiceAssetsView.vue'),
-    meta: { title: '④ 音色绑定', c1: '#a78bfa', c2: '#ec4899', icon: 'box3d' }
+    path: '/studio/asset/voices', name: 'voiceAssets', redirect: '/studio/characters#voices',
+    meta: { title: '角色设定', c1: '#a78bfa', c2: '#ec4899', icon: 'box3d' }
   },
   {
     path: '/studio/redo', name: 'shotRedo', component: () => import('./views/ShotRedoView.vue'),
-    meta: { title: '⑦ 创作生成 · 片段重拍', c1: '#f472b6', c2: '#a78bfa', icon: 'frames' }
+    meta: { title: '镜头创作 · 片段重拍', c1: '#f472b6', c2: '#a78bfa', icon: 'frames' }
   },
   {
     path: '/create/free', name: 'freeCreate', component: () => import('./views/CreateView.vue'),
-    meta: { title: '⑧ 自由创作', c1: '#a78bfa', c2: '#ec4899', icon: 'clapper' }
+    meta: { title: '自由创作', c1: '#a78bfa', c2: '#ec4899', icon: 'clapper' }
   },
   {
     path: '/blender',
@@ -120,13 +121,13 @@ export const routes = [
     path: '/package',
     name: 'package',
     component: () => import('./views/PackageView.vue'),
-    meta: { title: '⑥ 平面推演', c1: '#22d3ee', c2: '#6ee7b7', icon: 'box3d' }
+    meta: { title: '空间验证', c1: '#22d3ee', c2: '#6ee7b7', icon: 'box3d' }
   },
   {
     path: '/create',
     name: 'create',
     component: () => import('./views/ProductionStudioView.vue'),
-    meta: { title: '⑦ 创作生成', c1: '#ec4899', c2: '#f472b6', icon: 'wand' }
+    meta: { title: '镜头创作', c1: '#ec4899', c2: '#f472b6', icon: 'wand' }
   }
 ]
 

@@ -82,8 +82,8 @@ def compile_redo_request(project, body, cfg):
     validate_media(cap, 'first_last', ['0', '1'], '0', '1', [], [])
     prompt = str(body.get('prompt') or unit.get('prompt_video') or '').strip()
     if not prompt: raise ValueError('修补提示词为空，请填写或先补全该 V 的视频提示词')
-    from skill_lib import image_skill_text
-    style = image_skill_text(str(project))
+    from prompt_assembler import skill_positive
+    style = skill_positive(str(project))
     if style: prompt += '\n画风：' + style
     prompt += (f'\n总时长 {t1 - t0:g} 秒。首尾帧已锁定为原片 {t0:g}s 与 {t1:g}s 的画面，'
                f'只生成两帧之间自然衔接的动作，保持人物身份与场景空间连续。')
@@ -186,8 +186,16 @@ def compile_grid_request(project, body, cfg):
                    '布局：3×3 九宫格，共 9 格（3 列 × 3 行），格子间细白线分隔，按从左到右、从上到下的顺序叙述。')
     prompt = ('生成一张完整的影视分镜故事板宫格图（一张图内含多个格子）。' + layout_line +
               f'整图画幅严格为 {aspect}，只遵循上面的分格布局，不增减格子。'
-              '把以下剧情按时间顺序分到各格，每格一个关键瞬间并轮换景别（远景/中景/近景/特写交替）；'
+              '把以下剧情按时间顺序分到各格，每格一个关键瞬间，景别与机位遵循对应镜头设计；'
               '所有格子中人物外貌、发型、服装、体型完全一致，场景空间与色调统一；格内不要任何文字或字幕。\n剧情：' + story)
+    if not is_shot and not layout:
+        designs = [f"{s['id']}：{s['prompt_grid']}" for s in members if s.get('prompt_grid')]
+        if designs:
+            prompt += '\n成员镜头设计（仅取动作顺序与构图，整图采用上面的统一布局，不嵌套宫格）：\n' + '\n'.join(designs)
+    from prompt_assembler import skill_positive
+    style = skill_positive(str(project))
+    if style:
+        prompt += '\n统一画风：' + style
     negs = []
     for s in members:
         n = s.get('negative') or []
@@ -208,13 +216,36 @@ def compile_grid_request(project, body, cfg):
         )
     return {'scope': 'S' if is_shot else 'V', 'target': target, 'label': label, 'board': body['board'], 'board_revision': revision,
             'shots': copy.deepcopy(members), 'unit': copy.deepcopy(unit),
-            'source_hash': media_source_hash(members, 'image', unit), 'type': 'image',
+            'source_hash': media_source_hash(members, 'grid', unit), 'type': 'image',
             'prompt': prompt, 'negative': negative, 'refs': refs, 'ref_mode': 'reference', 'prompt_grid': layout,
             'video_options': {}, 'image_options': {'ratio': aspect}, 'audio_urls': [], 'video_urls': [],
             'audio_media': [], 'video_media': [],
             'duration': unit.get('duration') if unit else members[0].get('dur'), 'continuity': {}, 'vendor_id': cfg['id'],
             'model': model, 'image_mode': image_mode, 'include_voices': False, 'voices': [], 'plan_refs': 0}
     # 注意：宫格生成包自己的 ref_mode 用中性 'reference'——若标 'grid'，execute 会把旧宫格/锚点拼图错当本次的参考图
+
+
+def prompt_basis(project, board, board_name):
+    """补写与优化沿用正式剧情和素材档案，保留整集镜头作为连续性依据。"""
+    import story_units
+    from episode_editor import episode_text, board_episode
+    units = story_units.load_units(project)
+    episode_id = board_episode(board_name, board)
+    episode = next((e for e in units['episodes'] if e.get('id') == episode_id), None)
+    references = set()
+    for shot in board.get('shots', []):
+        references.update(shot.get('asset_refs') or [])
+        references.update(shot.get('actor_refs') or [])
+        references.update(shot.get('prop_refs') or [])
+        if shot.get('scene_ref'):
+            references.add(shot['scene_ref'])
+    if episode:
+        for key in ('cast_refs', 'scene_refs', 'key_asset_refs'):
+            references.update(episode.get(key) or [])
+    assets = {f'@{kind}:{row["id"]}': row for kind, key in (('character', 'characters'), ('scene', 'scenes'), ('prop', 'props'))
+              for row in units[key] if f'@{kind}:{row["id"]}' in references}
+    return {'outline': units['outline'], 'episode': {**episode, 'text': episode_text(project, units['episodes_doc'], episode)} if episode else None,
+            'assets': assets, 'foreshadows': units['foreshadows'], 'episode_shots': board.get('shots', [])}
 
 
 def enqueue(project, body, spawn, providers):
@@ -249,6 +280,13 @@ def enqueue(project, body, spawn, providers):
         if not config or not (config.get('models') or {}).get('text'): raise ValueError('请选择已启用的文字模型')
         board, revision = read_board(project, body['board'])
         packet = {'board': body['board'], 'snapshot': board, 'board_revision': revision, 'vendor_id': config['id'], 'type': 'production'}
+        if action == 'prompts':
+            packet['only_missing'] = body.get('only_missing') is True
+            if body.get('revision') and body['revision'] != revision:
+                raise project_store.RevisionConflict('分镜已变化，请刷新后补齐提示词')
+        from skill_lib import storyboard_generation_context
+        packet['skill_context'] = storyboard_generation_context(project, persist_defaults=False)
+        packet['source_context'] = prompt_basis(project, board, body['board'])
         if action == 'optimize':
             scope = body.get('scope'); field = body.get('field')
             allowed = FIELDS if scope == 'S' else ('prompt_video', 'prompt_grid') if scope == 'V' else ()
@@ -323,7 +361,8 @@ def enqueue(project, body, spawn, providers):
             'scope': packet.get('scope', ''), 'unit_id': packet.get('target') if packet.get('scope') == 'V' else '',
             'shot_id': packet.get('target') if packet.get('scope') == 'S' else '', 'vendor_id': body.get('vendor_id', ''),
             'prompt': packet.get('prompt', action), 'source_hash': packet.get('source_hash', ''),
-            'request': request_file.relative_to(Path(project)).as_posix(), 'duration': packet.get('duration')}
+            'request': request_file.relative_to(Path(project)).as_posix(), 'duration': packet.get('duration'),
+            'board_revision': packet.get('board_revision')}
     if action == 'redo_segment':
         # 候选卡片标记「修补 t0–t1s」+ 锚点/来源溯源信息，随 creation.json 透出给前端。
         item['redo'] = {k: packet['redo'][k] for k in ('t0', 't1', 'anchors', 'source_output', 'defer') if k in packet['redo']}
@@ -357,6 +396,8 @@ def adopt_grid(project, body):
     item = next((i for i in project_store.read_json(mf)[0].get('items', []) if i.get('id') == body.get('item_id')), None)
     if not item: raise ValueError('宫格候选不存在，请刷新后重试')
     if not item.get('grid'): raise ValueError('该候选不是宫格图')
+    board_name = str(body.get('board') or item.get('board') or '')
+    if item.get('board') != board_name: raise ValueError('不能采用另一集的宫格产出')
     raw = (item.get('outputs') or [''])[0]
     rel = raw['path'] if isinstance(raw, dict) else raw
     if not rel: raise ValueError('该宫格候选没有图片')
@@ -365,9 +406,11 @@ def adopt_grid(project, body):
     board, _ = read_board(project, str(body.get('board') or item.get('board') or ''))
     unit = next((u for u in board.get('video_units', []) if u['id'] == (str(body.get('target') or '') or item.get('unit_id'))), None)
     if not unit: raise ValueError('分镜视频不存在')
+    if item.get('unit_id') != unit['id']: raise ValueError('宫格产出与分镜视频不匹配')
     members = shot_list(board, unit)
     binding = {'item_id': item['id'], 'output_index': 0, 'path': rel, 'sha256': digest(p),
-               'source_hash': media_source_hash(members, 'image', unit), 'purpose': '故事板宫格参考'}
+               'source_hash': media_source_hash(members, 'grid', unit), 'source_kind': 'grid',
+               'generated_source_hash': item.get('source_hash', ''), 'purpose': '故事板宫格参考'}
     def mutate(bd):
         u = next((x for x in bd.get('video_units', []) if x['id'] == unit['id']), None)
         if u: u['grid_binding'] = binding
@@ -401,16 +444,53 @@ def adopt(project, body):
 def llm_task(project, packet, client):
     from creation_pipeline import parse_json
     snapshot = packet['snapshot']
+    contract = CONTRACT + '\n' + str((packet.get('skill_context') or {}).get('text') or '')
+    contract += '\nsource_context 是只读剧情与素材依据；当前镜头事实和用户已填文本约束输出。背景、其他镜头与派生仅用于连续性理解，不把后续事件提前写入当前镜头，不凭背景新增角色、动作或台词；素材仍使用稳定引用，不复制整份外观档案。'
+    if packet['action'] == 'prompts' and packet.get('only_missing'):
+        pending = [s for s in snapshot['shots'] if any(not str(s.get(f) or '').strip() for f in LLM_FIELDS)]
+        revision = packet['board_revision']
+        for start in range(0, len(pending), 4):
+            batch = pending[start:start + 4]
+            response = client.chat([
+                {'role': 'system', 'content': contract + '\n只补当前镜头的空白提示词。返回 shots 数组，每项含原 id 及缺失的 prompt_image/prompt_video/prompt_grid 字段；保持已有提示词和镜内事实。'},
+                {'role': 'user', 'content': json.dumps({'source_context': packet.get('source_context', {}), 'shots': batch}, ensure_ascii=False)}
+            ], kind='text', max_tokens=12000, timeout=720, extra={'thinking': {'type': 'disabled'}}, trace_stage='production_prompts_missing')
+            rows = parse_json(response).get('shots') or []
+            if not all(isinstance(r, dict) for r in rows) or [r.get('id') for r in rows] != [s['id'] for s in batch]:
+                raise ValueError('补齐提示词返回的镜号或数量不符，当前批未保存；已完成批次保留')
+            patches = {}
+            for old, row in zip(batch, rows):
+                patch = {}
+                for field in LLM_FIELDS:
+                    if not str(old.get(field) or '').strip():
+                        value = row.get(field)
+                        if not isinstance(value, str) or not value.strip():
+                            raise ValueError(f'{old["id"]} 缺少 {field}，当前批未保存；已完成批次保留')
+                        patch[field] = value.strip()
+                        patch[field + '_source'] = 'llm'
+                patches[old['id']] = patch
+                require_prompts([{**old, **patch}])
+                if 'prompt_image' in patch:
+                    patch['prompt'] = patch['prompt_image']
+            def fill(board):
+                for shot in board['shots']:
+                    if shot['id'] in patches:
+                        shot.update(patches[shot['id']])
+            _, revision = project_store.update_json(board_path(project, packet['board']), fill,
+                expected_revision=revision, snapshot=__import__('versions').snapshot)
+            print(f'[提示词补齐] 已保存 {min(start + 4, len(pending))}/{len(pending)} 镜', flush=True)
+        return
     if packet['action'] == 'optimize':
         from production_prompts import EDIT_FORMAT, format_shot_prompt
         rows = snapshot['shots'] if packet['scope'] == 'S' else snapshot.get('video_units', [])
         target = next(r for r in rows if r['id'] == packet['target'])
         members = [target] if packet['scope'] == 'S' else shot_list(snapshot, target)
         response = client.chat([
-            {'role': 'system', 'content': CONTRACT + '\n' + EDIT_FORMAT + '\n只优化指定字段，返回 JSON {"text":"优化后的完整提示词"}，不要输出其他字段。'
-              + ('宫格提示词=一次生图调用出多格故事板的分格说明：第一行写布局——必须是多格宫格形态（默认九宫格 3×3 共 9 格；剧情节奏需要可用 4×4 或 25 宫格 5×5；禁止 1×N 单条横版）；随后按剧情时间顺序写每格关键瞬间（格1…、格2…，轮换景别）；结尾注明：所有格子人物外貌服装完全一致、场景色调统一、格内无文字。它是给生图模型的出图说明，不是单帧画面描述，不要写焦距/光圈式长句。' if packet['field'] == 'prompt_grid' else '')},
-            {'role': 'user', 'content': json.dumps({'field': packet['field'], 'current_text': packet['current_text'], 'shots': members}, ensure_ascii=False)}
-        ], kind='text', max_tokens=12000, timeout=720, extra={'thinking': {'type': 'disabled'}})
+            {'role': 'system', 'content': contract + '\n' + (EDIT_FORMAT if packet['field'] != 'prompt_grid' else '') + '\n只优化指定字段，返回 JSON {"text":"优化后的完整提示词"}，不要输出其他字段。'
+              + ('宫格提示词=一次生图调用出多格故事板的分格说明：先保留当前明确的行列布局，未指定时采用3×3；禁止1×N长条。随后按剧情顺序写每格关键瞬间，景别与机位遵循本镜设计，不强制切换。结尾注明人物身份服装、场景色调一致、格内无文字。保留用户新增内容，不套单帧时间标签。' if packet['field'] == 'prompt_grid' else '')},
+            {'role': 'user', 'content': json.dumps({'source_context': packet.get('source_context', {}), 'field': packet['field'], 'current_text': packet['current_text'], 'shots': members}, ensure_ascii=False)}
+        ], kind='text', max_tokens=12000, timeout=720, extra={'thinking': {'type': 'disabled'}},
+           trace_stage='prompt_optimize_' + packet['field'])
         value = str(parse_json(response).get('text') or '').strip()
         if not value: raise ValueError('模型返回空提示词，原文已保留')
         if packet['scope'] == 'S':
@@ -433,15 +513,16 @@ def llm_task(project, packet, client):
                                   snapshot=__import__('versions').snapshot)
         return
     if packet['action'] == 'prompts':
-        instruction = '只补写 shots 的 prompt_image 与 prompt_video 两类提示词，镜号、镜头顺序和所有事实不得改变。返回 shots 数组（id 与这两个 prompt 字段）。宫格文案是人工配置字段，不要生成。'
+        instruction = '只补写 shots 的 prompt_image、prompt_video、prompt_grid 三类提示词，镜号、镜头顺序和所有事实不得改变。返回 shots 数组（id 与这三个 prompt 字段）。'
     else:
         cap = duration_cap()
-        instruction = (f'只输出 video_units 分组及 prompt_video/negative/title，不重写 shots，也不要生成宫格文案。'
+        instruction = (f'只输出 video_units 分组及 prompt_video/prompt_grid/negative/title，不重写 shots；宫格按成员 S 的动作与宫格设计汇总为一个整体布局。'
                       f'分组目标时长：每个 V 的成员 dur 之和不超过 {cap} 秒——同场景连续优先合并，'
                       f'同一段剧情尽量放在一起，时长放不下就切到下一个 V；超上限的分组保存时会被自动拆分。')
-    response = client.chat([{'role': 'system', 'content': CONTRACT + '\n' + instruction},
-                            {'role': 'user', 'content': json.dumps(snapshot, ensure_ascii=False)}], kind='text', max_tokens=24000, timeout=720,
-                           extra={'thinking': {'type': 'disabled'}})
+    response = client.chat([{'role': 'system', 'content': contract + '\n' + instruction},
+                            {'role': 'user', 'content': json.dumps({**snapshot, 'source_context': packet.get('source_context', {})}, ensure_ascii=False)}], kind='text', max_tokens=24000, timeout=720,
+                           extra={'thinking': {'type': 'disabled'}},
+                           trace_stage='production_prompts' if packet['action'] == 'prompts' else 'video_units')
     parsed = parse_json(response)
     if packet['action'] == 'prompts':
         rows = parsed.get('shots') or []
@@ -453,7 +534,6 @@ def llm_task(project, packet, client):
             for field in LLM_FIELDS:
                 if old.get(field + '_source') != 'authored':
                     updated[field] = str(row[field]); updated[field + '_source'] = 'llm'
-            # prompt_grid 是按需人工配置字段：LLM 刷新不生成、不覆盖、不清空
             cleaned.append(updated)
         save_shots(project, packet['board'], cleaned, packet['board_revision'], trusted_sources=True)
     else:
@@ -467,7 +547,8 @@ def llm_task(project, packet, client):
             previous = old.get(tuple(u.get('shot_ids') or []), {})
             u['id'] = previous.get('id') or 'v-' + uuid.uuid4().hex[:12]
             members = shot_list(snapshot, u)
-            if not u.get('prompt_video'): raise ValueError('V 缺少视频提示词')
+            if not all(isinstance(u.get(f), str) and u[f].strip() for f in ('prompt_video', 'prompt_grid')):
+                raise ValueError('V 视频与宫格提示词必须是非空字符串')
             u['duration'] = previous.get('duration') or sum(float(s['dur']) for s in members)
             u['scene_ref'] = members[0].get('scene_ref', '')
             u['source_hash'] = source_hash(members)
@@ -524,10 +605,12 @@ def execute(packet, providers):
                 update(continuity=meta)
                 if continuity['mode'] == 'tail_context':
                     vision = VendorClient(continuity['vision_vendor'], providers)
+                    vision.billing_project = project.name
                     if config_fingerprint(vision.cfg) != continuity.get('config_fingerprint'): raise ValueError('Vision 配置已变化，未调用模型')
                     description = vision.chat([{'role': 'user', 'content': [
                         {'type': 'text', 'text': '描述这张视频尾帧的角色位置、姿态、视线、构图和光线，作为下一段视频的连续性约束。不要虚构画外动作。'},
-                        vision.image_part(str(inside(project, meta['path'])))]}], kind='vision', max_tokens=1500, timeout=180)
+                        vision.image_part(str(inside(project, meta['path'])))]}], kind='vision', max_tokens=1500, timeout=180,
+                        trace_stage='video_tail_frame_vision')
                     prompt += '\n前段结束画面（连续性参考）：' + description
                     update(continuity={**meta, 'vision_description': description})
                 else:
@@ -613,6 +696,8 @@ def execute(packet, providers):
             print('媒体已完成；归档/自动采用待处理：' + str(exc)); return
         update(status='error', note=str(exc)[:2000], provider_task=getattr(client, 'last_request', None) if client else None)
         raise
+    finally:
+        set_billing_project("")
 
 
 def delete_item(project, body):

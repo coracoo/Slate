@@ -13,11 +13,10 @@ export function defaultShotPrompt(s: ProductionShot, field: 'prompt_image' | 'pr
 
 export function defaultUnitPrompt(u: VideoUnit, all: ProductionShot[], field: 'prompt_video' | 'prompt_grid') {
   const text = u[field] || ''
-  // 护栏只判断"已是逐 S 分段稿"：LLM 改写后可能是【S1（0—4s）：… 而不含"镜（"字样，
-  // 用宽松的 【S<数字> 检测，避免每次 load 重复叠加一整层。
-  if (/【S\d/.test(text)) return text
+  if (text.trim()) return text
+  if (field === 'prompt_grid') return ''
   const sections = u.shot_ids.map(id => all.find(s => s.id === id)?.[field] || '').filter(Boolean)
-  return sections.join('\n') + (text ? '\n整段补充：' + text : '')
+  return sections.join('\n')
 }
 
 /** 修改 S 后重算 V 总时长及时间标签，正文保持不变。 */

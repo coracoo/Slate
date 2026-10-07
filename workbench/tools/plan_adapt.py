@@ -61,7 +61,8 @@ def shot_scene_ref(shot):
 def choose_plan(plans, shots):
     """从候选 plans（mtime 降序）为分镜选底图：按 scene_ref 匹配镜数最多者胜
     （plans 已按 mtime 降序，同分自然取新）；全部无匹配/无 scene_ref 回退 plans[0]。
-    plans 为空返回 None。
+    判官明确拒绝（approval_state=rejected 或 _judge.ok=false）的方案不进入候选；
+    旧方案没有判官记录时继续兼容。过滤后为空返回 None。
 
     返回值上盖 `choice`={mode, score, total}：零匹配回退是**有意保留的行为**（老项目 scene_ref
     填充率为 0，硬拦会让一批项目当场出不了图），但"这是回退"必须能传到产物与页面上，
@@ -69,6 +70,9 @@ def choose_plan(plans, shots):
     靠身份比较（`pl is plan`）把选中的 plan 映射回文件路径，返回副本会让它恒定取不到路径、
     平面图参考帧整批静默消失（本轮改初版就踩过，靠既有 plan_frames 用例逼出来）。
     """
+    plans = [p for p in (plans or [])
+             if p.get("approval_state") != "rejected"
+             and not (isinstance(p.get("_judge"), dict) and p["_judge"].get("ok") is False)]
     if not plans:
         return None
     best, best_score = plans[0], 0
@@ -122,9 +126,19 @@ def plan_props_world(plan):
         if not isinstance(c, (list, tuple)) or len(c) < 2:
             continue
         x, z = pw(plan, c[0], c[1])
-        out.append({"id": p.get("id"), "label": p.get("label") or p.get("id"),
+        item = {"id": p.get("id"), "label": p.get("label") or p.get("id"),
                     "shape": p.get("shape") or "rect", "pos": [x, z],
-                    "size": list(p.get("size") or []), "rot": -(float(p.get("rot") or 0.0))})
+                    "size": list(p.get("size") or []), "rot": -(float(p.get("rot") or 0.0))}
+        size = item["size"] or [1, 1]
+        if item["shape"] == "circle":
+            item["radius"] = float(size[0])
+        else:
+            a = math.radians(item["rot"])
+            hw, hh = float(size[0]) / 2, float(size[1] if len(size) > 1 else 1) / 2
+            item["outline"] = [[x + dx * math.cos(a) - dz * math.sin(a),
+                                z + dx * math.sin(a) + dz * math.cos(a)]
+                               for dx, dz in ((-hw, -hh), (hw, -hh), (hw, hh), (-hw, hh))]
+        out.append(item)
     return out
 
 
@@ -163,7 +177,11 @@ def plan_openings_world(plan):
         x = a[0] + (b[0] - a[0]) * t
         y = a[1] + (b[1] - a[1]) * t
         wx, wz = pw(plan, x, y)
-        out.append({"pos": [wx, wz], "kind": op.get("kind") or "door", "width": op.get("width") or 1.0})
+        width = float(op.get("width") or 1.0)
+        t_end = min(1.0, t + width / seg)
+        end = pw(plan, a[0] + (b[0] - a[0]) * t_end, a[1] + (b[1] - a[1]) * t_end)
+        out.append({"pos": [wx, wz], "start": [wx, wz], "end": list(end),
+                    "kind": op.get("kind") or "door", "width": width})
     return out
 
 
@@ -235,3 +253,10 @@ def plan_scene(plan):
                        "entry": plan_openings_world(plan),
                        "zones": plan_zones_world(plan),
                        "paths": plan_paths_world(plan)}}
+
+
+def plan_base_world(plan):
+    """PNG 与网页共享同一份底图几何，保留陈设旋转及门窗区间。"""
+    return {"walls": plan_walls_world(plan), "props": plan_props_world(plan),
+            "zones": plan_zones_world(plan), "paths": plan_paths_world(plan),
+            "openings": plan_openings_world(plan)}

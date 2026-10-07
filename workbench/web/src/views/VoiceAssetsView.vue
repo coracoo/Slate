@@ -6,6 +6,9 @@ import { trackJob } from '../stores/jobs'
 import { studioPost, submitStudioJob } from '../utils/productionStudio'
 import { useBoardSelection } from '../utils/useBoardSelection'
 
+const props = withDefaults(defineProps<{embedded?: boolean; selectedCharacterId?: string; voiceDescription?: string}>(), {embedded: false, selectedCharacterId: '', voiceDescription: ''})
+const emit = defineEmits<{ 'binding-changed': [] }>()
+
 interface State {id: string; label: string; image?: string}
 interface Variant {voice_asset_id: string; revision: number; name: string; state?: string}
 interface Voice {id: string; revision: number; name: string; voice_id: string; sample: string; tts_verified: boolean; derived_from?: string; character_id?: string; origin?: string; vendor_id?: string; description?: string}
@@ -51,7 +54,8 @@ async function load() {
     const r = await getJSON<{characters: Actor[]; voices: Voice[]; catalog: Catalog[]}>(`/api/studio/voices?project=${encodeURIComponent(project)}`)
     if (project !== app.current) return
     actors.value = r.characters; voices.value = r.voices; catalog.value = r.catalog
-    if (!actors.value.some(a => a.id === actorId.value)) actorId.value = actors.value[0]?.id || ''
+    if (props.selectedCharacterId) actorId.value = props.selectedCharacterId
+    else if (!actors.value.some(a => a.id === actorId.value)) actorId.value = actors.value[0]?.id || ''
     if (!boards.value.includes(board.value)) board.value = boards.value[0] || ''
     syncStateSel()
   } catch (e) { error.value = String(e) }
@@ -71,14 +75,14 @@ async function submit(action: string, extra: Record<string, unknown> = {}, recov
 }
 async function bindGlobal(v: Voice) {
   if (!actor.value) return
-  try { await studioPost('voice-bind', {project: app.current, character_id: actorId.value, voice_asset_id: v.id, revision: v.revision}); await load(); toast(`${v.name} 已绑定为 ${actor.value.name} 的全剧默认音色`, 'ok') }
+  try { await studioPost('voice-bind', {project: app.current, character_id: actorId.value, voice_asset_id: v.id, revision: v.revision}); await load(); emit('binding-changed'); toast(`${v.name} 已绑定为 ${actor.value.name} 的全剧默认音色`, 'ok') }
   catch (e) { error.value = String(e) }
 }
 async function bindState(stateId: string) {
   const voiceId = stateSel.value[stateId] || ''
   try {
     await studioPost('voice-bind', {project: app.current, character_id: actorId.value, state: stateId, voice_asset_id: voiceId})
-    await load(); toast(voiceId ? '状态音色已绑定' : '已恢复跟随全剧默认', 'ok')
+    await load(); emit('binding-changed'); toast(voiceId ? '状态音色已绑定' : '已恢复跟随全剧默认', 'ok')
   } catch (e) { error.value = String(e) }
 }
 async function uploadVoice(f: Event) {
@@ -99,15 +103,17 @@ function stateVoiceName(stateId: string) {
   return vid ? voices.value.find(v => v.id === vid)?.name || vid : ''
 }
 function url(path: string) { return mediaUrl(`projects/${app.current}/${path}`) }
+watch(() => props.selectedCharacterId, id => { if (id) actorId.value = id; description.value = props.voiceDescription || ''; voiceName.value = actor.value?.name ? actor.value.name + '音色' : '' }, {immediate: true})
+watch(() => props.voiceDescription, value => { description.value = value || '' })
 watch(() => app.current, () => { void load(); void loadSpeechVendors() }, {immediate: true})
 </script>
 
 <template>
-  <div class="page-wide">
-    <header class="mb-5"><h1 class="grad-text text-2xl font-black">④ 音色绑定</h1><p class="mt-1 text-sm text-slate-400">为角色选择全剧音色，也可为派生状态单独绑定。</p></header>
+  <div :class="embedded ? 'min-w-0' : 'page-wide'">
+    <header v-if="!embedded" class="mb-5"><h1 class="grad-text text-2xl font-black">④ 音色绑定</h1><p class="mt-1 text-sm text-slate-400">为角色选择全剧音色，也可为派生状态单独绑定。</p></header>
     <p v-if="error" role="alert" class="mb-4 rounded-lg bg-rose-950/50 p-3 text-rose-200">{{ error }}</p>
-    <div class="grid items-start gap-5 lg:grid-cols-[230px_minmax(0,1fr)]">
-      <aside class="glass space-y-2 p-3"><h2 class="mb-4 text-sm font-bold">角色与旁白</h2><button v-for="a in actors" :key="a.id" class="block w-full rounded-xl border p-3 text-left" :class="a.id === actorId ? 'border-sky-400/50 bg-sky-900/20' : 'border-white/10'" @click="actorId = a.id"><b>{{ a.name }}</b><small class="mt-1 block text-slate-300">{{ a.voice_binding ? '已绑定全剧音色' : '待绑定' }}<template v-if="a.states?.length"> · {{ a.states.length }} 状态</template></small></button><p class="text-sm text-slate-400">旁白未绑定音色时不生成配音。</p></aside>
+    <div :class="embedded ? 'min-w-0' : 'grid items-start gap-5 lg:grid-cols-[230px_minmax(0,1fr)]'">
+      <aside v-if="!embedded" class="glass space-y-2 p-3"><h2 class="mb-4 text-sm font-bold">角色与旁白</h2><button v-for="a in actors" :key="a.id" class="block w-full rounded-xl border p-3 text-left" :class="a.id === actorId ? 'border-sky-400/50 bg-sky-900/20' : 'border-white/10'" @click="actorId = a.id"><b>{{ a.name }}</b><small class="mt-1 block text-slate-300">{{ a.voice_binding ? '已绑定全剧音色' : '待绑定' }}<template v-if="a.states?.length"> · {{ a.states.length }} 状态</template></small></button><p class="text-sm text-slate-400">旁白未绑定音色时不生成配音。</p></aside>
       <main class="space-y-5">
         <div class="grid items-start gap-5 xl:grid-cols-2">
           <section class="glass space-y-3 p-4">
@@ -158,7 +164,7 @@ watch(() => app.current, () => { void load(); void loadSpeechVendors() }, {immed
         </div>
         <section class="glass space-y-3 p-4">
           <h2 class="font-bold text-sky-200">分状态音色 <span class="text-sm font-normal text-slate-400">{{ actor?.name || '请选择角色' }}</span></h2>
-          <p v-if="!actor?.states?.length" class="text-xs text-slate-500">该角色暂无派生状态；请到「② 素材提炼」为角色定义状态资产（states），生成状态图后回到这里配音色。</p>
+          <p v-if="!actor?.states?.length" class="text-xs text-slate-500">该角色暂无派生状态；请到「② 素材生成」为角色定义状态资产（states），生成状态图后回到这里配音色。</p>
           <div v-for="s in actor?.states || []" :key="s.id" class="grid items-center gap-3 rounded-xl border border-white/10 p-3 md:grid-cols-[120px_minmax(0,1fr)_auto]">
             <div class="flex h-[90px] items-center justify-center overflow-hidden rounded-lg border border-white/10 bg-black/30">
               <img v-if="s.image" :src="url(s.image)" class="h-full w-full object-contain" :alt="s.label" />

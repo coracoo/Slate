@@ -108,6 +108,15 @@ class ChoosePlanTests(unittest.TestCase):
         got = plan_adapt.choose_plan(self.PLANS, self.SHOTS)
         self.assertIs(got, self.PLANS[2])
 
+    def test_semantically_rejected_plan_is_never_selected_downstream(self):
+        plans = [
+            {"name": "新但被拒", "scene_ref": "loc_field", "approval_state": "rejected"},
+            {"name": "已通过", "scene_ref": "loc_field", "approval_state": "approved"},
+        ]
+        got = plan_adapt.choose_plan(plans, self.SHOTS)
+        self.assertEqual(got["name"], "已通过")
+        self.assertIs(got, plans[1])
+
 
 class StrategyMapPlanTests(unittest.TestCase):
     def setUp(self):

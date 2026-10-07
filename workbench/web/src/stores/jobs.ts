@@ -100,8 +100,10 @@ export function trackJob(id: number, label: string): Promise<TrackedJob> {
       inflightRemove(id)
       const j = finalJob()
       j.success = jobOk(j)
-      toast(`${label}｜${j.success ? '已完成' : '失败'}${!j.success ? '：' + (j.err || '请查看任务日志') : ''}`,
-        j.success ? 'ok' : 'err', j.success ? 6000 : 12000)
+      const incomplete = (j.out || '').split('\n').find(line => line.startsWith('[后处理未完成]'))
+      const warning = j.success && incomplete
+      toast(`${label}｜${warning ? incomplete : j.success ? '已完成' : '失败'}${!j.success ? '：' + (j.err || '请查看任务日志') : ''}`,
+        warning ? 'info' : j.success ? 'ok' : 'err', warning || !j.success ? 12000 : 6000)
       fireJobDone(j)
       resolve(j)
     }

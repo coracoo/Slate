@@ -55,8 +55,9 @@ class AssetRegistryTests(unittest.TestCase):
         registry = AssetRegistry(root)
         rows = registry.list()
         self.assertEqual({row["ref"] for row in rows}, {"@character:hero", "@scene:room", "@prop:prop"})
-        allowed = {"ref", "kind", "id", "name", "path", "usage", "aliases", "prompt", "asset_revision", "children_refs",
-                   "parent_ref", "relation", "derived_from", "related_refs", "source_episode_ids", "states"}
+        allowed = {"ref", "kind", "id", "name", "path", "usage", "aliases", "prompt", "prompt_editable", "asset_revision", "children_refs",
+                   "parent_ref", "relation", "derived_from", "related_refs", "source_episode_ids", "states", "visual_status",
+                   "media_settings_revision", "settings_source", "settings_updated_at", "settings_change"}
         self.assertTrue(all(set(row) <= allowed for row in rows))
         self.assertEqual(registry.resolve("@character:hero")["asset_revision"], 1)
         with self.assertRaises(AssetReferenceError):

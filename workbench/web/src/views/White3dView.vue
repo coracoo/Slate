@@ -8,6 +8,7 @@ import { app, projectFiles, materialVideos, toast, loadBasics } from '../stores/
 import { trackJob } from '../stores/jobs'
 import { icons } from '../components/icons'
 import StyledSelect from '../components/StyledSelect.vue'
+import SpatialWorkspaceNav from '../components/SpatialWorkspaceNav.vue'
 import DelBadge from '../components/DelBadge.vue'
 import EmptyState from '../components/EmptyState.vue'
 
@@ -237,29 +238,27 @@ useBoardSelection(storyboard, boards, 'white3d')
 </script>
 
 <template>
-  <div class="page">
-    <header class="mb-6">
-      <h1 class="grad-text text-2xl font-black">② 辅助·Blender</h1>
-      <p class="mt-1 text-xs text-slate-500">
-        分镜 JSON → 生成 Blender 构建脚本 → 经 Blender MCP(127.0.0.1:9876) 构建并自动存盘 .blend
-      </p>
-      <p class="mt-1 rounded-lg bg-cyan-400/10 px-3 py-1.5 text-xs-plus text-cyan-300">
-        仅支持 dialogue 契约（显式 pos/look 站位）的分镜；previs 自动机位模式不支持 3D。
-      </p>
-    </header>
-
+  <div class="page-wide">
+    <SpatialWorkspaceNav active="white3d" />
+    <div class="grid items-start gap-4 xl:grid-cols-[320px_minmax(0,1fr)]">
+    <aside class="min-w-0">
     <!-- 参数条 -->
-    <div class="glass mb-5 flex flex-wrap items-end gap-3 p-4">
-      <label class="min-w-64 text-xs text-slate-400">
-        分镜 JSON（分镜/）
+    <div class="glass mb-4 flex flex-col gap-3 p-4">
+      <label class="text-xs text-slate-400">
+        分镜
         <StyledSelect v-model="storyboard" class="mt-1" :options="boards" :storage-key="`wb.${app.current}.white3d.board`" placeholder="— 选择分镜 —" />
       </label>
       <button class="btn" :disabled="phase !== 'idle' || !storyboard" @click="generate">
         <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
           <path :d="icons.wand" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
-        {{ phase === 'genscript' ? '生成脚本中…' : phase === 'build' ? '发送 Blender 构建中…' : '✨ 生成 3D 场景' }}
+        {{ phase === 'genscript' ? '生成脚本中…' : phase === 'build' ? '发送 Blender 构建中…' : '构建 3D 场景' }}
       </button>
+      <p class="text-xs text-slate-500">用已确认的位置与视线检查遮挡和景别。需 dialogue 分镜含显式机位，并连接 Blender。</p>
+      <RouterLink to="/blender" class="text-xs text-sky-300 hover:underline">Blender 连接设置</RouterLink>
+      <details class="border-t border-line-soft pt-3">
+        <summary class="cursor-pointer text-xs text-slate-400">补充场景陈设（可选）</summary>
+        <p class="my-2 text-xs text-slate-500">AI 按场景描述拟定陈设并写入分镜。尺寸与位置需要人工核对，再重新构建。</p>
       <button class="btn btn-ghost" :disabled="envLoading || !storyboard"
         title="LLM 读场景描述生成陈设灰模（桌案/帷幔/大帐/拒马…），写回分镜 env，重新生成构建脚本即可带上"
         @click="genEnv">
@@ -268,6 +267,7 @@ useBoardSelection(storyboard, boards, 'white3d')
         </svg>
         {{ envLoading ? 'AI 布置场景中…' : 'AI 生成场景陈设' }}
       </button>
+      </details>
       <div v-if="phase !== 'idle'" class="flex items-center gap-2 text-xs text-cyan-300">
         <svg class="animate-spin" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
           <path d="M12 3a9 9 0 1 0 9 9" stroke-linecap="round" />
@@ -285,13 +285,15 @@ useBoardSelection(storyboard, boards, 'white3d')
       <code class="truncate text-cyan-300" :title="genScript">{{ genScript }}</code>
     </div>
 
+    </aside>
+    <section class="min-w-0" aria-label="预演结果">
     <!-- 原片 vs 3D 白模 对比（有渲染视频时默认展开） -->
     <section v-if="app.current && videos.length" class="glass mb-5 p-4">
       <h3 class="mb-3 flex items-center gap-2 text-xs font-bold text-slate-400">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="2">
           <path :d="icons.film" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
-        原片 vs 3D 白模（播放/暂停/拖动双向联动）
+        原片与 3D 白模 · 联动播放
       </h3>
       <div class="grid grid-cols-1 gap-3 lg:grid-cols-2">
         <div class="overflow-hidden rounded-xl border border-line-soft bg-black/40">
@@ -349,14 +351,14 @@ useBoardSelection(storyboard, boards, 'white3d')
 
     <!-- 产物区 -->
     <section v-else>
-      <h3 class="mb-2 text-xs font-bold text-slate-500">3D 产物（白模3D/ 与项目根目录）</h3>
+      <h3 class="mb-2 text-xs font-bold text-slate-500">3D 场景与预演</h3>
       <div v-if="!hasProducts" class="glass p-12 text-center">
         <svg class="mx-auto mb-3 opacity-40" width="44" height="44" viewBox="0 0 24 24" fill="none" stroke="#22d3ee" stroke-width="1.5">
           <path :d="icons.box3d" stroke-linecap="round" stroke-linejoin="round" />
         </svg>
         <p class="text-sm text-slate-300">该项目还没有 3D 产物</p>
         <p class="mt-2 text-xs text-slate-500">
-          在上方选择 dialogue 契约分镜 JSON 后点「✨ 生成 3D 场景」<br />
+          选择分镜并「构建 3D 场景」，然后在 Blender 中检查机位<br />
           需先启动 Blender 并开启 MCP（127.0.0.1:9876）
         </p>
       </div>
@@ -394,7 +396,7 @@ useBoardSelection(storyboard, boards, 'white3d')
                   <svg v-else width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                     <path :d="icons.film" stroke-linecap="round" stroke-linejoin="round" />
                   </svg>
-                  {{ rendering[p.path] ? '渲染中…' : 'CLI 渲染' }}
+                  {{ rendering[p.path] ? '渲染中…' : '渲染视频' }}
                 </button>
               </div>
             </article>
@@ -402,8 +404,8 @@ useBoardSelection(storyboard, boards, 'white3d')
         </div>
 
         <!-- gen_*.py -->
-        <div v-if="scripts.length">
-          <h4 class="mb-2 text-2xs font-bold text-cyan-400">构建脚本（{{ scripts.length }}）</h4>
+        <details v-if="scripts.length">
+          <summary class="mb-2 cursor-pointer text-xs text-slate-400">构建脚本与重发（{{ scripts.length }}）</summary>
           <div class="grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
             <article
               v-for="p in scripts"
@@ -429,9 +431,11 @@ useBoardSelection(storyboard, boards, 'white3d')
               </div>
             </article>
           </div>
-        </div>
+        </details>
       </div>
     </section>
+    </section>
+    </div>
 
     <!-- 代码弹窗 -->
     <Teleport to="body">
@@ -458,4 +462,3 @@ useBoardSelection(storyboard, boards, 'white3d')
     </Teleport>
   </div>
 </template>
-

@@ -3,6 +3,7 @@ id: continuity-gap
 name: 连续性与信息差（drama-skills 提炼）
 category: 拆剧本
 target: script
+dimension: script_continuity
 enabled: true
 builtin: true
 description: 转折落在可见动作、相对时间换算、三层信息差——源自 zenstory-ai/drama-skills (MIT)

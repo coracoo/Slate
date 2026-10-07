@@ -231,6 +231,33 @@ def build_request(board, shot_id, context=None, system_prompt=None, project_dir=
     return request
 
 
+def continuity_evidence(board, shot_id, context, project_dir=None):
+    """显示与实际演员请求相同的知情快照，登记事实不等同于原文核验。"""
+    shot = _shot(board, shot_id)
+    explicit = isinstance(shot.get('after_event_ids'), list) or bool(shot.get('beat_after_event_ids') or shot.get('acting_beats'))
+    explicit = explicit or any(isinstance(line, dict) and ('after_event_ids' in line or 'event_ids' in line) for line in shot.get('lines') or [])
+    result = {'event_order_explicit': explicit, 'events': [], 'actors': [], 'warnings': []}
+    if not explicit:
+        result['warnings'].append('本镜未声明事件时点，当前沿用完整上下文；请确认是否包含尚未发生的事件。')
+    try:
+        request = build_request(board, shot_id, context=context, project_dir=project_dir)
+    except ValueError as exc:
+        result['warnings'].append('连续性依据不可用：' + str(exc))
+        return result
+    event_ids = request.get('event_ids') or []
+    result['events'] = [{'id': e['id'], 'label': str(e.get('text') or e.get('description') or e.get('id')),
+                         'source': e.get('source') or e.get('evidence') or ''}
+                        for e in context.get('events') or [] if isinstance(e, dict) and e.get('id') in event_ids]
+    result['beat_count'] = len(request.get('beat_contexts') or [])
+    for visible in request.get('visible_context') or []:
+        actor_id = visible['actor_id']
+        facts = [{'id': f['id'], 'text': str(f.get('text') or ''), 'source': f.get('source') or f.get('evidence') or ''}
+                 for f in visible.get('known_facts') or []]
+        result['actors'].append({'id': actor_id, 'name': str((board.get('actors') or {}).get(actor_id, {}).get('name') or actor_id),
+                                 'facts': facts, 'state': visible.get('state') or {}})
+    return result
+
+
 def run(request, call_llm, max_attempts=2):
     """运行有限次数的演员生成和程序校验。"""
     return perform(request, call_llm, max_attempts=max_attempts)
@@ -460,7 +487,7 @@ def actor_cards_from_assets(project_dir, board):
 
 
 def hydrate_actor_cards(context, project_dir, board):
-    """把资产角色卡补入上下文；已有非空或锁定字段保持不变。"""
+    """同步项目角色基准，保留镜内人工覆盖与锁定字段。"""
     out = copy.deepcopy(context) if isinstance(context, dict) else {}
     cards = out.get("actor_cards") if isinstance(out.get("actor_cards"), dict) else {}
     allowed_actor_ids = set(main_actor_ids(board, project_dir=project_dir))
@@ -500,9 +527,16 @@ def hydrate_actor_cards(context, project_dir, board):
             target = {}
             cards[actor_id] = target
         locked = set(target.get("locked_fields") or []) if isinstance(target.get("locked_fields"), list) else set()
+        inherited = target.get('project_values') if isinstance(target.get('project_values'), dict) else {}
         for field in ACTOR_CARD_FIELDS:
-            if field not in locked and not str(target.get(field) or "").strip() and asset_card.get(field):
-                target[field] = asset_card[field]
+            current = target.get(field)
+            if field not in locked and (not str(current or '').strip() or
+                    (field in inherited and current == inherited[field])):
+                target[field] = asset_card.get(field, '')
+                inherited[field] = asset_card.get(field, '')
+            elif field not in inherited and current == asset_card.get(field):
+                inherited[field] = current
+        target['project_values'] = inherited
         if not str(target.get("source") or "").strip():
             target["source"] = asset_card.get("source", "")
         target.setdefault("locked_fields", [])

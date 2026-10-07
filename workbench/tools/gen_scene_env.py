@@ -113,6 +113,7 @@ def main():
         print("[错误] 分镜没有 scene 文本可生成"); sys.exit(1)
     vid = pick_vendor(a.vendor)
     cli = VendorClient(vid)
+    cli.billing_project = os.path.basename(os.path.dirname(os.path.dirname(jp)))
     print(f"[信息] LLM 厂商: {vid} / {cli.model('text')}")
     KNOWN = {"room": "地板、四周墙、天花板、中央桌案（set.table）",
              "field": "地面、两翼旗阵（z≈±14 一带）、远处军阵块（x≈±13）、散落的乱石"}
@@ -121,7 +122,8 @@ def main():
                               desc=json.dumps(zones, ensure_ascii=False))
     txt = cli.chat([{"role": "system", "content": PROMPT_SYS},
                     {"role": "user", "content": user}],
-                   kind="text", max_tokens=3000, temperature=0.4, timeout=420)
+                   kind="text", max_tokens=3000, temperature=0.4, timeout=420,
+                   trace_stage="scene_environment")
     env = clamp_env(parse_json(txt), a.max_per)
     if not env:
         print("[错误] LLM 返回为空或不可解析:\n" + txt[:500]); sys.exit(1)

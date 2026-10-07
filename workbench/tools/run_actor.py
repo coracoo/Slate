@@ -55,10 +55,11 @@ def main():
     actor_system, _ = prompt_modules.actor_perform_prompt(request, acting_skill or None)
     request["system_prompt"] = actor_system
     client = VendorClient(a.vendor, a.providers)
+    client.billing_project = os.path.basename(project_dir)
 
     def call_llm(messages):
         content = client.chat(messages, kind="text", max_tokens=5000, timeout=420,
-                               temperature=0.35)
+                               temperature=0.35, trace_stage="actor_perform")
         return {"content": content}
 
     result = run(request, call_llm, max_attempts=2)

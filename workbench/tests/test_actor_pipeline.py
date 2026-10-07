@@ -191,6 +191,22 @@ class ActorCandidateTests(unittest.TestCase):
         self.assertIn("hero", out["continuities"][0]["initial_state"])
         self.assertNotIn("support", out["continuities"][0]["initial_state"])
 
+    def test_project_profile_refresh_keeps_manual_and_locked_overrides(self):
+        import actor_pipeline as ap
+        from unittest.mock import patch
+        board={'actors':{'hero':{'name':'主角','role':'主角'}},'shots':[]}
+        first={'hero':{'personality':'冷静','goal':'寻找证据','relationship':'互信','source':'素材/人物.json'}}
+        with patch.object(ap,'actor_cards_from_assets',return_value=first):
+            context=ap.hydrate_actor_cards({},self.project,board)
+        context['actor_cards']['hero']['goal']='本镜躲避追问'
+        context['actor_cards']['hero']['locked_fields']=['relationship']
+        second={'hero':{'personality':'外冷内热','goal':'保护同伴','relationship':'怀疑','source':'素材/人物.json'}}
+        with patch.object(ap,'actor_cards_from_assets',return_value=second):
+            refreshed=ap.hydrate_actor_cards(context,self.project,board)
+        self.assertEqual(refreshed['actor_cards']['hero']['personality'],'外冷内热')
+        self.assertEqual(refreshed['actor_cards']['hero']['goal'],'本镜躲避追问')
+        self.assertEqual(refreshed['actor_cards']['hero']['relationship'],'互信')
+
     def test_save_performance_candidate_rejects_supporting_actor_request(self):
         import actor_pipeline as ap
         board = {

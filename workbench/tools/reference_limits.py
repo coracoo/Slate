@@ -36,10 +36,30 @@ def reference_limit(vendor_id="", model="", kind="", cfg=None):
     """
     vid = str(vendor_id or "").lower()
     name = str(model or "").lower()
+    if vid == 'runninghub' and kind != 'video':
+        from runninghub_catalog import operation, edit_operation, reference_count, configured_parameters
+        try:
+            models = (cfg or {}).get('models') or {}
+            # 制作入口传生图槽查参考能力，但带引用的实际调用优先走已配置改图槽。
+            selected = models.get('image_edit') if kind == 'image' and model == models.get('image') else None
+            if str(selected or model).startswith('workflow:'):
+                slot = 'image_edit' if selected else kind
+                if (selected or model) == models.get('image') and (selected or model) != models.get('image_edit'):
+                    slot = 'image'
+                nodes = configured_parameters(cfg or {}, slot).get('image_nodes') or []
+                if not isinstance(nodes, list) or any(not isinstance(n, dict) or not str(n.get('nodeId') or '').strip()
+                                                      or not isinstance(n.get('fieldName'), str) or not n['fieldName'].strip() for n in nodes):
+                    return 0
+                return len({(str(n['nodeId']), n['fieldName']) for n in nodes})
+            row = edit_operation(selected or model) if kind == 'image' else operation(model)
+            return reference_count(row)
+        except ValueError:
+            return 0
     if kind == 'video':
         from video_profiles import capabilities
         profile = capabilities({**(cfg or {}), 'id': vid}, model)
         if profile['known']: return max(profile['max_refs'], 2 if profile['last_frame'] else 0)
+        if vid == 'runninghub': return 0
     # ComfyUI 的上限由**工作流自己**决定，不是厂商级常量：
     # · 内置 Qwen Image Edit 2511 只有 ref1/ref2/ref3 三个 LoadImage 位；
     # · 内置 Qwen Image 2.1 的组装器是「每张参考图建一个 LoadImage 节点」，没有三张的硬上限；

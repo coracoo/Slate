@@ -67,6 +67,21 @@ class SpeechBudgetAppliedAtStoryboard(unittest.TestCase):
         self.assertIn('时长按台词预算', src, '顶高必须留痕，否则用户以为时长是自己填的')
         self.assertIn('已超过单镜硬顶', src, '顶到硬顶仍装不下必须点名（这条不自动改数值，交回给人）')
 
+    def test_paid_generation_rejects_overflow_without_mutating_authored_lines(self):
+        shot = _shot(80, 15.0)
+        shot['lines'][0].update(at=14.0, dur=5.0)
+        board = {'shots': [shot]}
+        unit = {'shot_ids': ['S1'], 'duration': 15.0}
+        before = [dict(line) for line in shot['lines']]
+        with self.assertRaisesRegex(ValueError, '时间预算冲突'):
+            studio.require_timing_budget(board, unit)
+        self.assertEqual(shot['lines'], before, '预算校验不得把作者台词静默挤到镜尾')
+
+    def test_storyboard_pipeline_no_longer_clamps_overflow_to_last_point_eight_seconds(self):
+        src = inspect.getsource(creation_pipeline.cmd_storyboard)
+        self.assertNotIn('s["dur"] - 0.8', src)
+        self.assertIn('timing_conflicts', src)
+
 
 class DurationBandIsSingleSourced(unittest.TestCase):
     def test_only_production_studio_defines_the_band(self):

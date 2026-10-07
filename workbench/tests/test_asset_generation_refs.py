@@ -34,15 +34,20 @@ class _FakeClient:
         self.calls.append({"prompt": prompt, "out": out,
                            "image_refs": list(image_refs or []), "mode": mode,
                            "extra": kwargs.get("extra")})
-        Path(out).write_bytes(b"fake-image")
+        from PIL import Image
+        Image.new('RGB', (32, 18), 'white').save(out)
 
 
 def _run_main(gen, project, *extra_args, client=None):
-    """以桩厂商跑 gen_asset_images.main()，返回 (exit_code, fake_client)。"""
+    """以桩厂商和场景管线跑 main；封锁网络，返回 (exit_code, fake_client)。"""
+    import plan_frames
     client = client or _FakeClient()
     argv = ["gen_asset_images.py", str(project)] + list(extra_args)
     with mock.patch.object(gen, "pick_vendor", lambda v=None: client.id), \
          mock.patch.object(gen, "VendorClient", lambda vid: client), \
+         mock.patch.object(plan_frames, "ensure_scene_plan", return_value={}), \
+         mock.patch("socket.create_connection", side_effect=AssertionError("测试禁止网络")), \
+         mock.patch("socket.socket.connect", side_effect=AssertionError("测试禁止网络")), \
          mock.patch.object(sys, "argv", argv):
         code = 0
         try:
@@ -53,6 +58,51 @@ def _run_main(gen, project, *extra_args, client=None):
 
 
 class AssetGenerationReferenceTests(unittest.TestCase):
+    def test_batch_children_only_generates_selected_children_and_preserves_mother(self):
+        gen = _load_gen()
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project/'素材/场景').mkdir(parents=True)
+            mother = project/'素材/场景/room.png'
+            mother.write_bytes(b'mother')
+            (project/'素材/场景.json').write_text(json.dumps({'scenes':[
+                {'id':'room','name':'房间','image_prompt':'室内'},
+                {'id':'corner','name':'角落','image_prompt':'房间角落','parent_ref':'@scene:room'}
+            ]}, ensure_ascii=False), encoding='utf-8')
+            (project/'素材/道具.json').write_text(json.dumps({'props':[
+                {'id':'desk','name':'书桌','image_prompt':'木书桌','parent_ref':'@scene:room'},
+                {'id':'other','name':'其他','image_prompt':'铜灯'}
+            ]}, ensure_ascii=False), encoding='utf-8')
+            code, client = _run_main(gen, project, '--states', 'skip', '--force',
+                                     '--asset-ref', '@scene:corner', '--asset-ref', '@prop:desk')
+            self.assertEqual(code, 0)
+            self.assertEqual({Path(call['out']).stem for call in client.calls}, {'corner','desk'})
+            self.assertEqual(mother.read_bytes(), b'mother')
+            self.assertTrue(all(str(mother) in call['image_refs'] for call in client.calls))
+            with self.assertRaisesRegex(ValueError, '素材不存在'):
+                gen.collect_asset_image_plan(project, asset_refs=['@prop:missing'])
+
+    def test_invalid_state_does_not_abort_other_states_or_lose_completed_index(self):
+        import io
+        from contextlib import redirect_stdout
+        gen = _load_gen()
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp)
+            (project/'素材/人物').mkdir(parents=True)
+            (project/'素材/人物/hero.png').write_bytes(b'mother')
+            (project/'素材/人物.json').write_text(json.dumps({'characters':[{'id':'hero','name':'主角','sheet_prompt':'蓝衣男子','states':[
+                {'id':'bad','label':'前后动作','look_diff':'手持连弩；随后连弩脱手'},
+                {'id':'good','label':'受伤','look_diff':'左臂缠白色绷带'}]}]}, ensure_ascii=False), encoding='utf-8')
+            log = io.StringIO()
+            with redirect_stdout(log):
+                code, client = _run_main(gen, project, '--states', 'only')
+            self.assertEqual(code, 1)
+            self.assertEqual(len(client.calls), 1)
+            self.assertIn('hero__good.png', client.calls[0]['out'])
+            self.assertIn('前后动作（bad）', log.getvalue())
+            index = json.loads((project/'素材/素材图.json').read_text('utf-8'))
+            self.assertIn('good', index['人物']['hero']['states'])
+
     def test_local_comfyui_uses_edit_mode_when_asset_has_references(self):
         from gen_asset_images import asset_image_mode
 
@@ -358,6 +408,31 @@ class AssetGenerationReferenceTests(unittest.TestCase):
             self.assertTrue(batch["ok"])
             self.assertFalse(batch.get("notes"))
             self.assertEqual([item["id"] for item in batch["plans"]], ["parent", "child"])
+
+    def test_preflight_exact_state_missing_never_claims_text_fallback(self):
+        sys.path.insert(0, str(ROOT / 'workbench'))
+        import server
+        from types import SimpleNamespace
+        parent = {'kind': 'character', 'id': 'hero', 'can_generate': True,
+                  'mode': 'generate', 'missing_refs': []}
+        child = {'kind': 'prop', 'id': 'bow', 'can_generate': True,
+                 'mode': 'edit', 'missing_refs': ['@character:hero#rain']}
+        planner = SimpleNamespace(collect_asset_image_plan=lambda *_args, **_kwargs: [child])
+        vendor = {'id': 'api'}
+        with mock.patch.object(server, 'tools_mod', return_value=planner):
+            result = server.asset_image_preflight('unused', vendor=vendor)
+            self.assertFalse(result['ok'])
+            self.assertIn('指定的派生参考图', result['err'])
+            planner.collect_asset_image_plan = lambda *_args, **_kwargs: [parent, child]
+            self.assertTrue(server.asset_image_preflight('unused', vendor=vendor)['ok'])
+            self.assertFalse(server.asset_image_preflight('unused', vendor=vendor, states_mode='skip')['ok'])
+
+    def test_explicit_source_excludes_display_parent_and_its_ancestry(self):
+        gen = _load_gen()
+        index = {'道具': {'source': {'parent_ref': '@character:other'}}}
+        item = {'parent_ref': '@scene:display', 'derived_from': '@prop:source'}
+        self.assertEqual(gen._derived_reference_tokens(index, item, '@prop:child'), ['@prop:source'])
+        self.assertEqual(gen._derived_reference_tokens(index, {'kind': 'prop', 'parent_ref': '@scene:display'}, '@prop:child'), ['@scene:display'])
 
     def test_prompt_related_assets_are_not_image_references(self):
         """旧行为已废弃：related_refs / 提示词 @token 不再产出参考图。"""
@@ -665,6 +740,33 @@ def _wave_project(tmp, chars=4, derived=True):
 
 
 class AssetImageWaveTests(unittest.TestCase):
+    def test_parallel_assets_keep_project_on_billing_and_worker_context(self):
+        import llm_openai
+        gen = _load_gen()
+        contexts, ledger = [], []
+
+        class BillingClient(_GateClient):
+            def generate_image(self, prompt, out, **kw):
+                contexts.append(llm_openai.current_billing_project())
+                result = super().generate_image(prompt, out, **kw)
+                llm_openai.VendorClient._bill(self, 'image', 'fake-image', 'generate_image', True,
+                                            units={'images': 1})
+                return result
+
+        class Ledger:
+            @staticmethod
+            def bill(cfg, **kw):
+                ledger.append(kw)
+
+        with tempfile.TemporaryDirectory() as td:
+            project = _wave_project(td, chars=3, derived=False)
+            with mock.patch.object(llm_openai, 'billing', Ledger()):
+                code, _ = _run_main(gen, project, '--workers', '3', client=BillingClient())
+            self.assertEqual(code, 0)
+            self.assertTrue(contexts)
+            self.assertEqual(set(contexts), {project.name}, '线程内的场景派生与提示词追踪也须保留项目归属')
+            self.assertEqual({entry['project'] for entry in ledger}, {project.name})
+
     def test_plan_waves_groups_independent_assets_and_defers_children(self):
         from gen_asset_images import plan_waves
 

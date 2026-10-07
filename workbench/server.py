@@ -430,17 +430,12 @@ def _versions_snapshot(path):
         pass
 
 
-def asset_image_preflight(project_dir, kind="all", asset_id=None, vendor=None):
-    """检查资产图片任务的参考模式与本地 ComfyUI 改图配置。
+def asset_image_preflight(project_dir, kind="all", asset_id=None, vendor=None, asset_refs=None,
+                          states_mode="include", state_id=None, force=False):
+    """检查生成参考及 ComfyUI 改图配置，不访问厂商网络。
 
-    参考口径：人物/场景/道具母图一律无参考生成；仅 derived_from 派生
-    子图引用父资产母图并切到 Qwen Image Edit。在创建后台任务前先做同
-    一份判定，避免任务启动后才发现改图模型缺失。选中 image_edit 模型
-    后，ComfyUI 适配器自动使用内置 Qwen Image Edit 工作流；用户填写的
-    image_edit_workflow_path 只是可选覆盖。返回
-    ``{ok, plans, needs_edit, edit_workflow, notes?, err?}``，不访问
-    ComfyUI 网络。派生父图缺失不拦截任务，只记入 ``notes``（生成端会
-    降级为无参考生成）。
+    精确派生引用缺图时须先生成，或作为同批依赖生成；旧母图引用保留
+    缺图告警兼容。展示归属不替代明确选定的生成参考。
     """
     result = {"ok": True, "plans": [], "needs_edit": False, "edit_workflow": ""}
     if not isinstance(vendor, dict):
@@ -450,11 +445,16 @@ def asset_image_preflight(project_dir, kind="all", asset_id=None, vendor=None):
         return {"ok": False, "plans": [], "needs_edit": False,
                 "err": "资产生成规划模块缺失，无法确认参考图模式"}
     try:
-        plans = planner.collect_asset_image_plan(project_dir, kind, asset_id, vendor.get("id", ""))
+        plans = planner.collect_asset_image_plan(project_dir, kind, asset_id, vendor.get("id", ""), **({"asset_refs": asset_refs} if asset_refs is not None else {}))
     except Exception as exc:
         return {"ok": False, "plans": [], "needs_edit": False,
                 "err": "读取资产引用失败：" + scrub_err(exc)}
     result["plans"] = plans
+    if asset_id:
+        invalid = next((p for p in plans if not (p.get('visual_validation') or {}).get('ready', True)), None)
+        if invalid:
+            visual = invalid['visual_validation']
+            return {**result, 'ok': False, 'err': '、'.join(visual['field_labels'] + visual['warnings']) + '；请到角色设定确认外观或在素材详情补齐，保存后自动复检，无需重新提炼。'}
     edit_plans = [p for p in plans if p.get("mode") == "edit"]
     result["needs_edit"] = bool(edit_plans)
     if result["needs_edit"] and str(vendor.get("id") or "") == "local-comfyui":
@@ -485,9 +485,23 @@ def asset_image_preflight(project_dir, kind="all", asset_id=None, vendor=None):
     }
     notes = []
     for plan in plans:
+        zone = {'character': '人物', 'scene': '场景', 'prop': '道具'}.get(plan.get('kind'), '')
+        output_exists = os.path.isfile(os.path.join(project_dir, '素材', zone, str(plan.get('id')) + '.png'))
+        mother_needed = bool(force or not output_exists)
+        if (states_mode == 'only' or state_id) and output_exists:
+            mother_needed = False
+        state_missing = [ref for ref in (plan.get('missing_refs') or []) if '#' in ref and mother_needed]
+        blocked = [ref for ref in state_missing
+                   if ref.split('#', 1)[0] not in planned_refs or states_mode == 'skip'
+                   or (state_id and ref.split('#', 1)[1] != state_id)]
+        if blocked:
+            return {**result, 'ok': False,
+                    'err': '指定的派生参考图尚未生成：' + '、'.join(blocked) + '；请先生成对应派生图'}
+        if state_missing:
+            notes.append(f"{plan.get('kind')}/{plan.get('id')} 将等待本批次指定的派生参考图生成")
         external_missing = [
             ref for ref in (plan.get("missing_refs") or [])
-            if str(ref) not in planned_refs
+            if str(ref) not in planned_refs and '#' not in ref
         ]
         if external_missing:
             refs = ", ".join(str(x) for x in external_missing[:4])
@@ -646,6 +660,8 @@ class H(BaseHTTPRequestHandler):
             p=None
             try:
                 _env=dict(os.environ); _env["PYTHONUNBUFFERED"]="1"  # 子进程不缓冲 stdout，日志实时流式可见
+                _env['SLATE_JOB_ID'] = str(jid)
+                _env['SLATE_JOB_ATTEMPT_ID'] = str(attempt_id or '')
                 p=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
                                    text=True,encoding="utf-8",errors="replace",env=_env)
                 with self.JLOCK:
@@ -1061,13 +1077,19 @@ class H(BaseHTTPRequestHandler):
         if not item:
             return self._send(404,"application/json",json.dumps({"ok":False,"err":"资产不存在"},ensure_ascii=False).encode())
         sl=tools_mod("skill_lib.py")
-        subject=str(item.get(PFIELD[kind]) or "").strip()
+        visual=tools_mod('visual_asset_prompt.py').visual_contract(kind,item,project=d)
+        subject=visual['subject']
         style_text,src=sl.resolve_asset_style_text(d,item.get("style"),item.get("style_prompt"))
-        final,negative=sl.compose_asset_image_prompt(d,subject,skill_id=item.get("style"),kind=kind,style_prompt=item.get("style_prompt"))
+        visual_kind=tools_mod('visual_asset_prompt.py').generation_kind(kind,item)
+        final,negative=sl.compose_asset_image_prompt(d,subject,skill_id=item.get("style"),kind=visual_kind,style_prompt=item.get("style_prompt"))
+        image_mod=tools_mod('gen_asset_images.py')
+        image_index=image_mod.load_asset_index(d)
+        references=image_mod._derived_reference_tokens(image_index,item,f'@{kind}:{ident}')
+        final=image_mod._with_reference_mentions(final,[ref for ref in references if image_mod._ref_path(d,image_index,ref)])
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"kind":kind,"id":ident,
             "layers":{"subject":subject,"style":style_text,"style_source":src,
-                      "negative":negative,"constraint":sl.ASSET_KIND_CONSTRAINTS.get(kind,""),
-                      "final":final}},ensure_ascii=False).encode())
+                      "negative":negative,"constraint":sl.ASSET_KIND_CONSTRAINTS.get(visual_kind,""),
+                      "final":final,"validation":{key:value for key,value in visual.items() if key not in ('subject','editable_prompt')}}},ensure_ascii=False).encode())
 
     @route('GET', '/api/acting/evals')
     def route_get_api_acting_evals(self, ctx):
@@ -1132,13 +1154,14 @@ class H(BaseHTTPRequestHandler):
                         # 状态值不改（该报 stale 还是 unknown 属产品口径），先把原因带出去并留日志。
                         check_err = f"{type(exc).__name__}: {exc}"
                         print(f"[表演] {sid} 过期探针失败 -> 状态仍报 {status}；原因：{check_err}", flush=True)
-                if shot.get("performance_locked") or shot.get("acting_locked"):
+                if (shot.get("performance_locked") or shot.get("acting_locked")) and status not in ("stale","invalid") and not check_err:
                     status="locked"
                 shots.append({"id":sid,"dur":shot.get("dur"),"speaker":shot.get("speaker") or "",
                                "action":shot.get("action") or "","prompt":shot.get("prompt") or "",
                                "actor_ids":actor_ids,"actor_names":actor_names,
                                "performance_status":status,"performance_locked":bool(shot.get("performance_locked") or shot.get("acting_locked")),
-                               "performance_check_error":check_err,"performance":performance})
+                               "performance_check_error":check_err,"performance":performance,
+                               "continuity":mod.continuity_evidence(board,sid,context,project_dir=d) if hasattr(mod,"continuity_evidence") else None})
             return self._send(200,"application/json; charset=utf-8",json.dumps(
                 {"ok":True,"board":nm,"revision":revision,"context":context,
                   "actors":main_actors, "shots":shots,"candidates":candidates},
@@ -1159,6 +1182,20 @@ class H(BaseHTTPRequestHandler):
         return self._send(200,"application/json; charset=utf-8",json.dumps(
             {"ok":True,"brief":mod.load_brief(d),"exists":mod.has_brief(d)},ensure_ascii=False).encode())
 
+    @route('POST', '/api/units/delete-version')
+    def route_post_api_units_delete_version(self, ctx):
+        # 删除规划版本（历史/失败/过期候选）：目录与记录一并清除；已采用/生成中的拒绝。
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8', 'replace') or b'{}')
+        try:
+            d = proj_dir(body.get("project"))
+            if not d: raise ValueError("项目不存在")
+            planning = tools_mod("story_planning_versions.py")
+            result = planning.delete_version(d, str(body.get("version_id") or ""), str(body.get("revision") or ""))
+            return self._send(200, 'application/json; charset=utf-8', json.dumps(result, ensure_ascii=False).encode())
+        except Exception as exc:
+            return self._send(400 if isinstance(exc, ValueError) else 500, 'application/json',
+                              json.dumps({'ok': False, 'err': scrub_err(exc)}, ensure_ascii=False).encode())
+
     @route('GET', '/api/units')
     def route_get_api_units(self, ctx):
         # ① 第一步「全剧最小单元」总览：锚定状态 + 各包摘要 + 体检报告 + 反查索引
@@ -1169,6 +1206,11 @@ class H(BaseHTTPRequestHandler):
         mod=tools_mod("story_units.py")
         if mod is None:
             return self._send(500,"application/json",json.dumps({"ok":False,"err":"story_units.py 缺失"},ensure_ascii=False).encode())
+        current_project=d
+        planning=tools_mod("story_planning_versions.py")
+        version_id=q.get("version",[""])[0]
+        if version_id:
+            d=str(planning.version_project(current_project,version_id))
         units=mod.load_units(d)
         outline=dict(units["outline"] or {})
         eps=[]
@@ -1176,16 +1218,29 @@ class H(BaseHTTPRequestHandler):
             row={k:v for k,v in e.items() if k!="text"}
             row["has_text"]=bool(str(e.get("text") or "").strip())
             row["text_len"]=len(str(e.get("text") or ""))
+            if version_id:
+                row["text"]=tools_mod("episode_editor.py").episode_text(d,units["episodes_doc"],e)
             eps.append(row)
         bios=[]
         for c in units["characters"][:200]:
             bios.append({"ref":f"@character:{c.get('id')}","name":c.get("name"),
                          **{k:c.get(k) for k in mod.CHAR_KEYS if c.get(k)},
                          "states":[s.get("id") for s in (c.get("states") or []) if isinstance(s,dict)]})
+        def _slots(v):
+            if isinstance(v, list): return v
+            t = str(v or '').strip()
+            if not t or t == '[]': return []
+            try:
+                parsed = json.loads(t)
+                if isinstance(parsed, list): return parsed
+            except Exception: pass
+            return [x.strip() for x in t.split('；') if x.strip()]   # LLM 把数组二次序列化成字符串的脏数据归一
         limits=[{"ref":f"@scene:{s.get('id')}","name":s.get("name"),
-                 "spatial_limit":s.get("spatial_limit"),"action_slots":s.get("action_slots") or []}
+                 "spatial_limit":s.get("spatial_limit"),"action_slots":_slots(s.get("action_slots")),
+                 "visual_description":s.get("visual_description")}
                 for s in units["scenes"][:200]]
-        boundaries=[{"ref":f"@prop:{p.get('id')}","name":p.get("name"),"usage_boundary":p.get("usage_boundary")}
+        boundaries=[{"ref":f"@prop:{p.get('id')}","name":p.get("name"),"usage_boundary":p.get("usage_boundary"),
+                     "visual_description":p.get("visual_description")}
                     for p in units["props"][:300]]
         index=mod.build_index(d)
         try:
@@ -1201,7 +1256,11 @@ class H(BaseHTTPRequestHandler):
             "outline":outline,"episodes":eps,
             "foreshadows":units["foreshadows"],"hooks":units["hooks"],
             "bios":bios,"scene_limits":limits,"prop_boundaries":boundaries,
-            "index":index,"report":mod.check(d)},ensure_ascii=False).encode())
+            "index":index,"report":mod.check(d),
+            "planning_versions":[],
+            "planning_revision":planning.current_revision(current_project),
+            "viewing_version":version_id or None,
+            "workflow":tools_mod("preproduction_flow.py").workflow_state(d)},ensure_ascii=False).encode())
 
     @route('GET', '/api/script/data')
     def route_get_api_script_data(self, ctx):
@@ -1216,6 +1275,9 @@ class H(BaseHTTPRequestHandler):
             p=os.path.join(d,"素材",name)
             return json.load(open(p,encoding="utf-8")) if os.path.isfile(p) else None
         eps_doc=_rd("分集.json")
+        script_revision=""
+        if isinstance(eps_doc,dict):
+            eps_doc,script_revision=project_store.read_json(os.path.join(d,"剧本","分集.json"))
         eps=eps_doc.get("episodes") if isinstance(eps_doc,dict) else eps_doc
         script_rev=int(eps_doc.get("rev") or 0) if isinstance(eps_doc,dict) else 0
         chars_data=_ra("人物.json")
@@ -1246,6 +1308,8 @@ class H(BaseHTTPRequestHandler):
         mode=eps_doc.get("mode") if isinstance(eps_doc,dict) else None
         # 剧本正文权威源：generated=聚合分集正文；imported=剧本.txt
         script_mod=tools_mod("script_repository.py")
+        if script_mod:
+            mode=script_mod.script_mode(d)
         script=script_mod.load_script(d) if script_mod else ""
         if not script:
             sp=os.path.join(d,"剧本","剧本.txt")
@@ -1256,10 +1320,15 @@ class H(BaseHTTPRequestHandler):
             style_data = skill_lib_call("ensure_explicit_defaults", d)
         except Exception:
             style_data = _rd("style.json") or {}
+        flow_mod=tools_mod("preproduction_flow.py")
+        prompt_flow=flow_mod.inspect_project(d) if flow_mod else {"stages":[]}
+        progress=tools_mod("production_progress.py").inspect_project(d)
         return self._send(200,"application/json; charset=utf-8",json.dumps({
             "script": script, "script_mode": mode, "script_rev": script_rev,
+            "script_revision":script_revision,"production_progress":progress,
+            "idea": open(os.path.join(d,"剧本","构想.txt"),encoding="utf-8").read() if os.path.isfile(os.path.join(d,"剧本","构想.txt")) else "",
             "episodes": eps, "characters": chars_data, "scenes": scenes_data,
-            "props": props_data, "style": style_data},ensure_ascii=False).encode())
+            "props": props_data, "style": style_data, "prompt_flow": prompt_flow},ensure_ascii=False).encode())
 
     @route('GET', '/api/skills')
     def route_get_api_skills(self, ctx):
@@ -1269,6 +1338,16 @@ class H(BaseHTTPRequestHandler):
         _pm=_iu.module_from_spec(_sp); _sp.loader.exec_module(_pm)
         return self._send(200,"application/json; charset=utf-8",json.dumps(
             {"skills":skill_lib_list()+_pm.list_system_skills()},ensure_ascii=False).encode())
+
+    @route('GET', '/api/skills/style')
+    def route_get_api_skills_style(self, ctx):
+        d = proj_dir(ctx.query.get('project', [''])[0])
+        if not d:
+            return self._send(400, 'application/json', json.dumps({'err': '项目不存在'}, ensure_ascii=False).encode())
+        import skill_lib
+        with skill_lib.read_scope():
+            result = {'style': skill_lib.ensure_explicit_defaults(d), 'skills': skill_lib.list_skills()}
+        return self._send(200, 'application/json; charset=utf-8', json.dumps(result, ensure_ascii=False).encode())
 
     @route('GET', '/api/skills/get')
     def route_get_api_skills_get(self, ctx):
@@ -1692,8 +1771,9 @@ class H(BaseHTTPRequestHandler):
                 ct={".html":"text/html; charset=utf-8",".js":"text/javascript",".css":"text/css",".svg":"image/svg+xml",
                     ".png":"image/png",".jpg":"image/jpeg",".jpeg":"image/jpeg",".json":"application/json",
                     ".woff2":"font/woff2",".woff":"font/woff",".ico":"image/x-icon",".mp4":"video/mp4"}.get(os.path.splitext(p)[1].lower(),"application/octet-stream")
-                # 带 hash 的 assets 长缓存；index.html 等入口不缓存（防旧 chunk 引用失效）
-                cc={"Cache-Control":"public, max-age=31536000, immutable"} if u.path.startswith("/assets/") \
+                # hash 文件名理论上可 immutable 长缓存，但没刷新的 SPA 懒加载旧 chunk + 新构建删文件 = 404/旧码；
+                # 开发期工具正确性优先：assets 也 no-cache（ETag/304 仍省流量），index.html 恒不缓存
+                cc={"Cache-Control":"no-cache"} if u.path.startswith("/assets/") \
                     else {"Cache-Control":"no-store, no-cache, must-revalidate","Pragma":"no-cache"}
                 return self._send(200,ct,open(p,"rb").read(),cc)
             if not u.path.startswith(("/api/","/api","/src","/media")):
@@ -1789,7 +1869,9 @@ class H(BaseHTTPRequestHandler):
     def route_get_media_gateway(self, ctx):
         from media_gateway import load
         cfg = load()
-        return self._send(200, 'application/json', json.dumps({k:cfg[k] for k in ('base_url','ttl_seconds')}).encode())
+        host = cfg.get('image_host') or {}
+        return self._send(200, 'application/json', json.dumps({**{k:cfg[k] for k in ('base_url','ttl_seconds')},
+            'image_host': {k:host[k] for k in ('type','base_url','webdav_url','username','password','remote_dir','client_id','api_key','proxy','account_id','api_token') if k in host}}).encode())
 
     @route('POST', '/api/media-gateway')
     def route_post_media_gateway(self, ctx):
@@ -1798,6 +1880,24 @@ class H(BaseHTTPRequestHandler):
             cfg = save(json.loads(self.rfile.read(ctx.content_length)))
             return self._send(200, 'application/json', json.dumps({'ok':True, **cfg}).encode())
         except Exception as e: return self._send_run_error(e)
+
+    @route('POST', '/api/media-gateway/test-host')
+    def route_post_media_gateway_test_host(self, ctx):
+        # 图床连通性测试：生成 1x1 PNG 上传，验证直链可拉取，返回直链
+        import base64, tempfile, urllib.request
+        try:
+            host = json.loads(self.rfile.read(ctx.content_length)).get('host') or {}
+            import image_host
+            with tempfile.NamedTemporaryFile(suffix='.png', delete=False) as fh:
+                # 1x1 透明 PNG
+                fh.write(base64.b64decode('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg=='))
+                probe = fh.name
+            url = image_host.upload_image(probe, host)
+            req = urllib.request.Request(url, method='GET', headers={'User-Agent':'Slate/1.0'})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                if r.status != 200: raise ValueError(f'直链返回 HTTP {r.status}')
+            return self._send(200, 'application/json', json.dumps({'ok':True,'url':url}).encode())
+        except Exception as e: return self._send(400, 'application/json', json.dumps({'ok':False,'err':scrub_err(e)[:300]}).encode())
 
     @route('HEAD', '/api/public-reference')
     def route_head_public_reference(self, ctx):
@@ -2042,6 +2142,19 @@ class H(BaseHTTPRequestHandler):
         json.dump(out,open(PROV,"w",encoding="utf-8"),ensure_ascii=False,indent=1)
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"count":len(clean)},ensure_ascii=False).encode())
 
+    @route('POST', '/api/env/balance')
+    def route_post_api_env_balance(self, ctx):
+        # 厂商余额查询：仅支持官方开放余额 API 的厂商（runninghub 实测；其余给控制台指引）。
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8', 'replace') or b'{}')
+        try:
+            vendor = next((v for v in load_vendors() if v.get('id') == body.get('vendor_id')), None)
+            if not vendor:
+                raise ValueError('厂商不存在')
+            result = tools_mod('vendor_balance.py').query(vendor)
+            return self._send(200, 'application/json; charset=utf-8', json.dumps(result, ensure_ascii=False).encode())
+        except Exception as exc:
+            return self._send(400, 'application/json', json.dumps({'ok': False, 'err': scrub_err(exc)}, ensure_ascii=False).encode())
+
     @route('POST', '/api/env/test')
     def route_post_api_env_test(self, ctx):
         u, q = ctx.url, ctx.query
@@ -2118,6 +2231,9 @@ class H(BaseHTTPRequestHandler):
         ln = ctx.content_length
         body=json.loads(self.rfile.read(ln).decode("utf-8","replace") or b"{}")
         vid=str(body.get("id") or "")
+        kind=str(body.get('kind') or '').strip() or None
+        if kind and kind not in KINDS:
+            return self._send_run_json(400, {'ok':False,'err':'未知模型能力槽'})
         draft=body.get("draft") if isinstance(body.get("draft"),dict) and body.get("draft") else None
         if draft:
             v=next((x for x in load_vendors() if x.get("id")==vid),{})
@@ -2130,8 +2246,10 @@ class H(BaseHTTPRequestHandler):
                 return self._send(400,"application/json",json.dumps({"ok":False,"err":"草稿缺少 base_url"},ensure_ascii=False).encode())
             if not key and vid not in ("local-comfyui","chatgpt-queue"):
                 return self._send(400,"application/json",json.dumps({"ok":False,"err":"草稿未配置 api_key，且落盘配置中也没有可用 key"},ensure_ascii=False).encode())
-            cfg={"id":vid or "draft","base_url":base,"api_key":key,"enabled":True,
-                 "models":(draft.get("models") or (v or {}).get("models") or {}),"endpoints":{}}
+            cfg={**(v or {}),"id":vid or "draft","base_url":base,"api_key":key,"enabled":True,
+                 "models":(draft.get("models") or (v or {}).get("models") or {}),
+                 "endpoints":draft.get('endpoints') or (v or {}).get('endpoints') or {},
+                 "extra":draft.get('extra') or (v or {}).get('extra') or {}}
         else:
             v=next((x for x in load_vendors() if x.get("id")==vid),None)
             if not v:
@@ -2143,10 +2261,126 @@ class H(BaseHTTPRequestHandler):
             af=tools_mod("llm_openai.py")
             if not af:
                 return self._send(500,"application/json",json.dumps({"ok":False,"err":"llm_openai.py 缺失"},ensure_ascii=False).encode())
-            models=af.VendorClient.from_config(cfg,check_enabled=False).list_models(timeout=15)
+            client=af.VendorClient.from_config(cfg,check_enabled=False)
+            models=client.list_models(timeout=15, kind=kind) if vid=='runninghub' else client.list_models(timeout=15)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"models":models},ensure_ascii=False).encode())
         except Exception as e:
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":False,"err":scrub_err(e)},ensure_ascii=False).encode())
+
+    @route('GET', '/api/runninghub/catalog')
+    def route_get_api_runninghub_catalog(self, ctx):
+        from runninghub_catalog import catalog, model_options
+        # 标准模型 API 仅限企业-共享 key（1014）：个人 key（apiType=NORMAL）不列标准模型，
+        # 只保留可用的 LLM 槽，避免下拉里出现一选就 1014 的模型。
+        key_type = ''
+        note = ''
+        if not os.environ.get('SLATE_RUNNINGHUB_KEY_TYPE'):   # 测试可用该变量固定类型
+            try:
+                cfg = next((v for v in load_vendors() if v.get('id') == 'runninghub'), None)
+                if cfg and cfg.get('api_key'):
+                    vb = tools_mod('vendor_balance.py')
+                    r = vb.query(cfg)
+                    got = str((r.get('detail') or {}).get('apiType') or '')
+                    # 只有明确拿到 NORMAL/SHARED 才过滤；探测失败/超时按未知处理，不过滤（fail-open）
+                    if got in ('NORMAL', 'SHARED'):
+                        key_type = got
+                        if got != 'SHARED':
+                            note = '当前为个人 Key：标准模型 API 仅限企业-共享 Key，模型列表已隐藏（个人 Key 走工作流 API / LLM 槽）'
+            except Exception:
+                pass
+        else:
+            key_type = os.environ['SLATE_RUNNINGHUB_KEY_TYPE']
+        data = catalog()
+        models = {} if key_type and key_type != 'SHARED' else {k: model_options(k) for k in KINDS if k not in ('text', 'vision')}
+        return self._send_run_json(200, {**data, 'models': models, **({'note': note} if note else {})})
+
+    @route('GET', '/api/runninghub/aiapp-demo')
+    def route_get_api_runninghub_aiapp_demo(self, ctx):
+        # AI 应用节点发现：GET /api/webapp/apiCallDemo（官方无"我的应用列表"API，webappId 从应用页 URL 复制，
+        # 节点定义按 webappId 实时拉取，供前端生成参数表单）。key 只在服务端使用。
+        try:
+            q = ctx.query
+            webapp = str(q.get('webapp_id', [''])[0] or '').strip()
+            if not webapp or not re.fullmatch(r'[0-9]{6,32}', webapp):
+                raise ValueError('webappId 不合法（应用详情页 URL 里的长数字）')
+            cfg = next((v for v in load_vendors() if v.get('id') == 'runninghub'), None)
+            if not cfg or not cfg.get('api_key'): raise ValueError('RH 尚未配置 API Key')
+            import urllib.request as _u
+            url = 'https://www.runninghub.ai/api/webapp/apiCallDemo?apiKey=' + cfg['api_key'] + '&webappId=' + webapp
+            with _u.urlopen(_u.Request(url, headers={'User-Agent': 'Slate/1.0'}), timeout=20) as r:
+                data = json.loads(r.read().decode('utf-8', 'replace'))
+            if data.get('code') not in (0, '0'):
+                raise ValueError('RH 返回错误：' + str(data.get('msg') or data.get('code'))[:120])
+            d = data.get('data') or {}
+            # 节点清单透传（nodeInfoList 含 nodeId/fieldName/fieldType/description），不回传 curl 等含 key 的字段
+            nodes = d.get('nodeInfoList') or []
+            return self._send(200, 'application/json; charset=utf-8', json.dumps(
+                {'ok': True, 'webappName': d.get('webappName') or '', 'description': d.get('description') or '',
+                 'nodes': nodes}, ensure_ascii=False).encode())
+        except Exception as exc:
+            return self._send(400, 'application/json', json.dumps({'ok': False, 'err': scrub_err(exc)}, ensure_ascii=False).encode())
+
+    @route('POST', '/api/runninghub/submit')
+    def route_post_api_runninghub_submit(self, ctx):
+        try:
+            body=json.loads(self.rfile.read(ctx.content_length).decode('utf-8'))
+            cfg=next((v for v in load_vendors() if v.get('id')=='runninghub'),None)
+            from llm_openai import VendorClient
+            from runninghub_client import RunningHubClient
+            if not cfg: raise ValueError('RH 厂商尚未配置')
+            # 创建只用已落盘配置；不向浏览器发送 API Key，也不自动重发未知结果。
+            adapter=RunningHubClient(VendorClient.from_config(cfg))
+            data=adapter.call(body.get('endpoint'),body.get('payload'))
+            return self._send_run_json(200, {'ok':True,'result':adapter.public_result(data)})
+        except Exception as exc:
+            return self._send_run_json(400, {'ok':False,'err':scrub_err(exc)})
+
+    @route('POST', '/api/runninghub/query')
+    def route_post_api_runninghub_query(self, ctx):
+        try:
+            body=json.loads(self.rfile.read(ctx.content_length).decode('utf-8'))
+            task_id=str(body.get('task_id') or '').strip()
+            if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',task_id): raise ValueError('RH taskId 格式无效')
+            cfg=next((v for v in load_vendors() if v.get('id')=='runninghub'),None)
+            from llm_openai import VendorClient
+            from runninghub_client import RunningHubClient
+            if not cfg: raise ValueError('RH 厂商尚未配置')
+            adapter=RunningHubClient(VendorClient.from_config(cfg,check_enabled=False))
+            data=adapter.query(task_id,legacy=bool(body.get('legacy')))
+            files=[]
+            if body.get('download') and data.get('status')=='SUCCESS':
+                from pathlib import Path
+                root=Path(ROOT)/'exports'/'runninghub'/task_id
+                for i,row in enumerate(data.get('results') or []):
+                    if not row.get('url'): continue
+                    suffix=str(row.get('outputType') or 'bin').lower().lstrip('.')
+                    if not re.fullmatch(r'[a-z0-9]{1,8}',suffix): suffix='bin'
+                    target=root/f'result_{i+1}.{suffix}'
+                    if not target.is_file():
+                        adapter.output({'taskId':task_id,'results':[row]},out_path=target)
+                    files.append({'path':str(target),'url':'/api/runninghub/file?'+urllib.parse.urlencode({'task_id':task_id,'name':target.name})})
+            return self._send_run_json(200, {'ok':True,'result':adapter.public_result(data),'files':files})
+        except Exception as exc:
+            return self._send_run_json(400, {'ok':False,'err':scrub_err(exc)})
+
+    @route('GET', '/api/runninghub/file')
+    def route_get_api_runninghub_file(self, ctx):
+        task_id=ctx.query.get('task_id', [''])[0]
+        name=ctx.query.get('name', [''])[0]
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,100}',task_id) or not re.fullmatch(r'result_[0-9]+\.[a-z0-9]{1,8}',name):
+            return self._send_run_json(400, {'ok':False,'err':'RH 下载文件参数无效'})
+        root=os.path.realpath(os.path.join(ROOT,'exports','runninghub',task_id))
+        path=os.path.realpath(os.path.join(root,name))
+        if os.path.commonpath([root,path]) != root or not os.path.isfile(path):
+            return self._send_run_json(404, {'ok':False,'err':'RH 结果文件不存在'})
+        with open(path,'rb') as fh:
+            self.send_response(200)
+            self.send_header('Content-Type','application/octet-stream')
+            self.send_header('Content-Disposition','attachment; filename="'+name+'"')
+            self.send_header('Content-Length',str(os.path.getsize(path)))
+            self.end_headers()
+            while block := fh.read(1024 * 1024):
+                self.wfile.write(block)
 
     @route('POST', '/api/project/normalize')
     def route_post_api_project_normalize(self, ctx):
@@ -3133,6 +3367,139 @@ class H(BaseHTTPRequestHandler):
         jid=self.spawn_job("whiterange",cmd)
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"id":jid,"job":True},ensure_ascii=False).encode())
 
+    @route('GET', '/api/script/episode/history')
+    def route_get_api_script_episode_history(self, ctx):
+        d=proj_dir(ctx.query.get('project',[''])[0])
+        episode=ctx.query.get('episode',[''])[0]
+        if not d:
+            return self._send_run_json(400,{'ok':False,'err':'请选择项目'})
+        return self._send_run_json(200,{'ok':True,'versions':tools_mod('episode_editor.py').script_history(d,episode or None)})
+
+    @route('GET', '/api/units/candidate')
+    def route_get_api_units_candidate(self, ctx):
+        project = proj_dir(ctx.query.get('project', [''])[0])
+        if not project:
+            return self._send_run_json(400, {'ok': False, 'err': '请选择项目'})
+        try:
+            planning = tools_mod('story_planning_versions.py')
+            ident = ctx.query.get('id', [''])[0]
+            current = planning.current_candidate(project, job_lookup=self.job_record)
+            result = planning.preview_candidate(project, ident) if ident else current
+            return self._send_run_json(200, result)
+        except Exception as exc:
+            return self._send_run_error(exc)
+
+    @route('GET', '/api/assets/visual-review')
+    def route_get_asset_visual_review(self, ctx):
+        project = proj_dir(ctx.query.get('project', [''])[0])
+        if not project:
+            return self._send_run_json(400, {'ok': False, 'err': '项目不存在'})
+        try:
+            return self._send_run_json(200, tools_mod('asset_visual_review.py').state(project))
+        except project_store.RevisionConflict as exc:
+            return self._send_run_json(409, {'ok': False, 'err': scrub_err(exc)})
+
+    @route('POST', '/api/assets/visual-review')
+    def route_post_asset_visual_review(self, ctx):
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8'))
+        project = proj_dir(body.get('project'))
+        if not project:
+            return self._send_run_json(400, {'ok': False, 'err': '项目不存在'})
+        try:
+            return self._send_run_json(200, tools_mod('asset_visual_review.py').save(project, body.get('items'), body.get('revision')))
+        except (ValueError, project_store.RevisionConflict) as exc:
+            return self._send_run_json(409 if isinstance(exc, project_store.RevisionConflict) else 400,
+                {'ok': False, 'err': scrub_err(exc)})
+
+    @route('GET', '/api/assets/reconcile')
+    def route_get_asset_reconcile(self, ctx):
+        project = proj_dir(ctx.query.get('project', [''])[0])
+        if not project:
+            return self._send_run_json(400, {'ok': False, 'err': '项目不存在'})
+        try:
+            result = tools_mod('asset_reconcile.py').preview(project)
+        except project_store.RevisionConflict as exc:
+            return self._send_run_json(409, {'ok': False, 'err': scrub_err(exc)})
+        result.pop('_changes', None)
+        return self._send_run_json(200, result)
+
+    @route('POST', '/api/assets/reconcile')
+    def route_post_asset_reconcile(self, ctx):
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8'))
+        project = proj_dir(body.get('project'))
+        if not project:
+            return self._send_run_json(400, {'ok': False, 'err': '项目不存在'})
+        try:
+            result = tools_mod('asset_reconcile.py').apply(project, body.get('selected'), body.get('revision'))
+            return self._send_run_json(200, result)
+        except (ValueError, project_store.RevisionConflict) as exc:
+            return self._send_run_json(409 if isinstance(exc, project_store.RevisionConflict) else 400,
+                {'ok': False, 'err': scrub_err(exc)})
+
+    @route('GET', '/api/characters', '/api/script/drafts')
+    def route_get_authoring_workspace(self, ctx):
+        d=proj_dir(ctx.query.get('project',[''])[0])
+        if not d:
+            return self._send_run_json(400,{'ok':False,'err':'项目不存在'})
+        if ctx.url.path == '/api/characters':
+            return self._send_run_json(200,tools_mod('character_profiles.py').state(d))
+        tools_mod('script_drafts.py').reconcile(d,self.job_record)
+        return self._send_run_json(200,{'ok':True,'batches':tools_mod('script_drafts.py').list_batches(d,
+            include_history=ctx.query.get('history',['0'])[0]=='1')})
+
+    @route('POST', '/api/characters/save', '/api/script/drafts/generate', '/api/script/drafts/adopt', '/api/script/drafts/repair')
+    def route_post_authoring_workspace(self, ctx):
+        body=json.loads(self.rfile.read(ctx.content_length).decode('utf-8') or '{}')
+        d=proj_dir(body.get('project'))
+        if not d:
+            return self._send_run_json(400,{'ok':False,'err':'项目不存在'})
+        try:
+            if ctx.url.path == '/api/characters/save':
+                profiles=tools_mod('character_profiles.py')
+                if 'items' in body:
+                    result=profiles.save_batch(d,body.get('items'),expected_revision=body.get('expected_revision'))
+                else:
+                    result=profiles.save(d,body.get('character_id'),body.get('patch'),expected_revision=body.get('expected_revision'))
+            elif ctx.url.path.endswith('/adopt'):
+                result=tools_mod('script_drafts.py').adopt(d,body.get('batch'),body.get('episodes'),reviewed=body.get('reviewed'))
+            else:
+                tools_mod('script_drafts.py').reconcile(d,self.job_record)
+                repairing=ctx.url.path.endswith('/repair')
+                if repairing:
+                    result=tools_mod('script_drafts.py').queue_repair(d,body.get('batch'),body.get('episodes'),body.get('instructions',''))
+                else:
+                    result=tools_mod('script_drafts.py').create(d,body.get('episodes'),body.get('instructions',''),body.get('vendor'))
+                try:
+                    cmd=[sys.executable,os.path.join(TOOLS,'script_drafts.py'),d,result['id']]
+                    if repairing:
+                        cmd.append('--repair')
+                    jid=self.spawn_job('正文修正' if repairing else '正文候选', cmd)
+                    tools_mod('script_drafts.py').bind_job(d,result['id'],jid)
+                except Exception:
+                    tools_mod('script_drafts.py').interrupt(d,result['id'],
+                        '任务启动失败，原稿保留，可继续修正' if repairing else '任务启动失败，请重新生成')
+                    raise
+                result={'ok':True,'id':jid,'job':True,'batch':result['id']}
+            return self._send_run_json(200,result)
+        except project_store.RevisionConflict as exc:
+            return self._send_run_json(409,{'ok':False,'err':scrub_err(exc)})
+        except ValueError as exc:
+            return self._send_run_json(400,{'ok':False,'err':scrub_err(exc)})
+
+    @route('POST', '/api/script/episode/save')
+    def route_post_api_script_episode_save(self, ctx):
+        body=json.loads(self.rfile.read(ctx.content_length).decode('utf-8') or '{}')
+        d=proj_dir(body.get('project'))
+        if not d:
+            return self._send_run_json(400,{'ok':False,'err':'项目不存在'})
+        try:
+            result=tools_mod('episode_editor.py').save_episode(d,body.get('episode'),body.get('text'),body.get('revision'))
+            return self._send_run_json(200,result)
+        except project_store.RevisionConflict:
+            return self._send_run_json(409,{'ok':False,'err':'正文已被其他操作更新，编辑稿保留；请重新载入后对照合并'})
+        except ValueError as exc:
+            return self._send_run_json(400,{'ok':False,'err':scrub_err(exc)})
+
     @route('POST', '/api/script/import')
     def route_post_api_script_import(self, ctx):
         u, q = ctx.url, ctx.query
@@ -3359,9 +3726,12 @@ class H(BaseHTTPRequestHandler):
             ok=_pm_reset(str(body.get("id") or ""))
             return self._send(200,"application/json",json.dumps({"ok":bool(ok)},ensure_ascii=False).encode())
         if u.path=="/api/skills/create":
-            sid=_SL.create_skill(str(body.get("category") or "directing"),str(body.get("name") or "未命名"),
-                                 str(body.get("target") or "storyboard"),str(body.get("description") or ""),
-                                 str(body.get("text") or ""))
+            try:
+                sid=_SL.create_skill(str(body.get("category") or "directing"),str(body.get("name") or "未命名"),
+                                     str(body.get("target") or "storyboard"),str(body.get("description") or ""),
+                                     str(body.get("text") or ""),str(body.get("dimension") or ""))
+            except ValueError:
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":"Skill 类别、目标或维度不合法"},ensure_ascii=False).encode())
             return self._send(200,"application/json",json.dumps({"ok":True,"id":sid},ensure_ascii=False).encode())
         if u.path=="/api/skills/toggle":
             ok=_SL.toggle_skill(str(body.get("id") or ""),bool(body.get("enabled")))
@@ -3373,17 +3743,20 @@ class H(BaseHTTPRequestHandler):
         if not d:
             return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目不存在"},ensure_ascii=False).encode())
         old_style = _SL.project_style(d)
-        new_style = body.get("style") or {}
-        if not isinstance(new_style,dict):
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":"style 必须是对象"},ensure_ascii=False).encode())
-        _SL.set_project_style(d,new_style)
+        values = body.get('patch') if 'patch' in body else body.get('style')
+        if not isinstance(values,dict):
+            return self._send_run_json(400, {'ok': False, 'err': 'style 或 patch 必须是对象'})
+        try:
+            new_style = (_SL.patch_project_style(d, values) if 'patch' in body else _SL.set_project_style(d, values))
+        except Exception as exc:
+            return self._send_run_error(exc)
         refreshed = 0
-        if (old_style.get("image"), old_style.get("anchor")) != (new_style.get("image"), new_style.get("anchor")):
+        if any(old_style.get(key) != new_style.get(key) for key in ('image', 'image_visual', 'image_identity', 'anchor')):
             try:
                 refreshed = chatgpt_queue.refresh_queued_asset_jobs(d)
             except Exception as exc:
                 return self._send(500,"application/json",json.dumps({"ok":False,"err":f"风格已保存，但待生成资产队列刷新失败：{exc}"},ensure_ascii=False).encode())
-        return self._send(200,"application/json",json.dumps({"ok":True,"refreshed_asset_jobs":refreshed},ensure_ascii=False).encode())
+        return self._send_run_json(200, {'ok': True, 'style': new_style, 'refreshed_asset_jobs': refreshed})
 
     @route('POST', '/api/script/brief')
     def route_post_api_script_brief(self, ctx):
@@ -3435,109 +3808,60 @@ class H(BaseHTTPRequestHandler):
         if not d:
             return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目不存在"},ensure_ascii=False).encode())
         idea=str(body.get("idea") or "").strip()
-        if not idea and not os.path.isfile(os.path.join(d,"剧本","构想.txt")):
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":"缺少创作构想"},ensure_ascii=False).encode())
-        cmd=[sys.executable,os.path.join(TOOLS,"creation_pipeline.py"),"expand",d,
-             "--eps",str(int(body.get("eps") or 6))]
-        if idea: cmd+=["--idea",idea]
         ep=str(body.get("episode") or "")
+        if ep:
+            episode_path=os.path.join(d,"剧本","分集.json")
+            try:
+                with open(episode_path,encoding="utf-8") as handle:
+                    episode_doc=json.load(handle)
+            except (OSError,ValueError):
+                episode_doc={}
+            episode_rows=episode_doc.get("episodes") if isinstance(episode_doc,dict) else None
+            if not isinstance(episode_rows,list) or not any(isinstance(e,dict) and str(e.get("id"))==ep for e in episode_rows):
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":"请先生成分集，再扩写单集正文"},ensure_ascii=False).encode())
+            try:
+                tools_mod("preproduction_flow.py").require_expansion_ready(d)
+            except ValueError as exc:
+                return self._send(409,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
+        if not ep and not idea and not os.path.isfile(os.path.join(d,"剧本","构想.txt")):
+            return self._send(400,"application/json",json.dumps({"ok":False,"err":"缺少创作构想"},ensure_ascii=False).encode())
+        eps_default=6
+        if not ep:
+            preflight=tools_mod("preproduction_flow.py").completion_preflight(d,body.get("eps"))
+            if not preflight["ok"]:
+                return self._send(409,"application/json; charset=utf-8",json.dumps({**preflight,"err":preflight["reason"]},ensure_ascii=False).encode())
+            eps_default=0 if preflight["episode_count"] else 6
+        cmd=[sys.executable,os.path.join(TOOLS,"creation_pipeline.py"),"expand",d,
+             "--eps",str(int(body.get("eps") or eps_default))]
+        if idea: cmd+=["--idea",idea]
         if ep: cmd+=["--episode",ep]
+        if body.get("allow_gaps"): cmd+=["--allow-gaps"]   # 缺口实体未入档时强行留稿（页面二次确认后透传）
         jid=self.spawn_job("creation",cmd)
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"id":jid,"job":True},ensure_ascii=False).encode())
 
     @route('POST', '/api/assets/create')
     def route_post_api_assets_create(self, ctx):
-        u, q = ctx.url, ctx.query
-        ln = ctx.content_length
-        # 新增母素材/子素材：前端只提交最小字段，父子关系归一化后写回三件套 JSON。
-        body=json.loads(self.rfile.read(ln).decode("utf-8","replace") or b"{}")
-        d=proj_dir(body.get("project"))
-        kind=str(body.get("kind") or "").strip()
-        name=str(body.get("name") or "").strip()
-        if not d or kind not in ("character","scene","prop") or not name:
-            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":"项目、kind 或素材名不合法"},ensure_ascii=False).encode())
-        keys={"character":"characters","scene":"scenes","prop":"props"}
-        filenames={"character":"人物.json","scene":"场景.json","prop":"道具.json"}
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8'))
+        project = proj_dir(body.get('project'))
+        if not project:
+            return self._send_run_json(400, {'ok': False, 'err': '项目不存在'})
         try:
-            relmod=tools_mod("asset_relations.py")
-            # 读取三件套；不存在的档案按空数组创建，方便手工补充新母素材。
-            file_data={}; combined={}
-            for k,key in keys.items():
-                path=os.path.join(d,"素材",filenames[k])
-                if os.path.isfile(path):
-                    raw=json.load(open(path,encoding="utf-8"))
-                else:
-                    raw={key:[]}
-                rows=raw.get(key) if isinstance(raw,dict) else raw
-                if not isinstance(rows,list): rows=[]
-                file_data[k]=(path,raw,key)
-                # combined 必须使用副本；否则 append 新素材会同时修改 raw，
-                # 后面的 current_rows==next_rows 判断会误认为无需落盘。
-                combined[key]=list(rows)
+            kind = str(body.get('kind') or '')
+            fields = ({'role': body['role']} if kind == 'character' and body.get('role') else {})
+            if kind == 'scene':
+                fields.update({key: body[key] for key in ('time', 'light', 'interior') if key in body})
+            asset = tools_mod('asset_service.py').create_asset(
+                project, kind=kind, id=body.get('id'), name=body.get('name'),
+                prompt=body.get('prompt') or '', parent_ref=body.get('parent_ref'),
+                relation=body.get('relation'), related_refs=body.get('related_refs'),
+                episode=body.get('episode'), fields=fields,
+                derived_from=body.get('derived_from'), prop_kind=body.get('prop_kind'))
+            rows = tools_mod('asset_registry.py').AssetRegistry(project).list()
+            return self._send_run_json(200, {'ok': True, 'asset': asset, 'assets': rows})
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":f"读取资产档案失败：{exc}"},ensure_ascii=False).encode())
-        ident=str(body.get("id") or "").strip().lower()
-        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,63}",ident):
-            ident=re.sub(r"[^a-z0-9]+","_",name.lower()).strip("_")[:56] or "asset"
-        if any(str(item.get("id"))==ident for k in keys for item in combined[keys[k]]):
-            return self._send(409,"application/json",json.dumps({"ok":False,"err":f"资产 id 已存在：{ident}"},ensure_ascii=False).encode())
-        parent=str(body.get("parent_ref") or "").strip() or None
-        relation=str(body.get("relation") or "").strip() or None
-        prompt=str(body.get("prompt") or "").strip()
-        ep=str(body.get("episode") or "").strip()
-        item={"id":ident,"name":name,"asset_revision":1,"source_episode_ids":[ep] if ep else []}
-        if kind=="character":
-            item.update({"role":str(body.get("role") or ("配角" if parent else "主角")),"is_collective":False,"basis":"手工新增素材","sheet_prompt":prompt})
-        elif kind=="scene":
-            item.update({"time":str(body.get("time") or "日"),"light":str(body.get("light") or "日光"),"interior":bool(body.get("interior",True)),"geometry":[],"image_prompt":prompt})
-        else:
-            item.update({"kind":str(body.get("prop_kind") or ("关联素材" if parent else "叙事")),"asset_required":True,"owner":parent or "","actions":[],"image_prompt":prompt,"shot_hint":None})
-        if parent:
-            item["parent_ref"]=parent
-            item["relation"]=relation or ("located_in" if parent.startswith("@scene:") else "component_of")
-        related=body.get("related_refs")
-        if isinstance(related,list) and related:
-            item["related_refs"]=related
-        combined[keys[kind]].append(item)
-        # 提示词中的 @kind:id 是全局资产依赖：保存为 prompt_refs，
-        # 同时并入 related_refs，后续资产图/分镜生成会自动带上引用图。
-        if relmod and hasattr(relmod, "extract_asset_refs"):
-            prompt_refs=relmod.extract_asset_refs(prompt, combined)
-            if prompt_refs:
-                item["prompt_refs"]=prompt_refs
-                merged=list(item.get("related_refs") or [])
-                for prompt_ref in prompt_refs:
-                    if prompt_ref not in merged:
-                        merged.append(prompt_ref)
-                item["related_refs"]=merged
-        normalized,issues=relmod.normalize_asset_relations(combined) if relmod else (combined,[])
-        ref=f"@{kind}:{ident}"
-        blocking=[issue for issue in issues if issue.get("ref")==ref]
-        if blocking:
-            return self._send(422,"application/json; charset=utf-8",json.dumps({"ok":False,"err":"新素材关系无法解析","issues":blocking},ensure_ascii=False).encode())
-        try:
-            versions_mod=tools_mod("versions.py")
-            snapshot=getattr(versions_mod,"snapshot",None) if versions_mod else None
-            for k,(path,raw,key) in file_data.items():
-                next_rows=normalized.get(key,[])
-                current_rows=raw.get(key,[]) if isinstance(raw,dict) else raw
-                if current_rows==next_rows: continue
-                def mutate(current,key=key,next_rows=next_rows):
-                    if not isinstance(current,dict): return {key:next_rows}
-                    current[key]=next_rows; return current
-                if project_store:
-                    project_store.update_json(path,mutate,create_default={key:next_rows},snapshot=snapshot)
-                else:
-                    if snapshot and os.path.isfile(path): snapshot(path)
-                    os.makedirs(os.path.dirname(path),exist_ok=True)
-                    raw[key]=next_rows
-                    with open(path,"w",encoding="utf-8") as fh: json.dump(raw,fh,ensure_ascii=False,indent=1)
-        except Exception as exc:
-            return self._send(500,"application/json",json.dumps({"ok":False,"err":f"素材写入失败：{exc}"},ensure_ascii=False).encode())
-        registry_mod=tools_mod("asset_registry.py")
-        rows=registry_mod.AssetRegistry(d).list() if registry_mod else []
-        created=next((row for row in rows if row.get("ref")==ref),{"ref":ref,"kind":kind,"id":ident,"name":name})
-        return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"asset":created,"assets":rows},ensure_ascii=False).encode())
+            if hasattr(exc, 'issues'):
+                return self._send_run_json(exc.status, {'ok': False, 'err': str(exc), 'issues': exc.issues})
+            return self._send_run_error(exc)
 
     @route('POST', '/api/assets/edit')
     def route_post_api_assets_edit(self, ctx):
@@ -3561,134 +3885,24 @@ class H(BaseHTTPRequestHandler):
 
     @route('POST', '/api/assets/relations')
     def route_post_api_assets_relations(self, ctx):
-        u, q = ctx.url, ctx.query
-        ln = ctx.content_length
-        # 保存项目级资产父子/派生/关联关系；关系只写入三件套 JSON，不展开长设定。
-        body=json.loads(self.rfile.read(ln).decode("utf-8","replace") or b"{}")
-        d=proj_dir(body.get("project"))
-        updates=body.get("updates")
-        if not d or not isinstance(updates,list) or not updates:
-            return self._send(400,"application/json; charset=utf-8",json.dumps({"ok":False,"err":"项目或 updates 不合法"},ensure_ascii=False).encode())
-        relmod=tools_mod("asset_relations.py")
-        if relmod is None:
-            return self._send(500,"application/json",json.dumps({"ok":False,"err":"资产关系模块缺失"},ensure_ascii=False).encode())
-        kind_keys={"character":"characters","scene":"scenes","prop":"props"}
-        file_data={}
-        combined={}
+        body = json.loads(self.rfile.read(ctx.content_length).decode('utf-8'))
+        project = proj_dir(body.get('project'))
+        if not project:
+            return self._send_run_json(400, {'ok': False, 'err': '项目不存在'})
         try:
-            for kind,key in kind_keys.items():
-                path=os.path.join(d,"素材",{"character":"人物.json","scene":"场景.json","prop":"道具.json"}[kind])
-                if not os.path.isfile(path):
-                    return self._send(404,"application/json",json.dumps({"ok":False,"err":f"资产档案不存在：{os.path.basename(path)}"},ensure_ascii=False).encode())
-                raw=json.load(open(path,encoding="utf-8"))
-                rows=raw.get(key) if isinstance(raw,dict) else raw
-                if not isinstance(rows,list): rows=[]
-                file_data[kind]=(path,raw,key)
-                # 关系更新会原地修改 combined 中的 item；使用深副本，
-                # 才能与磁盘原值比较并真正触发 project_store 写入。
-                combined[key]=copy.deepcopy(rows)
+            result = tools_mod('asset_service.py').set_relations(
+                project, body.get('updates'), expected_revisions=body.get('expected_revisions'))
+            return self._send_run_json(200, result)
         except Exception as exc:
-            return self._send(400,"application/json",json.dumps({"ok":False,"err":f"读取资产档案失败：{exc}"},ensure_ascii=False).encode())
-        changed=[]
-        for update in updates:
-            if not isinstance(update,dict):
-                continue
-            raw_ref=str(update.get("ref") or "").strip().lstrip("@")
-            if ":" not in raw_ref:
-                return self._send(400,"application/json",json.dumps({"ok":False,"err":"关系更新缺少 @kind:id ref"},ensure_ascii=False).encode())
-            head,ident=raw_ref.split(":",1)
-            kind=relmod._kind(head) if hasattr(relmod,"_kind") else head
-            key=kind_keys.get(kind)
-            if not key or not ident:
-                return self._send(400,"application/json",json.dumps({"ok":False,"err":f"关系 ref 不合法：{update.get('ref')}"},ensure_ascii=False).encode())
-            item=next((x for x in combined[key] if isinstance(x,dict) and str(x.get("id") or "") == ident),None)
-            if item is None:
-                return self._send(404,"application/json",json.dumps({"ok":False,"err":f"找不到资产：@{kind}:{ident}"},ensure_ascii=False).encode())
-            before_item=copy.deepcopy(item)
-            for field in ("parent_ref","relation","derived_from"):
-                if field in update:
-                    value=update.get(field)
-                    if value in (None,""):
-                        item.pop(field,None)
-                    else:
-                        item[field]=value
-            if "related_refs" in update:
-                value=update.get("related_refs")
-                if value in (None,""):
-                    item.pop("related_refs",None)
-                else:
-                    item["related_refs"]=value if isinstance(value,list) else [value]
-            if item != before_item:
-                state_mod=tools_mod("production_state.py")
-                if state_mod and hasattr(state_mod,"bump_asset_revision"):
-                    state_mod.bump_asset_revision(item)
-            changed.append(f"@{kind}:{ident}")
-        normalized,issues=relmod.normalize_asset_relations(combined)
-        changed_set=set(changed)
-        # 父子关系固定为两层：母素材 -> 子素材。只检查本次请求改动的
-        # 节点，避免历史项目中已有的旧关系阻塞无关的关系保存。
-        normalized_by_ref={
-            f"@{kind}:{item.get('id')}": item
-            for kind,key in kind_keys.items()
-            for item in (normalized.get(key) or [])
-            if isinstance(item,dict) and item.get('id')
-        }
-        deep_parent_issues=[]
-        for ref in changed_set:
-            item=normalized_by_ref.get(ref)
-            parent_ref=item.get('parent_ref') if item else None
-            parent_item=normalized_by_ref.get(parent_ref) if parent_ref else None
-            if parent_item and parent_item.get('parent_ref'):
-                deep_parent_issues.append({
-                    "ref": ref,
-                    "field": "parent_ref",
-                    "message": "资产关系最多两层，不能把资产挂到子素材下",
-                })
-        if deep_parent_issues:
-            return self._send(422,"application/json; charset=utf-8",json.dumps(
-                {"ok":False,"err":"资产关系最多两层，不能挂到子素材下","issues":deep_parent_issues},
-                ensure_ascii=False).encode())
-        blocking=[issue for issue in issues if issue.get("ref") in changed_set]
-        if blocking:
-            return self._send(422,"application/json; charset=utf-8",json.dumps({"ok":False,"err":"资产关系无法保存","issues":blocking},ensure_ascii=False).encode())
-        try:
-            versions_mod=tools_mod("versions.py")
-            snapshot=getattr(versions_mod,"snapshot",None) if versions_mod else None
-            revisions=body.get("expected_revisions") if isinstance(body.get("expected_revisions"),dict) else {}
-            for kind,(path,raw,key) in file_data.items():
-                next_rows=normalized.get(key,[])
-                current_rows=raw.get(key,[]) if isinstance(raw,dict) else raw
-                if current_rows == next_rows:
-                    continue
-                def mutate(current, key=key, next_rows=next_rows):
-                    if not isinstance(current,dict):
-                        return {key:next_rows}
-                    current[key]=next_rows
-                    return current
-                expected=revisions.get(os.path.basename(path)) or revisions.get(kind)
-                if project_store:
-                    project_store.update_json(path,mutate,expected_revision=expected,snapshot=snapshot)
-                else:
-                    if snapshot: snapshot(path)
-                    raw[key]=next_rows
-                    with open(path,"w",encoding="utf-8") as fh:
-                        json.dump(raw,fh,ensure_ascii=False,indent=1)
-        except Exception as exc:
-            if project_store and isinstance(exc,project_store.RevisionConflict):
-                return self._send(409,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
-            return self._send(500,"application/json",json.dumps({"ok":False,"err":f"关系写入失败：{exc}"},ensure_ascii=False).encode())
-        try:
-            registry_mod=tools_mod("asset_registry.py")
-            rows=registry_mod.AssetRegistry(d).list() if registry_mod else []
-        except Exception:
-            rows=[]
-        return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"updated":changed,"assets":rows,"warnings":[issue for issue in issues if issue.get("ref") not in changed_set]},ensure_ascii=False).encode())
+            if hasattr(exc, 'issues'):
+                return self._send_run_json(exc.status, {'ok': False, 'err': str(exc), 'issues': exc.issues})
+            return self._send_run_error(exc)
 
     @route('POST', '/api/asset/image')
     def route_post_api_asset_image(self, ctx):
         u, q = ctx.url, ctx.query
         ln = ctx.content_length
-        # 资产设定图生图（人物三视图/场景/道具）
+        # 人物设定图、场景和道具共用当前档案的视觉投影。
         body=json.loads(self.rfile.read(ln).decode("utf-8","replace") or b"{}")
         d=proj_dir(body.get("project"))
         if not d:
@@ -3701,6 +3915,11 @@ class H(BaseHTTPRequestHandler):
             workers=4
         cmd+=["--workers",str(max(1,min(workers,16)))]
         if body.get("id"): cmd+=["--id",str(body["id"])]
+        asset_refs=body.get("asset_refs")
+        if asset_refs is not None:
+            if not isinstance(asset_refs,list) or not asset_refs or len(asset_refs)>500 or any(not isinstance(ref,str) or not re.fullmatch(r"@(character|scene|prop):[\w\-]{1,128}",ref) for ref in asset_refs):
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":"请选择有效的素材引用"},ensure_ascii=False).encode())
+            for ref in dict.fromkeys(asset_refs): cmd += ["--asset-ref",ref]
         if body.get("force"): cmd+=["--force"]
         states_mode=str(body.get("states") or "include").strip()
         if states_mode in ("only","skip"): cmd+=["--states",states_mode]
@@ -3715,22 +3934,23 @@ class H(BaseHTTPRequestHandler):
             if not vendor or not vendor.get("enabled") or not (vendor.get("models") or {}).get("image"):
                 return self._send(400,"application/json; charset=utf-8",json.dumps(
                     {"ok":False,"err":"所选生图厂商未启用或未配置 image 模型"},ensure_ascii=False).encode())
-            preflight = asset_image_preflight(d, str(body.get("kind") or "all"), body.get("id"), vendor)
+            preflight = asset_image_preflight(d, str(body.get("kind") or "all"), body.get("id"), vendor, asset_refs,
+                                              states_mode=states_mode, state_id=state_id, force=bool(body.get('force')))
             if not preflight.get("ok"):
                 return self._send(400,"application/json; charset=utf-8",json.dumps(
                     {"ok":False,
                      "err":preflight.get("err") or "资产图片任务前置检查失败",
                      "asset_plan":preflight.get("plans") or []},ensure_ascii=False).encode())
             cmd+=["--vendor",vendor_id]
-        # ComfyUI 是单队列串行执行：并发提交资产生图只会在 ComfyUI 侧排队，
-        # 拖到客户端轮询超时还写不出文件（job_264 实证）；且并发写 资产图.json
-        # 有索引竞争。同一时刻只允许一个 gen_asset_images 任务。
+        # 同一时刻只允许一个 gen_asset_images 任务：任务内部已按厂商并发（云端 4 路，
+        # 本机 ComfyUI/ChatGPT 队列压回 1 路，见 vendor_concurrency），但索引 素材图.json
+        # 只在批次结束统一 dump，两个任务并行会互相覆盖对方的条目（job_264 实证过写不出文件）。
         with self.JLOCK:
             busy_asset=[j for j in self.JOBS.values() if j.get("status")=="running"
                         and any("gen_asset_images.py" in str(c) for c in (j.get("fullcmd") or []))]
         if busy_asset:
             return self._send(409,"application/json; charset=utf-8",json.dumps(
-                {"ok":False,"err":f"已有资产生图任务运行中（#{busy_asset[0]['id']}），请等它完成再提交——生图后端单队列串行，并发提交只会排队超时"},ensure_ascii=False).encode())
+                {"ok":False,"err":f"已有资产生图任务运行中（#{busy_asset[0]['id']}），请等它完成再提交——单个任务内部已并发出图，但两个任务并行会互相覆盖素材图索引"},ensure_ascii=False).encode())
         jid=self.spawn_job("creation",cmd)
         return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"id":jid,"job":True},ensure_ascii=False).encode())
 
@@ -3761,7 +3981,9 @@ class H(BaseHTTPRequestHandler):
         import importlib.util as _iu
         _sp=_iu.spec_from_file_location("versions",os.path.join(TOOLS,"versions.py"))
         m=_iu.module_from_spec(_sp); _sp.loader.exec_module(m)
-        try: m.restore(pth,ts)
+        try:
+            m.restore(pth,ts)
+            return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True},ensure_ascii=False).encode())
         except Exception as e:
             return self._send_run_error(e)
 
@@ -3780,18 +4002,19 @@ class H(BaseHTTPRequestHandler):
         except Exception as e:
             return self._send_run_error(e)
         return self._send_run_json(200,{'ok':True,'removed':os.path.relpath(removed,VIDEO)})
-        return self._send(200,"application/json",json.dumps({"ok":True},ensure_ascii=False).encode())
 
     @route('GET', '/api/storyboard/revision')
     def route_get_api_storyboard_revision(self, ctx):
         q = ctx.query
-        # ③ 汇总表格的乐观锁基线：只回当前 revision，不回内容（内容页面已另有 /api/white/board）。
-        # 单独一条轻路由，是为了不改动白模页/③ 共用的 /api/white/board 响应体形状。
+        # 审核需要内容和版本来自同一次读取；默认响应保持轻量。
         d=proj_dir(q.get("project",[""])[0]); nm=safe_proj(q.get("name",[""])[0])
         p=os.path.join(d,"分镜",nm) if d and nm else ""
         if not d or not nm.lower().endswith(".json") or not under(d,p) or not os.path.isfile(p):
             return self._send(404,"application/json",json.dumps({"ok":False,"err":"分镜不存在"},ensure_ascii=False).encode())
         try:
+            if q.get('include', [''])[0] == 'board':
+                board, rev=project_store.read_json(p)
+                return self._send_run_json(200,{'ok':True,'revision':rev,'board':board})
             rev=project_store.current_revision(p)
         except Exception as exc:
             return self._send_run_error(exc)
@@ -3838,7 +4061,7 @@ class H(BaseHTTPRequestHandler):
         if not base_rev:
             return self._send(400,"application/json",json.dumps({"ok":False,"err":"缺少分镜基线 revision：请先 GET /api/storyboard/revision 再保存（避免整组回写盖掉 ⑦/⑤ 的改动）"},ensure_ascii=False).encode())
         try:
-            _, rev = tools_mod('production_studio.py').save_shots(d, nm, cleaned, base_rev)
+            saved, rev = tools_mod('production_studio.py').save_shots(d, nm, cleaned, base_rev)
         except Exception as exc:
             return self._send_run_error(exc)
         # ① 锚定的创作禁区：人工行内改也可能写出违规镜头，保存后同样扫一遍并回传（只告警不阻断）
@@ -3852,7 +4075,7 @@ class H(BaseHTTPRequestHandler):
                 print(f"[禁区扫描跳过] {exc}", flush=True)
         # 回写成功即返回新 revision：前端据此更新基线，连续两次保存不必整页重载
         return self._send(200,"application/json",json.dumps({"ok":True,"shots":len(shots),"revision":rev,
-                                                            "unit_warnings":unit_warnings},ensure_ascii=False).encode())
+                                                            "unit_warnings":unit_warnings,"board":saved},ensure_ascii=False).encode())
 
     @route('POST', '/api/storyboard/delete')
     def route_post_api_storyboard_delete(self, ctx):
@@ -4205,7 +4428,16 @@ class H(BaseHTTPRequestHandler):
         if not d:
             return self._send(400,"application/json",json.dumps({"ok":False,"err":"项目不存在"},ensure_ascii=False).encode())
         if u.path=="/api/units/build":
+            if body.get("anchor"):
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":"生成完成后请核对设定，再单独锁定。"},ensure_ascii=False).encode())
+            if str(body.get("stage") or "").strip() not in ("replan", "entity") and tools_mod("story_units.py").is_anchored(d):
+                return self._send(409,"application/json",json.dumps({"ok":False,"err":"设定已锁定，请先解除锁定再生成或补全。"},ensure_ascii=False).encode())
             cmd=[sys.executable,os.path.join(TOOLS,"creation_pipeline.py"),"units",d]
+            if body.get("idea") is not None:
+                idea=str(body.get("idea") or "").strip()
+                if len(idea)<5:
+                    return self._send(400,"application/json",json.dumps({"ok":False,"err":"创作构想至少 5 字"},ensure_ascii=False).encode())
+                cmd += ["--idea",idea]
             try:
                 eps_n=int(body.get("eps") or 0)
             except (TypeError,ValueError):
@@ -4218,11 +4450,51 @@ class H(BaseHTTPRequestHandler):
                 arc_size=0
             if arc_size>0:
                 cmd+=["--arc-size",str(arc_size)]
-            if body.get("anchor"):
-                cmd+=["--anchor"]
             stage=str(body.get("stage") or "").strip()
-            if stage in ("story","entity","all"):
+            if not stage:
+                stage="complete" if tools_mod("story_units.py").load_units(d)["episodes"] else "all"
+            if stage in ("story","entity","all","complete","replan"):
                 cmd+=["--stage",stage]
+            else:
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":"不支持的生成阶段"},ensure_ascii=False).encode())
+            if stage == "replan":
+                planning=tools_mod("story_planning_versions.py")
+                if body.get("planning_version"):
+                    try:
+                        meta=planning.resume_request(d,body["planning_version"])
+                        if eps_n and eps_n != meta["target_episodes"]:
+                            raise ValueError("续跑沿用候选的目标集数，修改目标请重新修订")
+                        if body.get("idea") is not None or body.get("revision_instructions"):
+                            raise ValueError("续跑沿用候选的修改要求，修改构想请重新修订")
+                    except project_store.RevisionConflict as exc:
+                        return self._send_run_json(409,{"ok":False,"err":scrub_err(exc)})
+                    except (ValueError,OSError) as exc:
+                        return self._send_run_json(400,{"ok":False,"err":scrub_err(exc)})
+                    cmd += ["--planning-version",body["planning_version"]]
+                else:
+                    source=str(body.get("planning_source") or "idea")
+                    target=eps_n or tools_mod("brief.py").load_brief(d).get("total_episodes") or 0
+                    if source not in ("idea","script") or not 1<=int(target)<=200:
+                        return self._send(400,"application/json",json.dumps({"ok":False,"err":"修订须填写 1–200 的全剧目标集数"},ensure_ascii=False).encode())
+                    try:
+                        revision_mode,instructions=planning.revision_request(
+                            d,int(target),str(body.get("revision_mode") or "auto"),body.get("revision_instructions") or "")
+                    except ValueError as exc:
+                        return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
+                    cmd += ["--planning-source",source,"--revision-mode",revision_mode]
+                    if instructions:
+                        cmd += ["--revision-instructions",instructions]
+            if 'asset_refs' in body:
+                refs = body['asset_refs']
+                units = tools_mod('story_units.py').load_units(d)
+                known_refs = {'@'+kind+':'+str(row.get('id')) for kind,key in (('character','characters'),('scene','scenes'),('prop','props')) for row in units[key]}
+                if stage != 'entity' or not isinstance(refs,list) or not refs or any(not isinstance(ref,str) or ref not in known_refs for ref in refs):
+                    return self._send_run_json(400,{'ok':False,'err':'请选择已有素材；批量补齐只接受设定阶段，空选择不会处理全项目'})
+                cmd += ['--asset-refs',json.dumps(list(dict.fromkeys(refs)),ensure_ascii=False)]
+            if stage in ("complete","entity") and 'asset_refs' not in body:
+                preflight=tools_mod("preproduction_flow.py").completion_preflight(d,eps_n)
+                if not preflight["ok"]:
+                    return self._send(409,"application/json; charset=utf-8",json.dumps({**preflight,"err":preflight["reason"]},ensure_ascii=False).encode())
             jid=self.spawn_job("creation",cmd)
             return self._send(200,"application/json; charset=utf-8",json.dumps({"ok":True,"id":jid,"job":True},ensure_ascii=False).encode())
         mod=tools_mod("story_units.py")
@@ -4240,7 +4512,24 @@ class H(BaseHTTPRequestHandler):
             return self._send(200 if payload["ok"] else 409,"application/json; charset=utf-8",
                               json.dumps(payload,ensure_ascii=False).encode())
         kind=str(body.get("kind") or "")
-        if kind=="episode":
+        if kind in ("adopt-plan","restore-plan"):
+            planning=tools_mod("story_planning_versions.py")
+            try:
+                fn=planning.adopt if kind=="adopt-plan" else planning.restore
+                res=fn(d,str(body.get("id") or ""),str(body.get("revision") or ""))
+            except project_store.RevisionConflict as exc:
+                return self._send(409,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
+            except ValueError as exc:
+                return self._send(400,"application/json",json.dumps({"ok":False,"err":scrub_err(exc)},ensure_ascii=False).encode())
+            return self._send(200,"application/json; charset=utf-8",json.dumps(res,ensure_ascii=False).encode())
+        if kind=="episodes":
+            try:
+                res=mod.edit_episodes_batch(d,body.get('items'),body.get('revision'))
+            except project_store.RevisionConflict as exc:
+                return self._send_run_json(409,{'ok':False,'err':scrub_err(exc)})
+            except ValueError as exc:
+                return self._send_run_json(400,{'ok':False,'err':scrub_err(exc)})
+        elif kind=="episode":
             res=mod.edit_episode(d,str(body.get("id") or ""),body.get("fields") or {})
         elif kind=="asset":
             res=mod.edit_asset(d,str(body.get("zone") or ""),str(body.get("id") or ""),
@@ -4249,8 +4538,10 @@ class H(BaseHTTPRequestHandler):
             res=mod.edit_outline(d,body.get("fields") or {})
         elif kind=="threads":
             res=mod.edit_threads(d,body.get("foreshadows"),body.get("hooks"))
+        elif kind=="unlock":
+            res=mod.unanchor(d)
         else:
-            res={"ok":False,"err":"kind 须为 episode|asset|outline|threads"}
+            res={"ok":False,"err":"kind 须为 episode|asset|outline|threads|unlock"}
         return self._send(200 if res.get("ok") else 400,"application/json; charset=utf-8",
                           json.dumps(res,ensure_ascii=False).encode())
 
@@ -4596,25 +4887,6 @@ if __name__=="__main__":
         raise SystemExit(f"启动失败，端口 {port} 被其他程序占用：{exc}。请更换端口或结束占用进程。")
     _safe_print(f"工作台: http://localhost:{port}（监听 0.0.0.0，局域网可达）")
     httpd.serve_forever()
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 

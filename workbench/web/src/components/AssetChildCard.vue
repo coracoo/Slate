@@ -58,6 +58,7 @@ async function delChild() {
     <div v-else class="flex h-24 items-center justify-center rounded-lg border border-dashed border-line text-2xs text-slate-500">子图未生成</div>
     <div class="mt-1 flex items-center gap-1"><button class="min-w-0 flex-1 truncate text-left text-xs text-slate-200 underline-offset-2 transition hover:text-cyan-200 hover:underline" @click="emit('details', child)">{{ child.name }}</button><span v-if="isPlan" class="shrink-0 rounded bg-violet-400/15 px-1 text-2xs font-bold text-violet-300">平面图</span></div>
     <div class="text-2xs text-slate-500">{{ relationLabel(child) }}</div>
+    <p v-if="child.visual_status?.postprocess_warning" class="mt-1 text-xs text-amber-200">{{ child.visual_status.postprocess_warning }}</p>
     <div class="mt-1 flex gap-1">
       <RouterLink v-if="isPlan" to="/package" class="btn btn-ghost btn-sm flex-1 text-center" title="平面图由 plan.json 确定性渲染；编辑/重渲染请到平面推演页">去平面推演</RouterLink>
       <button v-else class="btn btn-ghost btn-sm flex-1" :disabled="genDisabled" @click="emit('gen', child)">{{ genning === child.kind + child.id ? '生成中…' : '生成子图' }}</button>

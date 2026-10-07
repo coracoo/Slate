@@ -17,7 +17,19 @@ def generate(c, prompt, refs, out, model, timeout, interval, max_wait, options, 
         if refs: payload['images'] = [public_url(r) for r in refs]
         if options.get('audio_refs'): payload['audios'] = [public_url(r) for r in options['audio_refs']]
         if options.get('video_refs'): payload['videos'] = [{'url':public_url(r)} for r in options['video_refs']]
-    data = c._post(c.base + '/videos', payload, timeout)
+    # 免费队列高峰期常 503 video_queue_full：退避重试 3 次（45s/90s/180s）。已提交成功则不会走到这里，
+    # 重试的都是"创建被拒"——没有重复扣费风险（Agnes 免费，也无计费）。
+    import time as _time
+    waits = (45, 90, 180)
+    for attempt in range(len(waits) + 1):
+        try:
+            data = c._post(c.base + '/videos', payload, timeout)
+            break
+        except VendorError as exc:
+            if 'video_queue_full' not in str(exc) or attempt >= len(waits):
+                raise
+            print(f'[Agnes 队列满] 第 {attempt + 1} 次被拒，{waits[attempt]}s 后重试（共 3 次）', flush=True)
+            _time.sleep(waits[attempt])
     task = data.get('video_id')
     if not task: raise VendorError('Agnes 未返回 video_id，禁止自动重发，请核对厂商记录')
     query = c.base.removesuffix('/v1') + '/agnesapi?' + urllib.parse.urlencode({'video_id':task,'model_name':model})
